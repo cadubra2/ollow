@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>Fluxo — Bot de Qualificação de Leads via WhatsApp e CRM Moskit</title>
+<link rel="stylesheet" href="assets/pop.css">
+</head>
+<body>
+
+<!-- faixa institucional, repetida em todas as páginas -->
+<div class="pop-footer"><img src="assets/faixa-rodape.png" alt=""></div>
+
+<!-- ================= PÁGINA 1 — capa + seções i e ii ================= -->
+<div class="page-one">
+  <div class="cover-head">
+    <img class="cover-logo" src="assets/logo-capa.png" alt="Caballero, Rocha &amp; Carvalho — Sociedade de Advogados">
+    <div class="cover-rule"></div>
+    <div class="cover-eyebrow">P R O C E D I M E N T O &nbsp; O P E R A C I O N A L &nbsp; P A D R Ã O</div>
+    <div class="cover-title">Bot de Qualificação de Leads via WhatsApp<br>Cadastro Automático no CRM Moskit</div>
+    <div class="cover-kicker">Do recebimento da mensagem ao registro no CRM e na agenda</div>
+    <div class="cover-rule-short"></div>
+    <div class="cover-byline">Caballero, Rocha &amp; Carvalho — Sociedade de Advogados &nbsp; • &nbsp; Automação Comercial &nbsp; • &nbsp; Versão 1.2 — julho/2026</div>
+  </div>
+
+  <!-- i -->
+  <div class="sec">
+    <div class="sec-num">i</div>
+    <div class="sec-title">Objetivo e alcance</div>
+  </div>
+  <p>Este documento padroniza o fluxo de trabalho do bot que recebe as conversas do WhatsApp do escritório
+  (via Zernio), analisa cada atendimento com Inteligência Artificial e cadastra automaticamente o contato e o
+  negócio no CRM Moskit. Vai do recebimento da mensagem até a movimentação do negócio no funil de vendas e o
+  agendamento da consulta no Google Agenda, passando pela classificação do lead, pela extração dos dados do caso
+  e pela verificação do comprovante de pagamento.</p>
+
+  <p class="soft">Antes de tudo, o bot já descarta automaticamente as conversas dos sócios e da equipe (nunca
+  tratadas como lead) e só avança para o cadastro no CRM quando a Inteligência Artificial identifica interesse
+  real de contratação — spam, número errado e conversa interna não geram nada no CRM.</p>
+
+  <!-- ii -->
+  <div class="sec">
+    <div class="sec-num">ii</div>
+    <div class="sec-title">Como ler este fluxo</div>
+  </div>
+  <div class="legend">
+    <div class="legend-row">
+      <div class="legend-tag">ETAPA MANUAL</div>
+      <div class="legend-txt">Requer ação de alguém da equipe (enviar mensagem, revisar uma sugestão).</div>
+    </div>
+    <div class="legend-row">
+      <div class="legend-tag auto">ETAPA AUTOMATIZADA</div>
+      <div class="legend-txt">Executada pelo bot ou pela Inteligência Artificial, sem intervenção humana.</div>
+    </div>
+    <div class="legend-row">
+      <div class="legend-tag decision">PONTO DE DECISÃO</div>
+      <div class="legend-txt">Caixa em vermelho: decisão da IA que muda o rumo do atendimento.</div>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== CORPO (páginas 2+) ===================== -->
+<table class="pop-body">
+<thead>
+  <tr><td class="run-cell">
+    <div class="run-head">
+      <img class="run-mark" src="assets/marca-header.png" alt="">
+      <span class="run-title">Fluxo | Bot de Qualificação de Leads via WhatsApp</span>
+    </div>
+  </td></tr>
+</thead>
+<tbody>
+  <tr><td>
+
+  <!-- ========================= iii ========================= -->
+  <div class="sec">
+    <div class="sec-num">iii</div>
+    <div class="sec-title">Visão geral do fluxo</div>
+  </div>
+
+  <div class="flow">
+    <div class="card">
+      <div class="card-num">1</div>
+      <div class="card-title">Recepção da mensagem</div>
+      <div class="card-desc">Zernio entrega em tempo real as mensagens do cliente e da equipe.</div>
+    </div>
+    <div class="arrow"></div>
+
+    <div class="card">
+      <div class="card-num">2</div>
+      <div class="card-title">Buffer de inatividade</div>
+      <div class="card-desc">Aguarda 5 minutos sem mensagem nova antes de analisar a conversa.</div>
+    </div>
+    <div class="arrow"></div>
+
+    <div class="card auto">
+      <div class="card-num">3</div>
+      <div class="card-title">Classificação do lead</div>
+      <div class="card-desc">IA decide se a conversa é um lead viável ou deve ser descartada.</div>
+      <div class="card-badge">AUTOMATIZADO — IA</div>
+    </div>
+    <div class="arrow"></div>
+
+    <div class="card auto">
+      <div class="card-num">4</div>
+      <div class="card-title">Extração dos dados</div>
+      <div class="card-desc">IA extrai os campos do CRM, a data da consulta e o estágio do funil.</div>
+      <div class="card-badge">AUTOMATIZADO — IA</div>
+    </div>
+    <div class="arrow"></div>
+
+    <div class="card">
+      <div class="card-num">5</div>
+      <div class="card-title">Cadastro no Moskit</div>
+      <div class="card-desc">Busca ou cria o contato e o negócio, com nota de briefing do caso.</div>
+    </div>
+    <div class="arrow"></div>
+
+    <div class="card auto">
+      <div class="card-num">6</div>
+      <div class="card-title">Verificação do comprovante</div>
+      <div class="card-desc">IA de visão lê o valor pago e confere com o valor da consulta.</div>
+      <div class="card-badge">AUTOMATIZADO — IA</div>
+    </div>
+    <div class="arrow"></div>
+
+    <div class="card">
+      <div class="card-num">7</div>
+      <div class="card-title">Pagamento e funil</div>
+      <div class="card-desc">Move o negócio no funil de vendas conforme o atendimento avança.</div>
+    </div>
+    <div class="arrow"></div>
+
+    <div class="card">
+      <div class="card-num">8</div>
+      <div class="card-title">Agendamento no Google Agenda</div>
+      <div class="card-desc">Cria o evento quando pagamento e horário estão confirmados.</div>
+    </div>
+  </div>
+
+  <!-- ========================= iv ========================= -->
+  <div class="sec break-before">
+    <div class="sec-num">iv</div>
+    <div class="sec-title">Detalhamento das etapas</div>
+  </div>
+
+  <!-- 1 -->
+  <div class="step">
+  <div class="etapa">
+    <div class="etapa-num">1</div>
+    <div class="etapa-title">Recepção da mensagem</div>
+    <div class="etapa-resp">Responsável: Bot — webhook Zernio</div>
+  </div>
+  <p>O que fazer. A Zernio entrega ao servidor do bot, em tempo real, cada mensagem trocada no WhatsApp do
+  escritório — tanto as recebidas do cliente quanto as enviadas pela equipe (proposta, contrato, informações de
+  valores) — e o bot acumula tudo na conversa daquele contato. A cada 3 minutos uma sincronização periódica varre
+  as conversas recentes, como rede de segurança para qualquer webhook perdido.</p>
+
+  <div class="label">Documentos</div>
+  <div class="docs">Mensagem de texto ou anexo (imagem/documento) • Identificação do remetente (cliente ou equipe)</div>
+
+  <div class="label">Checklist</div>
+  <ul class="checklist">
+    <li>Mensagem do cliente identificada e salva com papel “cliente”</li>
+    <li>Mensagem da equipe identificada e salva com papel “equipe”</li>
+    <li>Anexo de imagem baixado e preparado para a verificação</li>
+  </ul>
+
+  <div class="callout decision">É sócio ou equipe?. Os telefones dos sócios e da equipe nunca são tratados como
+  lead — a conversa é descartada automaticamente deste fluxo, sem gerar contato nem negócio no CRM.</div>
+
+  </div>
+  <!-- 2 -->
+  <div class="step">
+  <div class="etapa">
+    <div class="etapa-num">2</div>
+    <div class="etapa-title">Buffer de inatividade</div>
+    <div class="etapa-resp">Responsável: Bot</div>
+  </div>
+  <p>O que fazer. A cada mensagem nova o temporizador de 5 minutos é reiniciado. Só quando o cliente (ou a equipe)
+  para de escrever por esse tempo o bot considera a conversa “pronta” e dispara a análise — evita processar mensagem
+  por mensagem e analisa o atendimento inteiro de uma vez.</p>
+
+  <div class="label">Checklist</div>
+  <ul class="checklist">
+    <li>Temporizador de 5 minutos ativo por conversa</li>
+    <li>Reagendamento automático a cada nova mensagem recebida</li>
+    <li>Conversa enviada à análise só depois do período de silêncio</li>
+  </ul>
+
+  <div class="callout">ATENÇÃO. O tempo de inatividade é o que separa uma conversa em andamento de uma conversa
+  encerrada. Mudar esse valor muda o momento em que todo o restante do fluxo dispara.</div>
+
+  </div>
+  <!-- 3 -->
+  <div class="step">
+  <div class="etapa">
+    <div class="etapa-num">3</div>
+    <div class="etapa-title">Classificação do lead</div>
+    <div class="etapa-resp">Responsável: Inteligência Artificial</div>
+  </div>
+  <p>O que fazer. Antes de extrair qualquer dado, a IA lê a conversa inteira e decide, de forma objetiva, se aquilo
+  é um lead com potencial real de contratação.</p>
+
+  <div class="label">Checklist</div>
+  <ul class="checklist">
+    <li>Classificação registrada (criar negócio / inviável)</li>
+    <li>Justificativa da IA registrada no banco</li>
+  </ul>
+
+  <div class="callout decision">Lead viável?. Spam, número errado, conversa interna da equipe ou cliente já
+  existente apenas confirmando algo → classificado como inviável, e nada é criado no CRM.</div>
+
+  </div>
+  <!-- 4 -->
+  <div class="step">
+  <div class="etapa">
+    <div class="etapa-num">4</div>
+    <div class="etapa-title">Extração dos dados</div>
+    <div class="etapa-resp">Responsável: Inteligência Artificial</div>
+  </div>
+  <p>O que fazer. Para os leads viáveis, a IA extrai os campos obrigatórios do CRM e decide a ação mais adequada:
+  criar negócio, atualizar campos, adicionar nota, aguardar mais informações ou ignorar.</p>
+
+  <div class="label">Dados extraídos</div>
+  <div class="docs">Origem • Tipo de consulta • Área do direito • Advogado responsável • Captação • Pagamento
+  confirmado • Data e hora da consulta • Email do cliente • Resumo do atendimento • Estágio de funil sugerido</div>
+
+  <div class="label">Checklist</div>
+  <ul class="checklist">
+    <li>Campos obrigatórios preenchidos ou marcados como pendentes</li>
+    <li>Resumo do atendimento (briefing) gerado de forma específica, não genérica</li>
+    <li>Ação sugerida pela IA registrada com o respectivo grau de confiança</li>
+  </ul>
+
+  <div class="callout">AUTOMATIZADO. O advogado responsável é sempre definido pela área do direito do caso, nunca
+  pelo nome do lead nem por qual sócio ele mencionou na conversa.</div>
+
+  <div class="callout decision">Confiança suficiente?. Confiança da IA abaixo de 6/10 na ação “criar” é tratada
+  como “ignorar” — proteção contra alucinação da IA.</div>
+
+  </div>
+  <!-- 5 -->
+  <div class="step">
+  <div class="etapa">
+    <div class="etapa-num">5</div>
+    <div class="etapa-title">Cadastro no Moskit</div>
+    <div class="etapa-resp">Responsável: Bot</div>
+  </div>
+  <p>O que fazer. O bot busca ou cria o contato no Moskit pelo telefone, cria ou atualiza o negócio com os campos
+  personalizados mapeados e adiciona uma nota com o briefing do caso, para o advogado se preparar antes da
+  consulta.</p>
+
+  <div class="label">Checklist</div>
+  <ul class="checklist">
+    <li>Contato buscado ou criado no Moskit</li>
+    <li>Negócio criado ou atualizado com os campos personalizados</li>
+    <li>Nota de briefing pré-consulta adicionada ao negócio</li>
+  </ul>
+
+  <div class="callout">ATENÇÃO. A busca por telefone exige no mínimo 8 dígitos coincidentes — evita reaproveitar
+  por engano o contato errado e duplicar histórico no CRM.</div>
+
+  </div>
+  <!-- 6 -->
+  <div class="step">
+  <div class="etapa">
+    <div class="etapa-num">6</div>
+    <div class="etapa-title">Verificação do comprovante</div>
+    <div class="etapa-resp">Responsável: Inteligência Artificial de visão</div>
+  </div>
+  <p>O que fazer. Ao receber uma imagem do cliente, o bot baixa o arquivo e usa Inteligência Artificial de visão
+  para ler o valor pago, comparando com o valor da consulta (R$ 350,00, aceitando o acréscimo do pagamento por
+  cartão).</p>
+
+  <div class="label">Documentos</div>
+  <div class="docs">Imagem do comprovante enviada pelo cliente</div>
+
+  <div class="label">Checklist</div>
+  <ul class="checklist">
+    <li>Comprovante baixado e salvo</li>
+    <li>Valor lido pela IA de visão, com o respectivo nível de confiança</li>
+    <li>Resultado registrado no histórico da conversa e avisado no Telegram da equipe</li>
+  </ul>
+
+  <div class="callout decision">Valor confere?. O comprovante só é considerado válido quando a IA identifica que é
+  mesmo um comprovante, com confiança de pelo menos 7/10, e o valor lido é igual ou maior que R$ 350,00. Não
+  passando em algum desses critérios, o negócio NÃO é movido e a equipe é avisada para revisar manualmente.</div>
+
+  </div>
+  <!-- 7 -->
+  <div class="step">
+  <div class="etapa">
+    <div class="etapa-num">7</div>
+    <div class="etapa-title">Pagamento e funil</div>
+    <div class="etapa-resp">Responsável: Bot</div>
+  </div>
+  <p>O que fazer. Confirmado o pagamento com o comprovante batendo, o negócio é movido para o estágio “Consulta
+  Agendada”. A IA também analisa as mensagens (inclusive as da equipe) buscando sinais de avanço no funil completo
+  — proposta de honorários, negociação, contrato.</p>
+
+  <div class="label">Checklist</div>
+  <ul class="checklist">
+    <li>Pagamento verificado e negócio movido (ou nota de alerta criada)</li>
+    <li>Sugestão de estágio de funil registrada em nota no negócio</li>
+  </ul>
+
+  <div class="callout">ATENÇÃO. O avanço automático além de “Consulta Agendada” está em modo de conferência: a IA
+  apenas anota a sugestão no negócio, sem mover de verdade, até a equipe validar o comportamento.</div>
+
+  </div>
+  <!-- 8 -->
+  <div class="step">
+  <div class="etapa">
+    <div class="etapa-num">8</div>
+    <div class="etapa-title">Agendamento no Google Agenda</div>
+    <div class="etapa-resp">Responsável: Bot</div>
+  </div>
+  <p>O que fazer. Quando o pagamento e a data e hora da consulta são confirmados na mesma leitura da IA, o bot cria
+  automaticamente o evento no calendário único do escritório — autenticado por OAuth2 com uma conta real da equipe
+  — já com um link do Google Meet gerado junto, e avisa a equipe pelo Telegram com esse link. Pedindo o cliente
+  para remarcar depois, o bot atualiza o mesmo evento em vez de criar um novo, mantendo o link do Meet.</p>
+
+  <div class="label">Documentos</div>
+  <div class="docs">Data e hora da consulta confirmadas • Email do cliente (se informado)</div>
+
+  <div class="label">Checklist</div>
+  <ul class="checklist">
+    <li>Evento criado com a data e o horário corretos</li>
+    <li>Link do Google Meet gerado automaticamente</li>
+    <li>Nota de agendamento, com o link do Meet, adicionada ao negócio no Moskit</li>
+    <li>Equipe avisada no Telegram com o link do Meet</li>
+    <li>Remarcação: evento existente atualizado sem perder o link do Meet</li>
+  </ul>
+
+  <div class="callout">FECHAMENTO. O convite por email ao cliente só é enviado se ele tiver informado o próprio
+  email na conversa — o link do Meet é sempre criado, mas o Google só avisa quem está cadastrado como participante
+  do evento.</div>
+
+  </div>
+  <!-- ========================= v ========================= -->
+  <div class="keep">
+  <div class="sec">
+    <div class="sec-num">v</div>
+    <div class="sec-title">Ferramentas e premissas fixas</div>
+  </div>
+  <ul class="legal">
+    <li><span class="k">Comunicação.</span> Zernio — API oficial do WhatsApp Business, integrada por webhook
+    (mensagens em tempo real) e por sincronização periódica a cada 3 minutos, como rede de segurança.</li>
+    <li><span class="k">Inteligência Artificial.</span> OpenAI gpt-4o-mini, temperatura 0, para a classificação do
+    lead, a extração dos dados e a leitura dos comprovantes por visão computacional.</li>
+    <li><span class="k">CRM.</span> Moskit, pipeline “Funil de Vendas”. Campos personalizados (origem, área do
+    direito, advogado responsável, captação, tipo de consulta) mapeados por ID fixo.</li>
+    <li><span class="k">Valor da consulta.</span> R$ 350,00 fixo — o comprovante “confere” quando o valor lido é
+    igual ou maior (pagamento por cartão pode ter acréscimo) e a confiança da IA é de pelo menos 7/10.</li>
+    <li><span class="k">Calendário.</span> Google Agenda, calendário único do escritório, acessado por OAuth2 com
+    uma conta real da equipe (não conta de serviço) — necessário para gerar o link do Google Meet e convidar
+    participantes por email, permissões que uma conta de serviço não tem sem Domain-Wide Delegation.</li>
+    <li><span class="k">Notificações.</span> Telegram — aviso à equipe a cada comprovante recebido (confere ou não
+    confere) e a cada consulta agendada ou remarcada, com o link do Meet.</li>
+    <li><span class="k">Tempo de inatividade.</span> 5 minutos sem mensagem nova antes de disparar a análise da
+    conversa.</li>
+  </ul>
+  </div>
+
+  </td></tr>
+</tbody>
+<tfoot><tr><td></td></tr></tfoot>
+</table>
+
+</body>
+</html>

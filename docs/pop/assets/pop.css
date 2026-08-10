@@ -1,0 +1,371 @@
+/* ============================================================
+   POP — Caballero, Rocha & Carvalho
+   Folha de estilo dos Procedimentos Operacionais Padrão.
+
+   Todos os valores foram medidos dos PDFs modelo
+   (Fluxo - Ação de Execução v1.1 / Fluxo - Due Diligence v1.0):
+   página A4, margens laterais 52pt, área de conteúdo 491,3pt,
+   topo do conteúdo em 90pt, base em 762pt.
+
+   Unidade de trabalho: pt (1pt = 1/72"). Não usar px.
+   ============================================================ */
+
+:root {
+  /* cores */
+  --navy:            #142840;  /* faixas, cabeçalhos, títulos */
+  --navy-ink:        #0b192b;  /* texto sobre dourado, caixas */
+  --gold:            #d19e4a;  /* filetes, círculos, badges */
+  --gold-ink:        #ad8038;  /* rótulos (Documentos, Checklist) */
+  --gold-legal:      #8a6a2a;  /* lead-in dos itens da seção final */
+  --red:             #993333;  /* ponto de decisão */
+  --ink:             #000000;  /* corpo */
+  --ink-soft:        #47474d;  /* corpo secundário, descrições */
+  --ink-faint:       #8c8c91;  /* byline, header corrente */
+  --card-bg:         #f7f7f6;  /* card da visão geral */
+  --box-info-bg:     #f8f1e1;  /* caixa de destaque */
+  --box-decision-bg: #faeded;  /* caixa de decisão */
+  --rule-soft:       #d9dbdb;  /* filete curto da capa */
+
+  /* famílias — Liberation Serif e Carlito são os substitutos
+     métricos usados na geração original em Linux */
+  --serif: "Times New Roman", "Liberation Serif", serif;
+  --sans:  "Calibri", "Carlito", sans-serif;
+}
+
+@page {
+  /* topo 30pt: o cabeçalho corrente (thead) ocupa de 30 a 90pt.
+     base 8pt: o Chrome recorta position:fixed na caixa de conteúdo, então a
+     faixa do rodapé precisa caber dentro dela. O espaço livre acima da faixa
+     é reservado pelo <tfoot> vazio de 72pt, que o motor repete em toda página
+     — o corpo continua terminando em 762pt, como nos PDFs modelo. */
+  /* 210mm x 297mm em vez de "A4": o Chrome arredonda o atalho A4 para
+     594,96pt e desloca todo o layout em 0,3pt. */
+  size: 210mm 297mm;
+  margin: 30pt 52pt 8pt 52pt;
+}
+
+* { box-sizing: border-box; }
+
+html, body { margin: 0; padding: 0; }
+
+body {
+  font-family: var(--serif);
+  font-size: 10.5pt;
+  line-height: 15pt;
+  color: var(--ink);
+  -webkit-print-color-adjust: exact;
+  print-color-adjust: exact;
+}
+
+/* ------------------------------------------------------------
+   Rodapé institucional — faixa dourada de sangria completa,
+   repetida em todas as páginas (inclusive a capa).
+   ------------------------------------------------------------ */
+.pop-footer {
+  position: fixed;
+  left: -52pt;
+  bottom: 0;              /* base da caixa de conteúdo = 833,9pt */
+  width: 595.28pt;
+  height: 14pt;
+}
+.pop-footer img { display: block; width: 595.28pt; height: 14pt; }
+
+/* ------------------------------------------------------------
+   Capa
+   ------------------------------------------------------------ */
+.cover-logo { display: block; width: 216pt; height: 92.8pt; margin: 4pt auto 0; }
+
+.cover-rule { border-top: 1.4pt solid var(--gold); margin-top: 16pt; }
+
+.cover-eyebrow {
+  margin: 7pt 0 0;
+  font: bold 10pt/13pt var(--sans);
+  color: var(--gold-ink);
+}
+
+.cover-title {
+  margin: 15pt 0 0;
+  font: bold 21pt/26pt var(--serif);
+  color: var(--navy);
+}
+
+.cover-kicker {
+  margin: 5pt 0 0;
+  font: italic 12.5pt/16pt var(--serif);
+  color: var(--ink-soft);
+}
+
+.cover-rule-short {
+  width: 320pt;
+  margin: 8pt auto 0;
+  border-top: 0.6pt solid var(--rule-soft);
+}
+
+.cover-byline {
+  margin: 6pt 0 0;
+  font: 8.5pt/11pt var(--sans);
+  color: var(--ink-faint);
+}
+
+/* ------------------------------------------------------------
+   Cabeçalho corrente (páginas 2+) — vai no <thead> da tabela
+   que envolve o corpo, para repetir em toda quebra de página.
+   ------------------------------------------------------------ */
+.run-head { position: relative; height: 38pt; border-bottom: 0.8pt solid var(--gold); }
+.run-mark  { position: absolute; left: 0; top: 0; width: 19.5pt; height: 30pt; }
+.run-title {
+  position: absolute; right: 0; top: 6pt;
+  font: italic 8.5pt/11pt var(--serif);
+  color: var(--ink-faint);
+}
+.pop-body { width: 100%; border-collapse: collapse; }
+.pop-body td { padding: 0; vertical-align: top; }
+/* 68pt (filete) + 22pt = conteúdo começando em 90pt, como nos modelos */
+.pop-body thead td.run-cell { padding: 0 0 22pt; }
+/* espaçador invisível: reserva, em toda página, a faixa entre 762pt e o rodapé */
+.pop-body tfoot td { height: 72pt; padding: 0; }
+
+/* ------------------------------------------------------------
+   Página 1 — capa + seções i e ii
+   ------------------------------------------------------------ */
+.page-one { break-after: page; }
+.cover-head { text-align: center; }
+
+/* ------------------------------------------------------------
+   Faixa de seção  (i, ii, iii, iv, v)
+   ------------------------------------------------------------ */
+.sec {
+  position: relative;
+  height: 22pt;
+  margin: 8pt 0 0;
+  background: var(--navy);
+  border-radius: 3pt;
+  break-after: avoid;
+  break-inside: avoid;
+}
+.sec-num {
+  position: absolute; left: 6.5pt; top: 2.5pt;
+  width: 17pt; height: 17pt; border-radius: 50%;
+  background: var(--gold);
+  font: bold 10pt/17pt var(--sans);
+  color: var(--navy-ink);
+  text-align: center;
+}
+.sec-title {
+  position: absolute; left: 32pt; top: 0;
+  font: bold 12pt/22pt var(--serif);
+  color: #fff;
+}
+
+.sec + * { margin-top: 12.5pt; }
+.sec + .step { margin-top: 10pt; }
+.cover-head + .sec { margin-top: 20pt; }
+.pop-body td > .sec:first-child { margin-top: 0; }
+.break-before { margin-top: 0 !important; }
+
+/* ------------------------------------------------------------
+   Corpo de texto
+   ------------------------------------------------------------ */
+p { margin: 0 0 6pt; text-align: justify; }
+p.soft { color: var(--ink-soft); }
+
+/* ------------------------------------------------------------
+   ii — legenda "Como ler este fluxo"
+   ------------------------------------------------------------ */
+.sec + .legend { margin-top: 10pt; }
+.legend-row { position: relative; height: 14pt; margin-bottom: 6pt; }
+.legend-row:last-child { margin-bottom: 0; }
+.legend-tag {
+  position: absolute; left: 0; top: 0;
+  width: 118pt; height: 14pt; border-radius: 2pt;
+  background: var(--navy);
+  font: bold 8.2pt/14pt var(--sans);
+  color: #fff;
+  text-align: center;
+  letter-spacing: 0.2pt;
+}
+.legend-tag.auto     { background: var(--gold-ink); }
+.legend-tag.decision { background: var(--red); }
+.legend-txt {
+  position: absolute; left: 130pt; top: 0;
+  font-size: 10pt; line-height: 14pt;
+  color: var(--ink-soft);
+}
+
+/* ------------------------------------------------------------
+   iii — visão geral do fluxo (cards + seta)
+   ------------------------------------------------------------ */
+.sec + .flow { margin-top: 12pt; }
+
+.card {
+  position: relative;
+  height: 50pt;
+  margin: 0 4pt;
+  background: var(--card-bg);
+  border-left: 3pt solid var(--navy);
+  border-radius: 4pt;
+  break-inside: avoid;
+}
+.card.auto { border-left-color: var(--gold); }
+
+.card-num {
+  position: absolute; left: 15pt; top: 10pt;
+  width: 30pt; height: 30pt; border-radius: 50%;
+  background: var(--navy);
+  font: bold 15pt/30pt var(--serif);
+  color: var(--gold);
+  text-align: center;
+}
+.card-title {
+  position: absolute; left: 56pt; top: 10.3pt; right: 100pt;
+  font: bold 12.5pt/15pt var(--serif);
+  color: var(--navy);
+}
+.card-desc {
+  position: absolute; left: 56pt; top: 29.5pt; right: 12pt;
+  font: 9pt/12pt var(--sans);
+  color: var(--ink-soft);
+}
+.card-badge {
+  position: absolute; right: 8pt; top: 18.5pt;
+  width: 84pt; height: 13pt; border-radius: 2pt;
+  background: var(--gold);
+  font: bold 7.3pt/13pt var(--sans);
+  color: var(--navy-ink);
+  text-align: center;
+  letter-spacing: 0.2pt;
+}
+
+/* seta entre cards: filete de 8pt + triângulo de 8x5pt, em x=86pt */
+.arrow { position: relative; height: 14pt; break-inside: avoid; }
+.arrow::before {
+  content: ""; position: absolute; left: 34pt; top: 2pt;
+  height: 8pt; border-left: 1pt solid var(--gold);
+}
+.arrow::after {
+  content: ""; position: absolute; left: 30pt; top: 8pt;
+  border-left: 4pt solid transparent;
+  border-right: 4pt solid transparent;
+  border-top: 5pt solid var(--gold);
+}
+
+/* ------------------------------------------------------------
+   iv — detalhamento das etapas
+
+   Cada etapa vai dentro de .step, que nunca se divide entre páginas:
+   nos PDFs modelo todo bloco de etapa cabe inteiro em uma página.
+   ------------------------------------------------------------ */
+.step { margin-top: 16pt; break-inside: avoid; }
+.step > .etapa:first-child { margin-top: 0; }
+
+.etapa {
+  position: relative;
+  height: 30pt;
+  margin-top: 16pt;
+  background: var(--navy);
+  border-radius: 3pt;
+  break-after: avoid;
+  break-inside: avoid;
+}
+.etapa-num {
+  position: absolute; left: 9.5pt; top: 2.5pt;
+  width: 25pt; height: 25pt; border-radius: 50%;
+  background: var(--gold);
+  font: bold 14pt/25pt var(--serif);
+  color: var(--navy-ink);
+  text-align: center;
+}
+.etapa-title {
+  position: absolute; left: 42pt; top: 0;
+  font: bold 13.5pt/30pt var(--serif);
+  color: #fff;
+}
+.etapa-resp {
+  position: absolute; right: 10pt; top: 0;
+  font: 8.4pt/30pt var(--sans);
+  color: #fff;
+}
+.etapa + * { margin-top: 12.5pt; }
+
+/* rótulo dourado: Documentos, Checklist, Dados extraídos, ... */
+.label {
+  margin: 10.5pt 0 5.5pt;
+  font: bold 9.5pt/12pt var(--sans);
+  color: var(--gold-ink);
+}
+.docs + .label { margin-top: 12pt; }
+
+/* linha de documentos, separada por • */
+.docs {
+  margin: 0;
+  font-size: 10pt; line-height: 14pt;
+  color: var(--ink-soft);
+  text-align: justify;
+}
+
+/* checklist com quadradinho vazado */
+.checklist { margin: 0; padding: 0; list-style: none; }
+.checklist li {
+  position: relative;
+  padding-left: 22pt;
+  margin-bottom: 3pt;
+  font-size: 10pt; line-height: 13.5pt;
+  break-inside: avoid;
+}
+.checklist li:last-child { margin-bottom: 0; }
+.checklist li::before {
+  content: ""; position: absolute; left: 2pt; top: 1.6pt;
+  width: 9pt; height: 9pt;
+  border: 1pt solid var(--navy);
+}
+.label + .checklist { margin-top: 0; }
+
+/* ------------------------------------------------------------
+   Caixas de destaque
+     .callout            → dourada  (ATENÇÃO, DICA, AUTOMATIZADO, FECHAMENTO)
+     .callout.decision   → vermelha (ponto de decisão)
+   ------------------------------------------------------------ */
+.callout {
+  margin: 7pt 0 16pt;
+  padding: 6pt 10pt;
+  background: var(--box-info-bg);
+  border: 0.8pt solid var(--gold);
+  border-left: 4pt solid var(--gold);
+  font-size: 9.8pt; line-height: 13.5pt;
+  color: var(--navy-ink);
+  text-align: justify;
+  break-inside: avoid;
+}
+.callout.decision {
+  background: var(--box-decision-bg);
+  border-color: var(--red);
+}
+.callout p { margin: 0; text-align: justify; }
+.callout:last-child { margin-bottom: 0; }
+
+/* ------------------------------------------------------------
+   v — ferramentas e premissas fixas
+   ------------------------------------------------------------ */
+.legal { margin: 0; padding: 0; list-style: none; }
+.sec + .legal { margin-top: 12.5pt; }
+.legal li {
+  position: relative;
+  padding-left: 14pt;
+  margin-bottom: 7pt;
+  font-size: 10pt; line-height: 14pt;
+  text-align: justify;
+  break-inside: avoid;
+}
+.legal li:last-child { margin-bottom: 0; }
+.legal li::before {
+  content: ""; position: absolute; left: 1.8pt; top: 5.4pt;
+  width: 4.4pt; height: 4.4pt; border-radius: 50%;
+  background: var(--navy);
+}
+.legal .k { color: var(--gold-legal); }
+
+/* ------------------------------------------------------------
+   Utilidades
+   ------------------------------------------------------------ */
+.keep { break-inside: avoid; }
+.break-before { break-before: page; }

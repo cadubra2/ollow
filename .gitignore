@@ -1,0 +1,50 @@
+.env
+google-service-account.json
+google-oauth-client.json
+google-oauth-token.json
+
+# Banco e backups: contem o historico completo das conversas dos clientes.
+# `conversations.db` ja estava ignorado, mas os backups gerados pelos scripts de correcao NAO —
+# e eles carregam exatamente o mesmo conteudo.
+conversations.db
+conversations.db-wal
+conversations.db-shm
+conversations.backup-*.db
+database.db
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Logs: contem telefone, nome e texto das mensagens.
+bot.log
+bot.err
+bot-err.log
+server_debug.log
+ngrok.log
+*.log
+
+# Comprovantes de pagamento baixados dos clientes.
+comprovantes/
+
+# URL publica do tunel — muda a cada boot e nao deve ser versionada.
+tunnel_url.txt
+
+.wwebjs_auth/
+.wwebjs_cache/
+node_modules/
+.DS_Store
+Thumbs.db
+.zcode/
+
+# Config local do Claude Code (por maquina/usuario, nao e codigo do bot).
+.claude/
+
+# Binario do ngrok bundlado (32MB, so Windows) — baixar/instalar por maquina em vez de versionar.
+ngrok/
+
+# Arquivos compactados dos assets do POP: ja estao versionados soltos em docs/pop/assets/.
+docs/pop/assets.zip
+docs/pop/assets.rar
+
+# Documento avulso, nao faz parte do codigo do bot.
+Apresentacao_Comite_IA.docx
