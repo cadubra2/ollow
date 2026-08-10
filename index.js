@@ -750,6 +750,12 @@ async function putDealComVerificacao(dealId, mudancas, verificar, origem = 'BOT_
     headers: { ...apiHeaders, 'X-Ollow-Origin': origem },
   });
   const dealAtual = { ...getRes.data, ...mudancas };
+  // O Moskit rejeita PUT cujo corpo traga status null ("Enum cannot be null"). Quando o GET vem sem
+  // status, assume OPEN (o PUT aqui so acontece em operacoes de avancar/fechar — nunca reabre um
+  // WON/LOST, e o status real de um deal em movimento no funil e OPEN).
+  if (dealAtual.status === null || dealAtual.status === undefined || dealAtual.status === '') {
+    dealAtual.status = STATUS_DEAL.OPEN;
+  }
   await axios.put(`${MOSKIT_BASE}/deals/${dealId}`, dealAtual, {
     headers: { ...apiHeaders, 'X-Ollow-Origin': origem },
   });
@@ -3320,7 +3326,9 @@ app.listen(PORT, () => {
   // A API local do ngrok fica na 4040; se ela ja estiver ocupada por outro agente, o proximo sobe
   // na 4041, e assim por diante. Nao da pra fixar por flag (--web-addr nao existe no CLI, so em
   // arquivo de config), entao varremos a faixa e pegamos o tunnel que aponta pra NOSSA porta.
-  const ngrokProcess = spawn(ngrokPath, ['http', String(PORT)], { stdio: 'ignore', windowsHide: true });
+  const ngrokProcess = spawn(ngrokPath, process.env.NGROK_URL
+    ? ['http', String(PORT), '--url=' + process.env.NGROK_URL]
+    : ['http', String(PORT)], { stdio: 'ignore', windowsHide: true });
   const NGROK_API_PORTS = [4040, 4041, 4042, 4043, 4044, 4045];
   const tentarNgrok = async () => {
     for (let i = 0; i < 30; i++) {
