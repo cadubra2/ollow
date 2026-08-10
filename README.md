@@ -64,6 +64,18 @@ Em desenvolvimento, exponha a porta local (padrão 3000) com ngrok ou `node star
 Não há process manager configurado (pm2/systemd/Docker) — em produção, rodar por trás de um
 supervisor de processos é responsabilidade de quem fizer o deploy.
 
+## Deploy na VPS (Ubuntu)
+
+1. Suba uma VPS (Oracle/etc.) e rode `bash deploy-vps.sh` via SSH (instala Node 22, clona o repo,
+   instala dependências, baixa o ngrok, roda `npm test` e registra no pm2).
+2. Antes de subir, copie os arquivos de config da máquina atual via scp:
+   `.env`, `google-oauth-client.json`, `google-oauth-token.json`, `conversations.db` e `comprovantes/`.
+3. No `.env` da VPS: defina `NGROK_URL=<dominio-estatico>` (senão a URL do túnel muda a cada
+   restart e o webhook do Zernio quebra) e `TZ_ESCRITORIO` se o fuso não for `America/Fortaleza`.
+4. O tunnel fica em `~/ollow/ngrok/ngrok` (sem `.exe` no Linux) — o `index.js` escolhe o binário
+   pelo SO automaticamente. O token do ngrok vai em `NGROK_AUTHTOKEN` no `.env` da VPS, nunca
+   commitado no script.
+
 ## Auto-deploy (opcional)
 
 Pra manter uma instância sempre atualizada sozinha a cada `git push`, sem precisar entrar na
