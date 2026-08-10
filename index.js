@@ -3320,7 +3320,9 @@ app.listen(PORT, () => {
 
   // Expor via ngrok para receber webhooks do Zernio
   const { spawn } = require('child_process');
-  const ngrokPath = require('path').join(__dirname, 'ngrok', 'ngrok.exe');
+  const ngrokPath = process.platform === 'win32'
+    ? require('path').join(__dirname, 'ngrok', 'ngrok.exe')
+    : require('path').join(__dirname, 'ngrok', 'ngrok');
   // Porta propria para a API local do ngrok: a 4040 (padrao) pode estar ocupada por
   // outro agente (ex: bot de comprovantes na 3010) e ai leriamos o tunnel errado
   // A API local do ngrok fica na 4040; se ela ja estiver ocupada por outro agente, o proximo sobe
