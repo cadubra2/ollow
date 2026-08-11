@@ -367,6 +367,20 @@ function mesclarCustomFields(existentes, novos) {
   return [...mapa.values()];
 }
 
+// Compara por id do custom field + conjunto de options (nao por posicao no array nem
+// JSON.stringify direto — o Moskit nao garante a mesma ordem de array em duas leituras, e
+// id/options podem vir como string numa leitura e number noutra).
+function customFieldsPersistiram(esperados, atuais) {
+  const mapaAtual = new Map((Array.isArray(atuais) ? atuais : []).map((c) => [c.id, c]));
+  return (Array.isArray(esperados) ? esperados : []).every((esperado) => {
+    const atual = mapaAtual.get(esperado.id);
+    if (!atual) return false;
+    const optsEsperados = (esperado.options || []).map(String).sort();
+    const optsAtuais = (atual.options || []).map(String).sort();
+    return optsEsperados.length === optsAtuais.length && optsEsperados.every((o, i) => o === optsAtuais[i]);
+  });
+}
+
 // ------------------------------------------------------------
 // Helpers
 // ------------------------------------------------------------
@@ -610,6 +624,9 @@ async function criarNegocioMoskit(dados, contactId, opcoes = {}) {
 
 async function atualizarNegocioMoskit(dealId, dados, contactId, opcoes = {}) {
   const payload = montarPayloadMoskit(dados, contactId, opcoes);
+  // Tudo que o bot decidiu sobre este lead NESTA rodada, antes do merge com o que ja existia
+  // remotamente (que so acontece no GET abaixo) — e exatamente o que confirmamos apos o PUT.
+  const camposEsperados = payload.entityCustomFields;
 
   // O PUT substitui o deal inteiro. Le o estado atual antes pra (1) nao apagar campo personalizado
   // que a equipe preencheu na mao e o bot nao resolveu nesta rodada, e (2) preservar marcacao manual
@@ -661,6 +678,25 @@ async function atualizarNegocioMoskit(dealId, dados, contactId, opcoes = {}) {
     headers: { ...apiHeaders, 'X-Ollow-Origin': 'BOT_WHATSAPP' },
     validateStatus: (s) => s >= 200 && s < 300,
   });
+
+  // O Moskit pode aceitar o PUT (2xx) e so aplicar o valor de fato alguns segundos depois (mesmo
+  // cache/lag de propagacao documentado em putDealComVerificacao, abaixo). Sem esta confirmacao o
+  // bot cria a nota de "Campos preenchidos" achando que deu certo mesmo quando o campo nao pegou —
+  // foi exatamente isso que exigiu correcao manual no deal 48423360 (LGPD ficou preso no CRM depois
+  // do bot ja ter decidido corretamente "Direito Administrativo"). Se nao ha custom field resolvido
+  // nesta rodada, pula a confirmacao: zero GETs extras, zero latencia no caso comum.
+  if (camposEsperados.length > 0) {
+    const { confirmado, deal } = await confirmarAposRetentativas(
+      dealId,
+      (d) => customFieldsPersistiram(camposEsperados, d?.entityCustomFields)
+    );
+    if (!confirmado) {
+      throw new Error(
+        `Moskit aceitou o PUT no deal ${dealId} (2xx) mas os campos personalizados nao se confirmaram ` +
+        `apos retentativas (esperado: ${JSON.stringify(camposEsperados)}, lido: ${JSON.stringify(deal?.entityCustomFields)})`
+      );
+    }
+  }
   return response.data;
 }
 
@@ -745,6 +781,24 @@ async function criarNotaMoskit(dealId, texto) {
 // por alguns segundos (confirmado no mesmo teste: uma espera de 1.5s ainda nao foi suficiente numa
 // das rodadas) — por isso reconfere algumas vezes antes de declarar falha, em vez de arriscar um
 // falso negativo numa automacao sem checkpoint humano. Retorna o deal lido na confirmacao.
+// Mecanismo de retry compartilhado: GET repetido (1.5s/2s/3s) ate `verificar(deal)` bater, ou
+// devolve o ultimo lido sem confirmar. Nao lanca — quem decide se isso e erro (e a mensagem) e o
+// chamador, porque o que se verifica (stage/status escalar vs. array de entityCustomFields) e
+// diferente em cada caso.
+async function confirmarAposRetentativas(dealId, verificar, origem = 'BOT_WHATSAPP') {
+  const esperasMs = [1500, 2000, 3000];
+  let ultimoLido = null;
+  for (const ms of esperasMs) {
+    await new Promise((r) => setTimeout(r, ms));
+    const conferir = await axios.get(`${MOSKIT_BASE}/deals/${dealId}`, {
+      headers: { ...apiHeaders, 'X-Ollow-Origin': origem },
+    });
+    ultimoLido = conferir.data;
+    if (verificar(ultimoLido)) return { confirmado: true, deal: ultimoLido };
+  }
+  return { confirmado: false, deal: ultimoLido };
+}
+
 async function putDealComVerificacao(dealId, mudancas, verificar, origem = 'BOT_WHATSAPP') {
   const getRes = await axios.get(`${MOSKIT_BASE}/deals/${dealId}`, {
     headers: { ...apiHeaders, 'X-Ollow-Origin': origem },
@@ -760,17 +814,11 @@ async function putDealComVerificacao(dealId, mudancas, verificar, origem = 'BOT_
     headers: { ...apiHeaders, 'X-Ollow-Origin': origem },
   });
 
-  const esperasMs = [1500, 2000, 3000];
-  let ultimoLido = null;
-  for (const ms of esperasMs) {
-    await new Promise((r) => setTimeout(r, ms));
-    const conferir = await axios.get(`${MOSKIT_BASE}/deals/${dealId}`, {
-      headers: { ...apiHeaders, 'X-Ollow-Origin': origem },
-    });
-    ultimoLido = conferir.data;
-    if (verificar(ultimoLido)) return ultimoLido;
+  const { confirmado, deal } = await confirmarAposRetentativas(dealId, verificar, origem);
+  if (!confirmado) {
+    throw new Error(`Moskit aceitou o PUT no deal ${dealId} mas a mudanca nao se confirmou (mudancas: ${JSON.stringify(mudancas)}, lido: stage=${deal?.stage?.id} status=${deal?.status})`);
   }
-  throw new Error(`Moskit aceitou o PUT no deal ${dealId} mas a mudanca nao se confirmou (mudancas: ${JSON.stringify(mudancas)}, lido: stage=${ultimoLido?.stage?.id} status=${ultimoLido?.status})`);
+  return deal;
 }
 
 async function moverParaEstagio(dealId, stageId) {
@@ -3376,6 +3424,7 @@ module.exports = {
   // proposito: e totalmente observavel atraves de handleAgendamentoCalendar.
   buscarOuCriarContato,
   aplicarViradaCobranca,
+  atualizarNegocioMoskit,
   handleAgendamentoCalendar,
   finalizarCiclo,
   moverParaEstagio,

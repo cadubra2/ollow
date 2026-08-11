@@ -50,8 +50,10 @@ google.calendar = () => ({
 });
 
 const {
-  moverParaEstagio, criarNotaMoskit, aplicarViradaCobranca, handleAgendamentoCalendar, finalizarCiclo,
+  moverParaEstagio, criarNotaMoskit, aplicarViradaCobranca, atualizarNegocioMoskit,
+  handleAgendamentoCalendar, finalizarCiclo,
 } = require('./index');
+const moskitIds = require('./src/moskit-ids');
 
 const db = new Database(process.env.DB_PATH);
 
@@ -85,6 +87,16 @@ function semear(chatId, extras = {}) {
 const esperarErro = async (fn) => { try { await fn(); return null; } catch (e) { return e.message; } };
 
 const DADOS = { nome: 'Fulano de Tal', assunto: 'Inventario', tipo_consulta: 'consulta paga', advogado_responsavel: 'Bruno' };
+
+// entityCustomFields que atualizarNegocioMoskit vai tentar confirmar apos o PUT para DADOS (so
+// tipo_consulta e advogado_responsavel se resolvem — o resto fica null). Usado nos GETs simulados
+// dos testes de aplicarViradaCobranca abaixo, pra que a reconferencia pos-PUT ja encontre o campo
+// "persistido" de cara — sem isso, todo teste que usa DADOS ficaria 6.5s tentando e por fim
+// lancando, porque o dublê de rede nao tem estado real pra refletir o PUT que acabou de acontecer.
+const CF_DADOS = [
+  { id: moskitIds.CF.TIPO_CONSULTA, options: [moskitIds.TIPO_CONSULTA['consulta paga']] },
+  { id: moskitIds.CF.RESPONSAVEL, options: [moskitIds.RESPONSAVEL_PROCESSO['bruno']] },
+];
 
 (async () => {
   // ============================================================
@@ -121,6 +133,69 @@ const DADOS = { nome: 'Fulano de Tal', assunto: 'Inventario', tipo_consulta: 'co
     let seq = [{ stage: { id: 179388 } }, { stage: { id: '184382' } }];
     rede.get = () => ({ status: 200, data: seq.shift() });
     igual('id como string nao gera falso alarme (compara com Number)', await esperarErro(() => moverParaEstagio(7, 184382)), null);
+  }
+
+  // ============================================================
+  console.log('\n=== atualizarNegocioMoskit: o PUT so conta se os custom fields realmente pegarem ===');
+  // Regressao do deal 48423360: a IA decidiu "Direito Administrativo" e o bot criou a nota de
+  // sucesso, mas o Moskit aceitou o PUT (2xx) sem aplicar o campo de fato — exigiu correcao manual
+  // no CRM. atualizarNegocioMoskit agora reconfere os entityCustomFields que decidiu enviar, com o
+  // mesmo retry de moverParaEstagio, antes de devolver sucesso.
+  const DADOS_AREA = { ...DADOS, area_direito: 'Direito Administrativo' };
+  const CF_AREA = [
+    ...CF_DADOS,
+    { id: moskitIds.CF.AREA_DIREITO, options: [moskitIds.AREA_DIREITO['direito administrativo']] },
+  ];
+  {
+    limpar();
+    let seq = [
+      { id: 20, name: 'Cliente sem nome', stage: { id: 179388 }, entityCustomFields: [] },
+      { id: 20, entityCustomFields: CF_AREA },
+    ];
+    rede.get = () => ({ status: 200, data: seq.shift() });
+    const erro = await esperarErro(() => atualizarNegocioMoskit(20, DADOS_AREA, 555, {}));
+    igual('campo realmente pegou → resolve', erro, null);
+    igual('   fez 2 GET (leitura de merge + 1 conferencia)', de('GET', '/deals/20').length, 2);
+    igual('   fez 1 PUT', de('PUT', '/deals/20').length, 1);
+  }
+  {
+    // Exatamente o sintoma do deal 48423360: Moskit aceita o PUT (2xx) mas a area do direito nunca
+    // aparece nas releituras — antes disto, a funcao devolvia sucesso do mesmo jeito.
+    limpar();
+    let seq = [
+      { id: 21, entityCustomFields: [] },
+      { id: 21, entityCustomFields: [] },
+      { id: 21, entityCustomFields: [] },
+      { id: 21, entityCustomFields: [] },
+    ];
+    rede.get = () => ({ status: 200, data: seq.shift() });
+    const erro = await esperarErro(() => atualizarNegocioMoskit(21, DADOS_AREA, 555, {}));
+    checar('Moskit aceitou o PUT mas o campo nao pegou → LANCA', !!erro && erro.includes('nao se confirmaram'), erro);
+  }
+  {
+    // Prova de que a comparacao nao e JSON.stringify ingenuo: ordem do array e tipo de options
+    // diferentes (string vs number) nao podem gerar falso alarme.
+    limpar();
+    const invertidoEComoString = [
+      { id: moskitIds.CF.AREA_DIREITO, options: [String(moskitIds.AREA_DIREITO['direito administrativo'])] },
+      ...CF_DADOS,
+    ].reverse();
+    let seq = [
+      { id: 22, entityCustomFields: [] },
+      { id: 22, entityCustomFields: invertidoEComoString },
+    ];
+    rede.get = () => ({ status: 200, data: seq.shift() });
+    igual('ordem/tipo diferentes no array nao geram falso alarme',
+      await esperarErro(() => atualizarNegocioMoskit(22, DADOS_AREA, 555, {})), null);
+  }
+  {
+    // dados sem nenhum campo mapeavel (origem/tipo_consulta/captacao/area/responsavel todos null) →
+    // camposEsperados fica vazio, e a funcao nao tem nada pra reconferir.
+    limpar();
+    rede.get = () => ({ status: 200, data: { id: 23, entityCustomFields: [] } });
+    const erro = await esperarErro(() => atualizarNegocioMoskit(23, { nome: 'Sem Campos' }, 555, {}));
+    igual('nenhum custom field resolvido → resolve sem reconferir', erro, null);
+    igual('   so o GET de leitura, zero GET de conferencia', de('GET', '/deals/23').length, 1);
   }
 
   // ============================================================
@@ -161,7 +236,7 @@ const DADOS = { nome: 'Fulano de Tal', assunto: 'Inventario', tipo_consulta: 'co
   }
   {
     limpar();
-    rede.get = () => ({ status: 200, data: { id: 10, name: 'Fulano de Tal - Inventario', stage: { id: 179388 } } });
+    rede.get = () => ({ status: 200, data: { id: 10, name: 'Fulano de Tal - Inventario', stage: { id: 179388 }, entityCustomFields: CF_DADOS } });
     const row = semear(TEL, { deal_id: 10 });
     await aplicarViradaCobranca(TEL, row, DADOS, { condicoesValorEnviadas: true }, TEL);
     const puts = de('PUT', '/deals/10');
@@ -176,7 +251,7 @@ const DADOS = { nome: 'Fulano de Tal', assunto: 'Inventario', tipo_consulta: 'co
     // Consulta ja marcada como cortesia que vira paga: o evento NAO e cancelado — desmarcar reuniao
     // de cliente real por inferencia e pior que o erro. Avisa a equipe para cobrar.
     limpar();
-    rede.get = () => ({ status: 200, data: { id: 11, stage: { id: 184382 } } });
+    rede.get = () => ({ status: 200, data: { id: 11, stage: { id: 184382 }, entityCustomFields: CF_DADOS } });
     const row = semear(TEL, { deal_id: 11, evento_calendar_criado: 1, evento_calendar_id: 'ev9', evento_calendar_data: '2026-08-05T17:30:00' });
     await aplicarViradaCobranca(TEL, row, DADOS, { condicoesValorEnviadas: true }, TEL);
     igual('evento ja na agenda → 1 alerta no Telegram', telegrams().length, 1);
@@ -186,7 +261,7 @@ const DADOS = { nome: 'Fulano de Tal', assunto: 'Inventario', tipo_consulta: 'co
   }
   {
     limpar();
-    rede.get = () => ({ status: 200, data: { id: 12, stage: { id: 184382 } } });
+    rede.get = () => ({ status: 200, data: { id: 12, stage: { id: 184382 }, entityCustomFields: CF_DADOS } });
     const row = semear(TEL, { deal_id: 12, evento_calendar_criado: 1, evento_calendar_id: 'ev9', evento_calendar_data: null });
     await aplicarViradaCobranca(TEL, row, DADOS, { condicoesValorEnviadas: true }, TEL);
     checar('evento sem data registrada → alerta sai mesmo assim', telegrams()[0]?.corpo.text.includes('horario nao registrado'));
