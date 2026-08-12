@@ -23,6 +23,11 @@ process.env.TELEGRAM_CHAT_ID = '1';
 // ligado de verdade la). Os testes de dry-run abaixo dependem de comecar em 'true'.
 process.env.FUNIL_DRY_RUN = 'true';
 process.env.FUNIL_FECHAMENTO_DRY_RUN = 'true';
+// Mesmo motivo, sinal trocado: AGENDA_MOSKIT_DRY_RUN default FALSE (a agenda funciona sem a
+// variavel), e todas as assercoes de agenda deste arquivo cobrem o caminho LIGADO. Fixar em 'false'
+// impede que um .env de producao com a flag ligada faca esses testes passarem por engano, sem
+// escrever nada. O caminho desligado tem arquivo proprio: test-agenda-dry-run.js.
+process.env.AGENDA_MOSKIT_DRY_RUN = 'false';
 
 // ---------- dublê do axios ----------
 const axios = require('axios');

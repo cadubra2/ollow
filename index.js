@@ -66,6 +66,16 @@ const FUNIL_DRY_RUN = process.env.FUNIL_DRY_RUN !== 'false'; // default true (so
 // separada de FUNIL_DRY_RUN de proposito, pra poder ligar o avanco de estagio primeiro, observar,
 // e so depois (com confianca independente) ligar o fechamento automatico.
 const FUNIL_FECHAMENTO_DRY_RUN = process.env.FUNIL_FECHAMENTO_DRY_RUN !== 'false'; // default true
+// Desliga a escrita na AGENDA do Moskit (a Atividade que representa a consulta) sem precisar de
+// redeploy: basta mudar o .env na VPS e reiniciar. E botao de emergencia, nao encenacao.
+//
+// ATENCAO — a comparacao aqui e INVERTIDA em relacao as duas flags acima (`=== 'true'` em vez de
+// `!== 'false'`), de proposito: esta flag default FALSE, ou seja, a agenda funciona por padrao. As
+// outras seguram PALPITE DE IA sobre estagio de funil, e por isso nascem desligadas; aqui a regra e
+// deterministica — houve dupla confirmacao de cliente e equipe, entao a consulta existe e tem que
+// aparecer na agenda. Nao "conserte" esta linha para `!== 'false'`: isso desligaria a funcionalidade
+// em producao em silencio (ha teste cobrindo os dois caminhos).
+const AGENDA_MOSKIT_DRY_RUN = process.env.AGENDA_MOSKIT_DRY_RUN === 'true'; // default FALSE
 // Cria evento/Meet sem comprovante quando o deal esta marcado como "consulta gratis" no Moskit.
 // Default DESLIGADO de proposito: sobe o codigo, roda GET /auditoria-consulta-gratis pra ver o que
 // seria liberado, e so entao liga no .env.
@@ -1604,6 +1614,15 @@ function montarDescricaoEvento(dados, chatId) {
 async function registrarConsultaNaAgendaMoskit({ dealId, dados, chatId, horarioIso, meetLink, eventoId, row }) {
   if (!dealId) return false;
   if (row?.atividade_moskit_id) return false; // ja tem atividade — nao duplicar na agenda do CRM
+
+  if (AGENDA_MOSKIT_DRY_RUN) {
+    // Uma nota so: esta funcao roda no ramo de CRIACAO do evento, guardado por
+    // evento_calendar_criado — uma vez por conversa, nao a cada ciclo.
+    const quando = formatarHorarioEscritorio(horarioIso);
+    console.log(`  ⏭️ [dry-run] atividade do Moskit NAO criada para o deal ${dealId} (AGENDA_MOSKIT_DRY_RUN ativo)`);
+    await criarNotaMoskit(dealId, `🤖 [dry-run] A consulta de ${quando} NAO foi lançada na agenda do Moskit (AGENDA_MOSKIT_DRY_RUN ativo) — marque a atividade na mão. O evento no Google Agenda foi criado normalmente.`).catch(() => {});
+    return false;
+  }
 
   const dueDate = horarioNaiveParaInstante(horarioIso, TZ_ESCRITORIO);
   if (!dueDate) {

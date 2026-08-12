@@ -24,7 +24,8 @@ node test-telefone.js    # roda um arquivo de teste isolado (mesmo padrão para 
 ```
 
 `npm test` executa em sequência: `test-telefone.js`, `test-moskit-ids.js`, `test-atividade-moskit.js`, `test-evidencia.js`,
-`test-fila.js`, `test-payload.js`, `test-rotas.js`, `test-pipeline.js`, `test-guards-internos.js`,
+`test-fila.js`, `test-payload.js`, `test-rotas.js`, `test-pipeline.js`, `test-agenda-dry-run.js`,
+`test-guards-internos.js`,
 `test-agendamento-bloco-mensagens.js`, `test-transcricao.js`. Todos usam `DB_PATH` apontando para
 um arquivo inexistente (banco descartável) — **nunca** deixe um teste abrir `conversations.db` de
 produção.
@@ -193,6 +194,10 @@ risco de evento duplicado.
   três horas fora do lugar na agenda, em silêncio.
 - **Responsável.** A atividade sai no nome da Layla (`LAYLA_USER_ID`), como todo contato, deal e nota
   criados pelo bot. Não confundir com `advogado_responsavel`, que é campo personalizado do deal.
+- **Botão de emergência.** `AGENDA_MOSKIT_DRY_RUN=true` desliga a escrita na agenda do CRM sem
+  redeploy (o evento no Google continua sendo criado; o deal recebe uma nota `[dry-run]`). O padrão é
+  o **inverso** de `FUNIL_DRY_RUN`: sem a variável, a agenda funciona. Aquelas flags seguram palpite
+  de IA sobre funil; esta guarda uma regra determinística, então nasce ligada.
 
 ### Segurança das rotas
 
