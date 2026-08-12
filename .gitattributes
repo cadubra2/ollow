@@ -1,0 +1,7 @@
+# Normaliza quebra de linha pra LF em todo arquivo de texto, independente do fuso/editor/SO de
+# quem commitou ou de quem fez checkout. Sem isso, um arquivo salvo com CRLF (Windows) direto no
+# working tree da VPS (fora do fluxo normal do git) faz `git status` marcar o arquivo como
+# "modificado" mesmo com o conteudo identico — e isso trava `git pull --ff-only` no deploy.js,
+# porque o git ve como "mudanca local" que seria sobrescrita pelo merge. `eol=lf` forca o
+# checkout a sempre gerar LF, e `text=auto` deixa o git decidir binario vs texto sozinho.
+* text=auto eol=lf

@@ -51,10 +51,49 @@ function liberarLock() {
   try { fs.unlinkSync(DEPLOY_LOCK_FILE); } catch {}
 }
 
+// `git pull --ff-only` recusa mesclar quando ha "mudanca local" no arquivo que o pull tocaria —
+// mas isso tambem dispara quando a UNICA diferenca e quebra de linha (CRLF vs LF), introduzida por
+// alguem editando um arquivo direto na VPS fora do git (aconteceu em 11/08/2026: index.js/README.md/
+// .env.example ficaram com CRLF e travaram todo deploy seguinte, exigindo intervencao manual via
+// SSH). `.gitattributes` (eol=lf) evita que isso volte a acontecer por qualquer operacao do PROPRIO
+// git, mas nao impede um editor externo de reescrever o arquivo em disco — por isso esta rede de
+// seguranca aqui: se o pull falhar E a diferenca de TODOS os arquivos citados no erro for zero
+// ignorando espaco/quebra de linha, descarta so esses arquivos e tenta mais uma vez. Qualquer
+// arquivo com diferenca de CONTEUDO real cancela a auto-recuperacao inteira — nunca descarta
+// trabalho de verdade.
+function arquivosSoComDiferencaDeQuebraDeLinha(mensagemErro) {
+  const bloco = /would be overwritten by merge:\n((?:\t.+\n?)+)/.exec(String(mensagemErro || ''));
+  if (!bloco) return [];
+  const arquivos = bloco[1].split('\n').map((l) => l.replace(/^\t/, '').trim()).filter(Boolean);
+  if (!arquivos.length) return [];
+  for (const arquivo of arquivos) {
+    try {
+      execSync(`git diff --ignore-space-at-eol --quiet -- "${arquivo}"`, { cwd: __dirname, stdio: 'pipe' });
+      // exit 0 = nao ha diferenca real (so quebra de linha) — segue conferindo os demais
+    } catch {
+      return []; // pelo menos um arquivo tem diferenca de conteudo de verdade — nao arrisca nada
+    }
+  }
+  return arquivos;
+}
+
+function pullComRecuperacaoDeQuebraDeLinha() {
+  try {
+    rodar('git pull --ff-only');
+  } catch (e) {
+    const detalhe = String(e.stdout || e.stderr || e.message || e);
+    const arquivos = arquivosSoComDiferencaDeQuebraDeLinha(detalhe);
+    if (!arquivos.length) throw e; // conflito de verdade — sobe pro catch normal, aborta o deploy
+    log(`  🩹 pull travou so por quebra de linha (CRLF/LF) em: ${arquivos.join(', ')} — resetando (sem perda de conteudo) e tentando de novo`);
+    for (const arquivo of arquivos) rodar(`git checkout -- "${arquivo}"`);
+    rodar('git pull --ff-only'); // uma unica retentativa; se falhar de novo, e um problema diferente
+  }
+}
+
 async function main() {
   log('🚀 Deploy iniciado');
   try {
-    rodar('git pull --ff-only');
+    pullComRecuperacaoDeQuebraDeLinha();
     rodar('npm install');
     rodar('npm test');
   } catch (e) {
