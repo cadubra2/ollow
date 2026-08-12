@@ -223,11 +223,13 @@ risco de evento duplicado.
 - **OpenAI**: chamada HTTPS direta (`openaiChat`), sem SDK — decisão deliberada para evitar hangs.
 - **Moskit CRM** (`MOSKIT_BASE`): `PUT` de deal precisa reenviar o corpo do `GET` (peculiaridade da
   API); `GET` logo após um `PUT` pode retornar dados em cache por até ~4s; `limit` de paginação
-  sempre retorna 10 independente do valor pedido, **e `?page=` é ignorado** (medido em 12/08/2026 em
-  `/activities`: `page=1` até `page=5` devolvem os mesmos 10 registros). Quem pagina de verdade é o
-  header `x-moskit-listing-next-page-token` — ver `listarAtividadesMoskit` e `buscarOuCriarContato`.
-  Um loop com `?page=` não dá erro nenhum: relê a mesma página e parece ter varrido tudo.
-  `deal.status` só aceita `OPEN`/`WON`/`LOST`.
+  sempre retorna 10 independente do valor pedido. Em `/activities` (medido em 12/08/2026, um
+  parâmetro por vez) **o único que pagina é `?start=`** — offset real; `page`, `pageToken`, `offset`,
+  `skip`, `from`, `maxId` e `beforeId` são todos **ignorados em silêncio**, respondendo 200 com a
+  primeira página de novo. Um loop errado aqui não quebra: relê os mesmos 10 registros e parece ter
+  varrido tudo. Ver `listarAtividadesMoskit`. Atenção: em `/contacts` quem pagina é o
+  `x-moskit-listing-next-page-token` (`buscarOuCriarContato`) — o mecanismo **difere por endpoint**,
+  não assuma. `deal.status` só aceita `OPEN`/`WON`/`LOST`.
   **Autoria dos campos personalizados**: o bot guarda em `custom_fields_bot` o último valor que ele
   mesmo escreveu; se o CRM divergir disso, alguém corrigiu na mão — o campo entra em
   `campos_travados` e o bot nunca mais o sobrescreve (`filtrarCamposPorAutoria`). `TIPO_CONSULTA`

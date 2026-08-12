@@ -456,40 +456,41 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
   }
 
   // ============================================================
-  // MEDIDO em 12/08/2026: `?page=` e ignorado por /activities — page=1..5 devolve os MESMOS 10
-  // registros. A varredura antiga "paginava" assim e enxergava 10 de ~1300 atividades, sem erro
-  // nenhum aparecendo em lugar nenhum. Estas assercoes existem para que ninguem volte a esse padrao.
-  console.log('\n=== listarAtividadesMoskit: pagina por pageToken, nao por ?page= ===');
+  // MEDIDO em 12/08/2026 contra a API real: em /activities o UNICO parametro que pagina e `?start=`.
+  // `page`, `pageToken`, `limit`, `offset`, `skip`, `from` sao todos ignorados EM SILENCIO — a
+  // chamada responde 200 com a primeira pagina de novo. Um loop errado aqui nao quebra: rele os
+  // mesmos 10 registros e parece ter varrido tudo, que foi exatamente o bug (a varredura enxergava
+  // 10 achando que enxergava 100). Estas assercoes existem para ninguem voltar a esse padrao.
+  console.log('\n=== listarAtividadesMoskit: pagina por ?start=, nao por page/pageToken ===');
   {
     limpar();
     const pagina = (ids) => ids.map((id) => ({ id, type: { id: moskitIds.ATIVIDADE_TIPO.reuniao } }));
     const lotes = [
-      { data: pagina([9, 8, 7]), headers: { 'x-moskit-listing-next-page-token': 'tok-A' } },
-      { data: pagina([6, 5, 4]), headers: { 'x-moskit-listing-next-page-token': 'tok-B' } },
-      { data: pagina([3, 2, 1]), headers: {} }, // sem token: acabou
+      pagina([10, 9, 8, 7, 6, 5, 4, 3, 2, 1]), // pagina cheia (10) → ha mais
+      pagina([20, 19, 18]),                    // incompleta → fim da lista
     ];
     let i = 0;
-    rede.get = () => ({ status: 200, ...lotes[i++] });
+    rede.get = () => ({ status: 200, data: lotes[i++] || [], headers: {} });
 
     const { atividades, truncou } = await listarAtividadesMoskit();
     const gets = de('GET', '/activities');
-    igual('varre as 3 paginas ate o token acabar', atividades.length, 9);
-    igual('   sem repetir registro (o sintoma do bug antigo)', new Set(atividades.map((a) => a.id)).size, 9);
-    igual('   3 requisicoes', gets.length, 3);
-    checar('   a primeira pede page=1', gets[0].cfg.params.page === 1 && !gets[0].cfg.params.pageToken, gets[0].cfg.params);
-    checar('   as seguintes mandam pageToken e NAO page', gets.slice(1).every((g) => g.cfg.params.pageToken && !g.cfg.params.page),
-      gets.slice(1).map((g) => g.cfg.params));
-    igual('   e repassam o token que veio no header', gets[1].cfg.params.pageToken, 'tok-A');
-    igual('   em ordem', gets[2].cfg.params.pageToken, 'tok-B');
+    igual('para na primeira pagina incompleta', gets.length, 2);
+    igual('   juntando os dois lotes', atividades.length, 13);
+    igual('   a primeira pede start=0', gets[0].cfg.params.start, 0);
+    igual('   a segunda avanca o offset pelo que ja veio', gets[1].cfg.params.start, 10);
+    checar('   e nunca manda page nem pageToken (ambos ignorados por esta API)',
+      gets.every((g) => g.cfg.params.page === undefined && g.cfg.params.pageToken === undefined),
+      gets.map((g) => g.cfg.params));
     igual('   nao marca truncado quando a lista acabou sozinha', truncou, false);
   }
   {
     // Teto silencioso se leria como "varri tudo e nao achei nada" — exatamente o engano anterior.
     limpar();
-    rede.get = () => ({ status: 200, data: [{ id: 1, type: { id: moskitIds.ATIVIDADE_TIPO.reuniao } }], headers: { 'x-moskit-listing-next-page-token': 'sempre-tem-mais' } });
+    const cheia = Array.from({ length: 10 }, (_, k) => ({ id: k, type: { id: moskitIds.ATIVIDADE_TIPO.reuniao } }));
+    rede.get = () => ({ status: 200, data: cheia, headers: {} });
     const { atividades, truncou } = await listarAtividadesMoskit(3);
     igual('teto de paginas respeitado', de('GET', '/activities').length, 3);
-    igual('   e devolve o que deu tempo de varrer', atividades.length, 3);
+    igual('   e devolve o que deu tempo de varrer', atividades.length, 30);
     checar('   sinalizando que a varredura foi truncada', truncou === true, truncou);
   }
   {

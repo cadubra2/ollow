@@ -77,22 +77,19 @@ function horarioNaiveDeTeste() {
   return `${p.year}-${p.month}-${p.day}T14:00:00`;
 }
 
-// Pagina por pageToken, NAO por ?page= — medido em 12/08/2026: `?page=` e ignorado por este endpoint
-// e devolve sempre os mesmos 10 registros. Aqui isso nao seria so imprecisao: a blindagem abaixo
-// depende desta lista para impedir que atividade de cliente real vire evento por causa do teste, e
-// com o loop antigo ela protegia so os 10 mais recentes de uma base de 1165.
+// Pagina por `?start=` — o unico parametro que esta API respeita em /activities (medido em
+// 12/08/2026: page, pageToken, limit, offset, skip e from sao todos ignorados EM SILENCIO, devolvendo
+// a primeira pagina de novo). Aqui isso nao e detalhe de precisao: a blindagem abaixo depende desta
+// lista para impedir que atividade de cliente real vire evento por causa do teste, e um loop que rele
+// a mesma pagina protegeria so os 10 mais recentes achando que protegeu todos.
 async function atividadesFuturasDeConsulta() {
   const todas = [];
-  let pageToken = null;
   for (let p = 0; p < 40; p++) {
-    const params = new URLSearchParams({ limit: '100', sort: 'id', order: 'desc' });
-    if (pageToken) params.set('pageToken', pageToken); else params.set('page', '1');
-    const r = await req('get', `${MOSKIT_BASE}/activities?${params}`);
+    const r = await req('get', `${MOSKIT_BASE}/activities?start=${todas.length}&limit=100&sort=id&order=desc`);
     if (r.status < 200 || r.status >= 300) break;
     const lote = Array.isArray(r.data) ? r.data : [];
     todas.push(...lote);
-    pageToken = r.headers?.['x-moskit-listing-next-page-token'] || r.headers?.['x-ollow-listing-next-page-token'];
-    if (!pageToken || !lote.length) break;
+    if (lote.length < 10) break; // pagina incompleta = fim da lista
   }
   const agora = Date.now();
   return todas.filter((a) => MOSKIT_IDS.ATIVIDADE_TIPOS_CONSULTA.has(a?.type?.id)
@@ -151,12 +148,37 @@ async function main() {
       console.error(`\n❌ Nao consegui criar a atividade de teste (HTTP ${post.status}): ${JSON.stringify(post.data)}`);
       process.exit(1);
     }
-    console.log(`   atividade de teste ${atividadeId} criada no deal ${DEAL}\n`);
+    console.log(`   atividade de teste ${atividadeId} criada no deal ${DEAL}`);
+
+    // A LISTAGEM demora a enxergar o que acabou de ser criado (o mesmo cache de ate ~4s que o
+    // CLAUDE.md documenta para GET logo apos escrita). Sem esperar, a RODADA A varre e nao acha a
+    // atividade: o teste "passa" na rodada errada e as duas conclusoes saem invertidas.
+    let visivel = false;
+    for (let tentativa = 0; tentativa < 8 && !visivel; tentativa++) {
+      await espera(2000);
+      const r = await req('get', `${MOSKIT_BASE}/activities?start=0&limit=100&sort=id&order=desc`);
+      visivel = (Array.isArray(r.data) ? r.data : []).some((a) => a.id === atividadeId);
+    }
+    if (!visivel) {
+      console.error(`\n❌ A atividade ${atividadeId} nao apareceu na listagem — sem isso as rodadas nao provam nada.`);
+      process.exit(1);
+    }
+    console.log('   e ja aparece na listagem que a sincronizacao varre\n');
 
     // ── RODADA A: sem a trava. Se a sync NAO criar evento aqui, a rodada B nao prova nada. ──
     console.log('── RODADA A: atividade FORA de atividades_sincronizadas ──');
-    const a = await sincronizar();
-    console.log(`  relatorio: ${JSON.stringify(a.data)}`);
+    // Insistir ate a varredura enxergar a atividade. A listagem do Moskit demora a incluir o que
+    // acabou de ser criado, e — medido na pratica — uma leitura positiva NAO garante que a proxima
+    // tambem veja: o teste ficava intermitente, com as duas rodadas trocando de resultado. Repetir e
+    // seguro porque a sync so cria evento para atividade que ainda nao esta em
+    // atividades_sincronizadas, entao a tentativa que der certo e a unica que escreve.
+    let a = null;
+    for (let tentativa = 1; tentativa <= 6; tentativa++) {
+      a = await sincronizar();
+      console.log(`  tentativa ${tentativa}: ${JSON.stringify(a.data)}`);
+      if (a.data?.eventos_criados >= 1) break;
+      await espera(3000);
+    }
     checar('sem a trava, a sync cria 1 evento no Google (prova que a trava e necessaria)', a.data?.eventos_criados === 1, a.data);
     eventoId = `moskitatv${atividadeId}`;
     const evA = await cal.events.get({ calendarId: CAL, eventId: eventoId }).then((r) => r.data).catch(() => null);
@@ -184,9 +206,16 @@ async function main() {
     }
     if (atividadeId) {
       const d = await req('delete', `${MOSKIT_BASE}/activities/${atividadeId}`);
-      await espera(1500);
-      const sobrou = await req('get', `${MOSKIT_BASE}/activities/${atividadeId}`);
-      checar(`atividade ${atividadeId} removida do Moskit`, d.status < 300 && sobrou.status >= 400, { del: d.status, get: sobrou.status });
+      // A releitura logo apos o DELETE ainda devolve 200 por alguns segundos (mesmo cache de escrita
+      // que confirmarAposRetentativas trata para deal). Reconferir com espera crescente, senao o
+      // teste acusa sujeira que nao existe.
+      let ultimo = null;
+      for (const ms of [1500, 2000, 3000, 4000]) {
+        await espera(ms);
+        ultimo = await req('get', `${MOSKIT_BASE}/activities/${atividadeId}`);
+        if (ultimo.status >= 400) break;
+      }
+      checar(`atividade ${atividadeId} removida do Moskit`, d.status < 300 && ultimo.status >= 400, { del: d.status, get: ultimo.status });
     }
     servidor.close();
     console.log(`\n${'='.repeat(50)}\n${passou} passaram · ${falhou} falharam\n`);

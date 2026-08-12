@@ -100,17 +100,16 @@ const ZERNIO_API_KEY = process.env.ZERNIO_API_KEY;
 // pagina, que viraria loop. 20 x 100 cobre a base atual com folga.
 const MAX_PAGINAS_BUSCA_CONTATO = Number(process.env.MAX_PAGINAS_BUSCA_CONTATO) || 20;
 // Teto da varredura de atividades. Cada pagina traz 10 (ver listarAtividadesMoskit), entao 20
-// paginas = 200 atividades mais recentes por ciclo.
+// paginas = 200 atividades por ciclo — a varredura completa da base em 12/08/2026 devolveu 190
+// registros unicos, ou seja, hoje o teto cobre tudo com folga e `truncou` nunca dispara.
 //
-// Por que 200 basta, apesar de a base ter ~1300 atividades (medido em 12/08/2026): a varredura roda a
-// cada SYNC_INTERVAL_MS (3 min) e ordena por id desc, ou seja, por ordem de CRIACAO. Uma atividade so
-// precisa ser vista uma vez — depois disso ela fica em atividades_sincronizadas e nunca mais entra na
-// conta. Entao a janela nao precisa cobrir todas as consultas futuras, so as criadas desde o ciclo
-// anterior. O escritorio cria ~76 atividades por dia; perder alguma exigiria criar mais de 200 em
-// tres minutos.
+// E teto, nao janela: a varredura para sozinha na primeira pagina incompleta. Serve so para uma base
+// que cresca muito, e mesmo ai o essencial esta coberto — a lista vem por id desc (ordem de criacao)
+// e cada atividade so precisa ser vista UMA vez, porque depois disso fica em
+// atividades_sincronizadas e nunca mais entra na conta.
 //
-// O teto de 10 anterior (efeito de `?page=` ser ignorado, nao uma escolha) era justamente o caso
-// perigoso: 10 atividades em 3 minutos acontece num momento movimentado.
+// O teto efetivo de 10 que existia antes nao era uma escolha: era `?page=` sendo ignorado em
+// silencio pela API.
 const MAX_PAGINAS_ATIVIDADES = Number(process.env.MAX_PAGINAS_ATIVIDADES) || 20;
 // Timeout de toda chamada HTTP feita por axios (Moskit, Zernio, download de anexo). Aplicado como
 // default global mais abaixo, junto com o httpsAgent — cobre os 25 call sites de uma vez.
@@ -1337,27 +1336,31 @@ async function atualizarAtividadeMoskit(atividadeId, dueDate, dealId) {
   }
 }
 
-// Varre as atividades mais recentes do Moskit, paginando DE VERDADE.
+// Varre as atividades do Moskit paginando por OFFSET (`?start=`).
 //
-// MEDIDO em 12/08/2026: o parametro `?page=` e ignorado por completo neste endpoint — pedir page=1
-// ate page=5 devolve exatamente os MESMOS 10 registros. Quem paginava por `page` (a sincronizacao e
-// a auditoria) enxergava so as 10 atividades mais recentes de uma base de 1165 e achava que estava
-// varrendo 100, porque `limit: 100` tambem e ignorado. Uma consulta marcada direto no CRM num dia
-// movimentado simplesmente nunca virava evento no Google.
+// MEDIDO em 12/08/2026 contra a API real, testando um parametro de cada vez. Em `/activities`:
+//   - `?page=`      IGNORADO — page=1 ate page=5 devolvem os MESMOS 10 registros
+//   - `?pageToken=` IGNORADO — devolve a mesma pagina e repete o mesmo token (diferente de
+//                   `/contacts`, onde esse mecanismo funciona e buscarOuCriarContato depende dele)
+//   - `?limit=`     IGNORADO — sempre 10, qualquer que seja o valor
+//   - `?offset=` / `?skip=` / `?from=` / `?maxId=` / `?beforeId=` — todos ignorados
+//   - **`?start=`   FUNCIONA** — offset real: start=10 devolve os 10 seguintes, sem sobreposicao
+//   - `?sort=`/`?order=` funcionam (order=asc devolve as mais antigas)
 //
-// O que pagina e o header `x-moskit-listing-next-page-token`, mesmo mecanismo que
-// buscarOuCriarContato ja usa em /contacts.
+// Nenhum desses parametros ignorados devolve erro: a chamada responde 200 com a primeira pagina de
+// novo. Um loop mal escrito aqui nao quebra — ele rele os mesmos 10 registros e parece ter varrido
+// tudo. Foi assim que a sincronizacao e a auditoria passaram a enxergar so as 10 atividades mais
+// recentes achando que varriam 100.
 //
-// Devolve tambem `truncou`, para o chamador poder AVISAR quando o teto cortou a varredura — um teto
-// silencioso aqui se leria como "varri tudo e nao achei nada", que e exatamente o engano anterior.
+// Devolve tambem `truncou`, para o chamador poder AVISAR quando o teto cortou a varredura — teto
+// silencioso aqui se leria como "varri tudo e nao achei nada", que e exatamente o engano acima.
 async function listarAtividadesMoskit(maxPaginas = MAX_PAGINAS_ATIVIDADES) {
   const atividades = [];
-  let pageToken = null;
   let truncou = false;
 
   for (let pagina = 0; pagina < maxPaginas; pagina++) {
     const res = await axios.get(`${MOSKIT_BASE}/activities`, {
-      params: { limit: 100, sort: 'id', order: 'desc', ...(pageToken ? { pageToken } : { page: 1 }) },
+      params: { start: atividades.length, limit: 100, sort: 'id', order: 'desc' },
       headers: apiHeaders,
       validateStatus: (s) => s < 500,
     });
@@ -1366,10 +1369,10 @@ async function listarAtividadesMoskit(maxPaginas = MAX_PAGINAS_ATIVIDADES) {
     const lote = Array.isArray(res.data) ? res.data : [];
     atividades.push(...lote);
 
-    pageToken = res.headers?.['x-moskit-listing-next-page-token']
-      || res.headers?.['x-ollow-listing-next-page-token'];
-    if (!pageToken || lote.length === 0) break;
-    if (pagina === maxPaginas - 1) truncou = true; // ainda havia token quando o teto chegou
+    // Pagina incompleta = fim da lista. Nao da pra confiar no header `x-moskit-listing-total`: ele
+    // dizia 1165 numa base cuja varredura completa devolveu 190 registros unicos.
+    if (lote.length < 10) break;
+    if (pagina === maxPaginas - 1) truncou = true; // ainda vinha pagina cheia quando o teto chegou
   }
 
   return { atividades, truncou };
