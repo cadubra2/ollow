@@ -94,14 +94,21 @@ async function main() {
   }
 
   // ── 1. Amostra: como o Moskit DEVOLVE uma atividade de consulta ───────────────────────────────
-  // Paginando: `limit` sempre devolve 10 nesta API, e a pagina 1 costuma so ter atividades ja
-  // concluidas — que nao tem os campos de uma atividade pendente (era o que confundia antes).
+  // Paginando por pageToken: `limit` sempre devolve 10 nesta API E `?page=` e ignorado (medido em
+  // 12/08/2026 — page=1..5 devolve os mesmos 10 registros). Sem isto a "amostra" era sempre a mesma
+  // pagina repetida, e a contagem impressa mentia por um fator de N.
   console.log('\n── Amostra de atividade existente ──');
   const todas = [];
-  for (let p = 1; p <= 8; p++) {
-    const r = await req('get', `${MOSKIT_BASE}/activities?page=${p}&limit=100&sort=id&order=desc`);
-    if (!Array.isArray(r.data) || !r.data.length) break;
-    todas.push(...r.data);
+  let pageToken = null;
+  for (let p = 0; p < 8; p++) {
+    const params = new URLSearchParams({ limit: '100', sort: 'id', order: 'desc' });
+    if (pageToken) params.set('pageToken', pageToken); else params.set('page', '1');
+    const r = await req('get', `${MOSKIT_BASE}/activities?${params}`);
+    if (r.status < 200 || r.status >= 300) break;
+    const lote = Array.isArray(r.data) ? r.data : [];
+    todas.push(...lote);
+    pageToken = r.headers?.['x-moskit-listing-next-page-token'] || r.headers?.['x-ollow-listing-next-page-token'];
+    if (!pageToken || !lote.length) break;
   }
   const consultas = todas.filter((a) => MOSKIT_IDS.ATIVIDADE_TIPOS_CONSULTA.has(a?.type?.id));
   const amostra = consultas.find((a) => !a.doneDate) || consultas[0];

@@ -56,7 +56,7 @@ google.calendar = () => ({
 
 const {
   moverParaEstagio, criarNotaMoskit, aplicarViradaCobranca, atualizarNegocioMoskit,
-  handleAgendamentoCalendar, finalizarCiclo,
+  handleAgendamentoCalendar, listarAtividadesMoskit, finalizarCiclo,
   aplicarGateCasoDescrito, deveEsperarCasoDescrito, registrarBriefing, mergeDados,
   mesclarParaCrm, derivarAdvogadoDaArea, detectarOpcoesInvalidas, registrarOpcoesInvalidas,
   reconciliarClassificacao, montarPayloadMoskit,
@@ -453,6 +453,50 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     await handleAgendamentoCalendar(20, { ...DADOS, email_cliente: 'cliente@exemplo.com' }, CHAT, true, row, CONFIRMADO);
     igual('email do cliente → vira convidado', agenda.insert[0].requestBody.attendees[0].email, 'cliente@exemplo.com');
     igual('   e o convite e enviado', agenda.insert[0].sendUpdates, 'all');
+  }
+
+  // ============================================================
+  // MEDIDO em 12/08/2026: `?page=` e ignorado por /activities — page=1..5 devolve os MESMOS 10
+  // registros. A varredura antiga "paginava" assim e enxergava 10 de ~1300 atividades, sem erro
+  // nenhum aparecendo em lugar nenhum. Estas assercoes existem para que ninguem volte a esse padrao.
+  console.log('\n=== listarAtividadesMoskit: pagina por pageToken, nao por ?page= ===');
+  {
+    limpar();
+    const pagina = (ids) => ids.map((id) => ({ id, type: { id: moskitIds.ATIVIDADE_TIPO.reuniao } }));
+    const lotes = [
+      { data: pagina([9, 8, 7]), headers: { 'x-moskit-listing-next-page-token': 'tok-A' } },
+      { data: pagina([6, 5, 4]), headers: { 'x-moskit-listing-next-page-token': 'tok-B' } },
+      { data: pagina([3, 2, 1]), headers: {} }, // sem token: acabou
+    ];
+    let i = 0;
+    rede.get = () => ({ status: 200, ...lotes[i++] });
+
+    const { atividades, truncou } = await listarAtividadesMoskit();
+    const gets = de('GET', '/activities');
+    igual('varre as 3 paginas ate o token acabar', atividades.length, 9);
+    igual('   sem repetir registro (o sintoma do bug antigo)', new Set(atividades.map((a) => a.id)).size, 9);
+    igual('   3 requisicoes', gets.length, 3);
+    checar('   a primeira pede page=1', gets[0].cfg.params.page === 1 && !gets[0].cfg.params.pageToken, gets[0].cfg.params);
+    checar('   as seguintes mandam pageToken e NAO page', gets.slice(1).every((g) => g.cfg.params.pageToken && !g.cfg.params.page),
+      gets.slice(1).map((g) => g.cfg.params));
+    igual('   e repassam o token que veio no header', gets[1].cfg.params.pageToken, 'tok-A');
+    igual('   em ordem', gets[2].cfg.params.pageToken, 'tok-B');
+    igual('   nao marca truncado quando a lista acabou sozinha', truncou, false);
+  }
+  {
+    // Teto silencioso se leria como "varri tudo e nao achei nada" — exatamente o engano anterior.
+    limpar();
+    rede.get = () => ({ status: 200, data: [{ id: 1, type: { id: moskitIds.ATIVIDADE_TIPO.reuniao } }], headers: { 'x-moskit-listing-next-page-token': 'sempre-tem-mais' } });
+    const { atividades, truncou } = await listarAtividadesMoskit(3);
+    igual('teto de paginas respeitado', de('GET', '/activities').length, 3);
+    igual('   e devolve o que deu tempo de varrer', atividades.length, 3);
+    checar('   sinalizando que a varredura foi truncada', truncou === true, truncou);
+  }
+  {
+    limpar();
+    rede.get = () => ({ status: 500, data: null, headers: {} });
+    const r = await listarAtividadesMoskit();
+    igual('erro na primeira pagina → devolve lista vazia, nao lanca', r.atividades.length, 0);
   }
 
   // ============================================================

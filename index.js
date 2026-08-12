@@ -99,6 +99,19 @@ const ZERNIO_API_KEY = process.env.ZERNIO_API_KEY;
 // Teto de paginas na busca de contato: protege contra base grande + resposta sem token de proxima
 // pagina, que viraria loop. 20 x 100 cobre a base atual com folga.
 const MAX_PAGINAS_BUSCA_CONTATO = Number(process.env.MAX_PAGINAS_BUSCA_CONTATO) || 20;
+// Teto da varredura de atividades. Cada pagina traz 10 (ver listarAtividadesMoskit), entao 20
+// paginas = 200 atividades mais recentes por ciclo.
+//
+// Por que 200 basta, apesar de a base ter ~1300 atividades (medido em 12/08/2026): a varredura roda a
+// cada SYNC_INTERVAL_MS (3 min) e ordena por id desc, ou seja, por ordem de CRIACAO. Uma atividade so
+// precisa ser vista uma vez — depois disso ela fica em atividades_sincronizadas e nunca mais entra na
+// conta. Entao a janela nao precisa cobrir todas as consultas futuras, so as criadas desde o ciclo
+// anterior. O escritorio cria ~76 atividades por dia; perder alguma exigiria criar mais de 200 em
+// tres minutos.
+//
+// O teto de 10 anterior (efeito de `?page=` ser ignorado, nao uma escolha) era justamente o caso
+// perigoso: 10 atividades em 3 minutos acontece num momento movimentado.
+const MAX_PAGINAS_ATIVIDADES = Number(process.env.MAX_PAGINAS_ATIVIDADES) || 20;
 // Timeout de toda chamada HTTP feita por axios (Moskit, Zernio, download de anexo). Aplicado como
 // default global mais abaixo, junto com o httpsAgent — cobre os 25 call sites de uma vez.
 const TIMEOUT_HTTP_MS = Number(process.env.TIMEOUT_HTTP_MS) || 30000;
@@ -1322,6 +1335,44 @@ async function atualizarAtividadeMoskit(atividadeId, dueDate, dealId) {
     if (dealId) await criarNotaMoskit(dealId, `⚠️ A atividade na agenda do Moskit NAO foi remarcada (${e.message}) e continua no horario antigo. O Google Agenda ja esta no horario novo — corrija a atividade na mao.`).catch(() => {});
     return false;
   }
+}
+
+// Varre as atividades mais recentes do Moskit, paginando DE VERDADE.
+//
+// MEDIDO em 12/08/2026: o parametro `?page=` e ignorado por completo neste endpoint — pedir page=1
+// ate page=5 devolve exatamente os MESMOS 10 registros. Quem paginava por `page` (a sincronizacao e
+// a auditoria) enxergava so as 10 atividades mais recentes de uma base de 1165 e achava que estava
+// varrendo 100, porque `limit: 100` tambem e ignorado. Uma consulta marcada direto no CRM num dia
+// movimentado simplesmente nunca virava evento no Google.
+//
+// O que pagina e o header `x-moskit-listing-next-page-token`, mesmo mecanismo que
+// buscarOuCriarContato ja usa em /contacts.
+//
+// Devolve tambem `truncou`, para o chamador poder AVISAR quando o teto cortou a varredura — um teto
+// silencioso aqui se leria como "varri tudo e nao achei nada", que e exatamente o engano anterior.
+async function listarAtividadesMoskit(maxPaginas = MAX_PAGINAS_ATIVIDADES) {
+  const atividades = [];
+  let pageToken = null;
+  let truncou = false;
+
+  for (let pagina = 0; pagina < maxPaginas; pagina++) {
+    const res = await axios.get(`${MOSKIT_BASE}/activities`, {
+      params: { limit: 100, sort: 'id', order: 'desc', ...(pageToken ? { pageToken } : { page: 1 }) },
+      headers: apiHeaders,
+      validateStatus: (s) => s < 500,
+    });
+    if (res.status < 200 || res.status >= 300) break;
+
+    const lote = Array.isArray(res.data) ? res.data : [];
+    atividades.push(...lote);
+
+    pageToken = res.headers?.['x-moskit-listing-next-page-token']
+      || res.headers?.['x-ollow-listing-next-page-token'];
+    if (!pageToken || lote.length === 0) break;
+    if (pagina === maxPaginas - 1) truncou = true; // ainda havia token quando o teto chegou
+  }
+
+  return { atividades, truncou };
 }
 
 // CONFIRMADO empiricamente em 04/08/2026 via test-moskit-put.js contra um deal de teste: o PUT com
@@ -2879,14 +2930,11 @@ app.get('/auditoria-consulta-gratis', exigeAdmin, rota(async (req, res) => {
   console.log('\n🔍 Auditoria de consultas gratis (so leitura)...');
   const linhas = [];
   try {
-    const ativRes = await axios.get(`${MOSKIT_BASE}/activities`, {
-      params: { page: 1, limit: 100, sort: 'id', order: 'desc' },
-      headers: apiHeaders,
-      validateStatus: (s) => s < 500,
-    });
+    const { atividades, truncou } = await listarAtividadesMoskit();
+    if (truncou) console.log(`  ⚠️ teto de ${MAX_PAGINAS_ATIVIDADES} paginas atingido — auditoria cobre so as ${atividades.length} atividades mais recentes`);
     const agora = Date.now();
 
-    for (const atv of (ativRes.data || [])) {
+    for (const atv of atividades) {
       if (!ATIVIDADE_TIPOS_CONSULTA.has(atv.type?.id)) continue;
       if (atv.doneDate) continue;
       if (!atv.dueDate || new Date(atv.dueDate).getTime() <= agora) continue;
@@ -3305,14 +3353,13 @@ async function sincronizarAtividadesMoskit() {
   sincronizacaoAtividadesEmAndamento = true;
 
   try {
-    const res = await axios.get(`${MOSKIT_BASE}/activities`, {
-      params: { page: 1, limit: 100, sort: 'id', order: 'desc' },
-      headers: apiHeaders,
-      validateStatus: (s) => s < 500,
-    });
-    const atividades = res.data || [];
+    const { atividades, truncou } = await listarAtividadesMoskit();
     relatorio.atividades_verificadas = atividades.length;
+    relatorio.varredura_truncada = truncou;
     console.log(`  📅 ${atividades.length} atividades recentes encontradas no Moskit`);
+    // Teto silencioso aqui se leria como "varri tudo e nao tinha nada" — que foi exatamente o engano
+    // enquanto `?page=` era ignorado e a varredura via 10 de 1165.
+    if (truncou) console.log(`  ⚠️ teto de ${MAX_PAGINAS_ATIVIDADES} paginas atingido — atividades mais antigas que essas nao foram verificadas neste ciclo`);
 
     const agora = Date.now();
 
@@ -4492,6 +4539,9 @@ module.exports = {
   reconciliarClassificacao,
   buscarIdOpcao,
   handleAgendamentoCalendar,
+  // Exportada para teste: a paginacao por pageToken (e NAO por ?page=) e o tipo de detalhe que passa
+  // despercebido — o codigo antigo "paginava" e lia sempre os mesmos 10 registros sem erro nenhum.
+  listarAtividadesMoskit,
   finalizarCiclo,
   moverParaEstagio,
   moverEstagioSeAvancar,

@@ -77,12 +77,22 @@ function horarioNaiveDeTeste() {
   return `${p.year}-${p.month}-${p.day}T14:00:00`;
 }
 
+// Pagina por pageToken, NAO por ?page= — medido em 12/08/2026: `?page=` e ignorado por este endpoint
+// e devolve sempre os mesmos 10 registros. Aqui isso nao seria so imprecisao: a blindagem abaixo
+// depende desta lista para impedir que atividade de cliente real vire evento por causa do teste, e
+// com o loop antigo ela protegia so os 10 mais recentes de uma base de 1165.
 async function atividadesFuturasDeConsulta() {
   const todas = [];
-  for (let p = 1; p <= 10; p++) {
-    const r = await req('get', `${MOSKIT_BASE}/activities?page=${p}&limit=100&sort=id&order=desc`);
-    if (!Array.isArray(r.data) || !r.data.length) break;
-    todas.push(...r.data);
+  let pageToken = null;
+  for (let p = 0; p < 40; p++) {
+    const params = new URLSearchParams({ limit: '100', sort: 'id', order: 'desc' });
+    if (pageToken) params.set('pageToken', pageToken); else params.set('page', '1');
+    const r = await req('get', `${MOSKIT_BASE}/activities?${params}`);
+    if (r.status < 200 || r.status >= 300) break;
+    const lote = Array.isArray(r.data) ? r.data : [];
+    todas.push(...lote);
+    pageToken = r.headers?.['x-moskit-listing-next-page-token'] || r.headers?.['x-ollow-listing-next-page-token'];
+    if (!pageToken || !lote.length) break;
   }
   const agora = Date.now();
   return todas.filter((a) => MOSKIT_IDS.ATIVIDADE_TIPOS_CONSULTA.has(a?.type?.id)
