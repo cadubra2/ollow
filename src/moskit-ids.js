@@ -230,8 +230,17 @@ const ADVOGADO_POR_AREA_ID = {
   [AREA_DIREITO['direito do trabalho']]: 'Iury',
 };
 
-// Tipos de atividade que viram evento no Google Agenda. Ligacao/Email/WhatsApp nao viram.
-const ATIVIDADE_TIPOS_CONSULTA = new Set([87134, 87361]); // 87134 = Reuniao, 87361 = Videoconferencia
+// Tipos de atividade que representam consulta marcada (GET /activityTypes).
+// Ligacao/Email/WhatsApp ficam de fora de proposito: nao viram compromisso de agenda.
+const ATIVIDADE_TIPO = {
+  reuniao: 87134,          // consulta presencial
+  videoconferencia: 87361, // consulta online (a que ganha link do Meet)
+};
+
+// Derivado de ATIVIDADE_TIPO para os dois lados nunca divergirem: este Set filtra o que o bot LE do
+// Moskit, e ATIVIDADE_TIPO decide o que ele ESCREVE. Manter as duas listas na mao seria repetir aqui
+// dentro exatamente o erro que este arquivo existe para impedir.
+const ATIVIDADE_TIPOS_CONSULTA = new Set(Object.values(ATIVIDADE_TIPO));
 
 // Valores de deal.status confirmados em 04/08/2026 testando contra a API real (deal de teste): o
 // Moskit rejeita qualquer outra grafia com 422 "Enum must be valid format (OPEN, WON, LOST)".
@@ -270,6 +279,7 @@ module.exports = {
   ADVOGADO_POR_AREA_ID,
   normalizarChave,
   buscarOpcao,
+  ATIVIDADE_TIPO,
   ATIVIDADE_TIPOS_CONSULTA,
   TIPO_CONSULTA_GRATIS_ID: TIPO_CONSULTA['consulta gratis'],
   TIPO_CONSULTA_PAGA_ID: TIPO_CONSULTA['consulta paga'],

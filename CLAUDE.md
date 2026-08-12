@@ -23,7 +23,7 @@ npm run test:ia          # chama a OpenAI de verdade (test-dupla-confirmacao.js)
 node test-telefone.js    # roda um arquivo de teste isolado (mesmo padrão para os demais test-*.js)
 ```
 
-`npm test` executa em sequência: `test-telefone.js`, `test-moskit-ids.js`, `test-evidencia.js`,
+`npm test` executa em sequência: `test-telefone.js`, `test-moskit-ids.js`, `test-atividade-moskit.js`, `test-evidencia.js`,
 `test-fila.js`, `test-payload.js`, `test-rotas.js`, `test-pipeline.js`, `test-guards-internos.js`,
 `test-agendamento-bloco-mensagens.js`, `test-transcricao.js`. Todos usam `DB_PATH` apontando para
 um arquivo inexistente (banco descartável) — **nunca** deixe um teste abrir `conversations.db` de
@@ -38,6 +38,18 @@ Escrevem em dados reais de produção (Moskit e/ou banco real):
 - `testar-briefing-unico.js` — idem, cria contato/deal reais no Moskit.
 - `test-zapsign-real.js <email> [--aplicar]` — cria um documento REAL no ZapSign a partir do
   template de produção e dispara um e-mail de assinatura de verdade para o e-mail informado.
+- `test-moskit-atividade-real.js <dealId> [--aplicar] [--manter]` — mede o contrato de `/activities`
+  contra a API real. Sem `--aplicar` é só leitura (amostra real + o payload que seria enviado); com
+  `--aplicar` varre rota × variante de payload até uma ser aceita, cria a atividade DE VERDADE na
+  agenda do CRM, mede qual padrão de `PUT` move o `dueDate` e apaga a atividade no fim (`--manter`
+  desliga a limpeza). É o script que valida a conversão de fuso antes de mexer no agendamento.
+- `test-dedupe-agenda-real.js [--aplicar]` — prova, contra o Moskit e o Google reais, que a consulta
+  não entra duas vezes na agenda: roda `POST /sincronizar-atividades` duas vezes, com e sem a linha
+  em `atividades_sincronizadas`. Sem `--aplicar` é só leitura. Com `--aplicar` cria uma atividade e
+  um evento de teste e apaga os dois no fim. Seguro por construção (`WORKER_MODE=1` carrega o
+  `index.js` sem servidor e sem os `setInterval`, `DB_PATH` descartável, Telegram desligado, e toda
+  atividade futura de cliente real entra pré-marcada para não virar evento) — mas ainda assim
+  escreve em produção, então não é `npm test`.
 - `GET /auditoria-classificacao?aplicar=1` — escreve nos deals reais (corrige a classificação). Em
   dry-run (sem `aplicar`) é só leitura e pode rodar à vontade.
 - `test-cenarios-classificacao.js` e `test-simulacao.js` — chamam a OpenAI de verdade mas não têm
@@ -69,6 +81,8 @@ deploy.js                git pull + npm install + npm test + pm2 restart; dispar
                          restart que ele mesmo provoca no processo que o gerou)
 src/
   agendamento.js         dupla confirmação de horário (cliente + equipe precisam confirmar o mesmo slot)
+  atividade-moskit.js    payload da Atividade (a consulta na agenda do CRM) + conversão do horário
+                         naive do escritório para o instante absoluto que o Moskit espera
   bloco-condicoes.js     detecção do bloco de condições de pagamento enviado pela equipe
   evidencia.js           validação das observações extraídas pela IA
   fila.js                fila de retry em disco para o worker (MAX_TENTATIVAS, depois desiste e avisa Telegram)
@@ -143,12 +157,42 @@ por IA de visão), `atividades_sincronizadas` (dedupe de sync de atividades do M
    área do sócio que o lead mencionou — "consulta com o Dr. Berto" virava LGPD.
 3. Agendamento: `apurarDuplaConfirmacao` (cliente E equipe confirmam o mesmo horário) →
    `handleAgendamentoCalendar` → `criarEventoGoogleCalendar` (OAuth2, precisa de conta Google real
-   do escritório — service account não gera link de Meet nem convida participantes).
+   do escritório — service account não gera link de Meet nem convida participantes) e
+   `registrarConsultaNaAgendaMoskit` → `criarAtividadeMoskit` (ver "As duas agendas" abaixo).
 4. Progressão de funil (`moverEstagioSeAvancar`) e fechamento (`fecharNegocioSeAplicavel`) são
    guardados por flags `FUNIL_DRY_RUN`/`FUNIL_FECHAMENTO_DRY_RUN` — comece sempre com dry-run
    ligado (padrão) até validar as sugestões da IA na prática.
 5. Se qualquer etapa falhar, a conversa cai na fila (`src/fila.js`) e é reprocessada pelo
    `worker.js`, que é lançado como processo filho do próprio `index.js`.
+
+### As duas agendas: Google Agenda e agenda do Moskit
+
+Toda consulta agendada existe em **dois** lugares, e os dois caminhos se cruzam — é aqui que nasce o
+risco de evento duplicado.
+
+- **Bot → as duas agendas.** Fechada a dupla confirmação, `handleAgendamentoCalendar` cria o evento
+  no Google (`criarEventoGoogleCalendar`) e a Atividade no Moskit
+  (`registrarConsultaNaAgendaMoskit` → `criarAtividadeMoskit`), guardando o id em
+  `conversations.atividade_moskit_id`. Remarcação move as duas (`atualizarEventoSeRemarcado` +
+  `atualizarAtividadeMoskit`).
+- **Moskit → Google.** `sincronizarAtividadesMoskit` (a cada `SYNC_INTERVAL_MS`) cria evento no
+  Google para atividades marcadas direto no CRM ou pelo Moskit Boost, que nunca passaram por
+  conversa nenhuma.
+- **A trava.** Logo após criar a Atividade, o bot grava a linha em `atividades_sincronizadas`
+  apontando para o evento que ele mesmo acabou de criar. Sem isso, a sincronização acima veria a
+  atividade nova como "ainda não sincronizada" e criaria um **segundo** evento no Google para a mesma
+  consulta minutos depois. Se mexer nesse trecho, `test-pipeline.js` tem a regressão.
+- **`PUT /activities/{id}` exige o corpo do `GET`.** Medido em 12/08/2026 contra a API real: um
+  payload mínimo `{dueDate}` volta **422** — mesma peculiaridade do `PUT` de deal. `POST /activities`,
+  ao contrário, aceita o payload construído normalmente. Sem o `GET` prévio em
+  `atualizarAtividadeMoskit`, nenhuma remarcação chegaria à agenda do CRM.
+- **Fuso.** O pipeline inteiro usa horário *naive* (`"2026-08-05T17:30:00"`), que significa sempre
+  hora local do escritório. O Google aceita isso com `timeZone` ao lado; o Moskit **não** — `dueDate`
+  é instante absoluto. A conversão é `horarioNaiveParaInstante` (`src/atividade-moskit.js`), que
+  pergunta o offset ao `Intl` em vez de fixar `-03:00`. Errar aqui não quebra nada: só põe a consulta
+  três horas fora do lugar na agenda, em silêncio.
+- **Responsável.** A atividade sai no nome da Layla (`LAYLA_USER_ID`), como todo contato, deal e nota
+  criados pelo bot. Não confundir com `advogado_responsavel`, que é campo personalizado do deal.
 
 ### Segurança das rotas
 
