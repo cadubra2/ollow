@@ -88,27 +88,64 @@ igual('"Direito da Saúde" (alias) → 577809', opcaoDe(montar({ area_direito: '
 igual('LGPD em maiuscula → 228786', opcaoDe(montar({ area_direito: 'LGPD' }), IDS.CF.AREA_DIREITO), 228786);
 igual('origem Instagram', opcaoDe(montar({ origem: 'Instagram' }), IDS.CF.ORIGEM), 200152);
 igual('captacao Bruno', opcaoDe(montar({ captacao: 'Bruno' }), IDS.CF.CAPTACAO), 200155);
-igual('responsavel Iury', opcaoDe(montar({ advogado_responsavel: 'Iury' }), IDS.CF.RESPONSAVEL), 228790);
+
+console.log('\n=== Responsavel: consequencia da area, nunca escolha do modelo ===');
+// A partir de 12/08/2026 a area DEFINE o responsavel, e montarPayloadMoskit e o ultimo ponto de
+// estrangulamento: nenhum caminho de escrita (pipeline, virada de cobranca, backfill, reconciliacao)
+// consegue gravar um par area/responsavel incoerente.
+igual('area de Familia → Bruno, mesmo com a IA dizendo Iury',
+  opcaoDe(montar({ area_direito: 'Direito de Familia', advogado_responsavel: 'Iury' }), IDS.CF.RESPONSAVEL), IDS.RESPONSAVEL_PROCESSO['bruno']);
+igual('area LGPD → Berto, mesmo com a IA dizendo Bruno',
+  opcaoDe(montar({ area_direito: 'LGPD', advogado_responsavel: 'Bruno' }), IDS.CF.RESPONSAVEL), IDS.RESPONSAVEL_PROCESSO['berto']);
+igual('area Educacional → Iury (regra do escritorio, mesmo o lead vindo pelo Berto)',
+  opcaoDe(montar({ area_direito: 'Direito Educacional', advogado_responsavel: 'Berto', captacao: 'Berto' }), IDS.CF.RESPONSAVEL), IDS.RESPONSAVEL_PROCESSO['iury']);
+igual('   ...e a captacao do exemplo acima continua Berto (quem trouxe o lead)',
+  opcaoDe(montar({ area_direito: 'Direito Educacional', advogado_responsavel: 'Berto', captacao: 'Berto' }), IDS.CF.CAPTACAO), IDS.CAPTACAO['berto']);
+igual('sem area → responsavel VAZIO (nao da pra derivar)',
+  opcaoDe(montar({ advogado_responsavel: 'Iury' }), IDS.CF.RESPONSAVEL), undefined);
+igual('area "Outros" → responsavel VAZIO (nao tem dono automatico)',
+  opcaoDe(montar({ area_direito: 'Outros', advogado_responsavel: 'Iury' }), IDS.CF.RESPONSAVEL), undefined);
+igual('area desconhecida → responsavel VAZIO',
+  opcaoDe(montar({ area_direito: 'Direito Espacial', advogado_responsavel: 'Iury' }), IDS.CF.RESPONSAVEL), undefined);
+{
+  // A copia dentro de montarPayloadMoskit protege o objeto de quem chamou: o pipeline decide sozinho
+  // quando sanitizar (sanitizarClassificacao), e nao pode ser surpreendido por mutacao aqui.
+  const dados = { ...BASE, area_direito: 'Direito de Familia', advogado_responsavel: 'Iury' };
+  montarPayloadMoskit(dados, CONTATO, {});
+  igual('montarPayloadMoskit nao muta o objeto recebido', dados.advogado_responsavel, 'Iury');
+}
 
 igual('area desconhecida nao entra no payload', opcaoDe(montar({ area_direito: 'direito espacial' }), IDS.CF.AREA_DIREITO), undefined);
 igual('origem ausente nao entra no payload', opcaoDe(montar({ origem: null }), IDS.CF.ORIGEM), undefined);
 igual('campo vazio nao entra no payload', opcaoDe(montar({ captacao: '' }), IDS.CF.CAPTACAO), undefined);
 
-console.log('\n=== CARACTERIZACAO: buscarIdOpcao casa por substring nos dois sentidos ===');
-// Nao e o comportamento desejado, mas e o atual. Registrado para que uma mudanca seja deliberada.
-// O primeiro caso tem consequencia financeira: um "consulta" vago da IA vira R$0 no CRM.
+console.log('\n=== buscarIdOpcao: correspondencia exata, nunca por aproximacao ===');
+// Era o contrario ate 12/08/2026: o casamento por substring preenchia mais campos e escolhia a opcao
+// errada em silencio. O primeiro caso tinha consequencia financeira — um "consulta" vago da IA virava
+// "consulta gratis", ou seja R$0 no CRM.
 igual(
-  'tipo_consulta "consulta" (vago) → GRATIS — vira R$0 no CRM',
+  'tipo_consulta "consulta" (vago) → campo VAZIO, nao mais "gratis"',
   opcaoDe(montar({ tipo_consulta: 'consulta' }, { condicoesValorEnviadas: true }), IDS.CF.TIPO_CONSULTA),
-  IDS.TIPO_CONSULTA_GRATIS_ID
+  undefined
 );
 igual(
-  'area_direito "direito" (vago) → direito administrativo',
+  'area_direito "direito" (vago) → campo VAZIO, nao mais administrativo',
   opcaoDe(montar({ area_direito: 'direito' }), IDS.CF.AREA_DIREITO),
-  228779
+  undefined
 );
-// ...mas o PRICE nao se deixa enganar: quem manda nele e o checkpoint, nao o texto da IA.
-igual('   ...ainda assim o price continua 35000 (o checkpoint manda)', montar({ tipo_consulta: 'consulta' }, { condicoesValorEnviadas: true }).price, 35000);
+igual(
+  'origem "Indicacao" (vago) → campo VAZIO, nao mais "Indicacao de clientes"',
+  opcaoDe(montar({ origem: 'Indicação' }), IDS.CF.ORIGEM),
+  undefined
+);
+// Apelido declarado continua resolvendo — e o que impede a exigencia de exatidao de virar campo vazio
+// para valores que a IA legitimamente escreve de outro jeito.
+igual('area "Direito Médico" (apelido) → solucoes medicas', opcaoDe(montar({ area_direito: 'Direito Médico' }), IDS.CF.AREA_DIREITO), IDS.AREA_DIREITO['solucoes medicas']);
+igual('area "família" (apelido curto) → direito de familia', opcaoDe(montar({ area_direito: 'família' }), IDS.CF.AREA_DIREITO), IDS.AREA_DIREITO['direito de familia']);
+igual('captacao "Dr. Berto" (apelido) → berto', opcaoDe(montar({ captacao: 'Dr. Berto' }), IDS.CF.CAPTACAO), IDS.CAPTACAO['berto']);
+igual('origem "Indicacao de amigos e parentes" (grafia do prompt) → resolve', opcaoDe(montar({ origem: 'Indicacao de amigos e parentes' }), IDS.CF.ORIGEM), IDS.ORIGEM['indicacao de/ou amigos e parentes']);
+// ...e o PRICE nunca dependeu do texto da IA: quem manda nele e o checkpoint do bloco de condicoes.
+igual('   price continua 35000 (o checkpoint manda)', montar({ tipo_consulta: 'consulta' }, { condicoesValorEnviadas: true }).price, 35000);
 
 console.log('\n=== Nome do deal ===');
 

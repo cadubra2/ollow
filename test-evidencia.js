@@ -489,5 +489,52 @@ for (const caso of casos) {
 }
 
 // ------------------------------------------------------------
+// Regressao do deal 48423360: sem esta evidencia o bot deduzia a area do direito do SOCIO que o lead
+// mencionou. A observacao existe justamente para amarrar area/assunto a uma mensagem em que alguem
+// contou o caso de verdade.
+console.log('\n=== cliente_descreveu_caso / equipe_descreveu_caso ===');
+
+{
+  const msgs = [
+    /* 0 */ { role: 'cliente', text: 'Olá!' },
+    /* 1 */ { role: 'cliente', text: 'Gostaria de agendar uma consulta com o Dr. Berto, por videoconferencia.' },
+    /* 2 */ { role: 'cliente', text: 'Fui exonerada do cargo e quero pedir remocao por motivo de saude' },
+    /* 3 */ { role: 'equipe', text: 'Ela quer entrar com acao de remocao por motivo de saude' },
+  ];
+
+  const so = (obs) => validarObservacoes(obs, msgs);
+
+  {
+    const { validas } = so([{ tipo: 'cliente_descreveu_caso', msg_idx: 2, trecho: 'remocao por motivo de saude' }]);
+    checar('cliente descreveu o caso => valida', validas.length === 1 && validas[0].tipo === 'cliente_descreveu_caso', validas);
+  }
+  {
+    const { validas } = so([{ tipo: 'equipe_descreveu_caso', msg_idx: 3, trecho: 'acao de remocao' }]);
+    checar('equipe descreveu o caso => valida', validas.length === 1 && validas[0].tipo === 'equipe_descreveu_caso', validas);
+  }
+  {
+    // Papel trocado: o fato ("alguem contou o caso") existe nos dois papeis, entao o prefixo e
+    // corrigido pelo role real em vez de a observacao ser descartada.
+    const { validas } = so([{ tipo: 'equipe_descreveu_caso', msg_idx: 2, trecho: 'remocao por motivo de saude' }]);
+    checar('prefixo errado e corrigido pelo role da mensagem', validas.length === 1 && validas[0].tipo === 'cliente_descreveu_caso', validas);
+  }
+  {
+    const { validas, rejeitadas } = so([{ tipo: 'cliente_descreveu_caso', msg_idx: 1, trecho: 'meu tio morreu e deixou uma casa' }]);
+    checar('trecho inventado e descartado', validas.length === 0 && rejeitadas.length === 1, { validas, rejeitadas });
+  }
+  {
+    // O trecho existe, mas nao descreve caso nenhum. A validacao confere a CITACAO; o julgamento do
+    // conteudo e do prompt. Registrado aqui para deixar o limite explicito.
+    const { validas } = so([{ tipo: 'cliente_descreveu_caso', msg_idx: 1, trecho: 'agendar uma consulta com o Dr. Berto' }]);
+    checar('citacao valida de mensagem sem caso ainda passa pela validacao (limite conhecido)', validas.length === 1, validas);
+  }
+  {
+    const { validas } = so([{ tipo: 'cliente_descreveu_caso', msg_idx: 2, trecho: 'remocao por motivo de saude' }]);
+    checar('ultimaObservacao encontra a evidencia do caso', !!ultimaObservacao(validas, 'cliente_descreveu_caso'));
+    checar('nao inventa evidencia da equipe a partir dela', !ultimaObservacao(validas, 'equipe_descreveu_caso'));
+  }
+}
+
+// ------------------------------------------------------------
 console.log(`\n${falhou === 0 ? '✅' : '❌'} ${passou} passaram, ${falhou} falharam\n`);
 process.exit(falhou === 0 ? 0 : 1);

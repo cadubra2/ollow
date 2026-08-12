@@ -36,6 +36,10 @@ Escrevem em dados reais de produção (Moskit e/ou banco real):
 - `test-moskit-put.js <dealId> [--aplicar]` e `test-moskit-real.js` — chamadas de escrita reais na
   API de produção do Moskit (criam/movem deals de verdade).
 - `testar-briefing-unico.js` — idem, cria contato/deal reais no Moskit.
+- `test-zapsign-real.js <email> [--aplicar]` — cria um documento REAL no ZapSign a partir do
+  template de produção e dispara um e-mail de assinatura de verdade para o e-mail informado.
+- `GET /auditoria-classificacao?aplicar=1` — escreve nos deals reais (corrige a classificação). Em
+  dry-run (sem `aplicar`) é só leitura e pode rodar à vontade.
 - `test-cenarios-classificacao.js` e `test-simulacao.js` — chamam a OpenAI de verdade mas não têm
   asserção automática de pass/fail; servem para inspeção manual, não regressão.
 - `corrigir-*.js` — scripts pontuais de correção de dados já aplicados (histórico, não reexecutar).
@@ -75,6 +79,29 @@ src/
 docs/pop/                POP oficial do processo de negócio (HTML + PDF) — fonte da verdade
 ```
 
+### Classificação do deal: como o erro é evitado e como é corrigido
+
+Área do direito / responsável / assunto / origem foram a maior fonte de dado errado no CRM (deal
+48423360 entrou como LGPD sendo Direito Administrativo). Cinco camadas, todas em `index.js` salvo nota:
+
+1. **Evidência**: `aplicarGateCasoDescrito` só deixa área/advogado/assunto irem ao CRM se houver
+   observação validada `cliente_descreveu_caso`/`equipe_descreveu_caso` ([src/evidencia.js](src/evidencia.js)).
+   Sem caso descrito o lead nem vira deal (`deveEsperarCasoDescrito`), exceto com dupla confirmação
+   de horário ou bloco de condições enviado.
+2. **Merge sanitizado**: `mesclarParaCrm` aplica o gate ao objeto **mesclado** com `last_data` — sem
+   isso um palpite antigo era ressuscitado e reenviado a cada ciclo.
+3. **Regra de negócio em código**: `derivarAdvogadoDaArea` + `MOSKIT_IDS.ADVOGADO_POR_AREA_ID` — a
+   área define o responsável, e `montarPayloadMoskit` reaplica isso em **todo** caminho de escrita.
+4. **Correspondência exata**: `MOSKIT_IDS.buscarOpcao` (usado por `buscarIdOpcao` e por todos os
+   scripts) só aceita chave canônica ou apelido declarado. Valor fora da lista deixa o campo vazio e
+   gera nota + Telegram (`detectarOpcoesInvalidas`/`registrarOpcoesInvalidas`), nunca um chute.
+5. **Reconciliação**: `reconciliarClassificacao` compara CRM x decisão do bot e corrige o que o
+   próprio bot escreveu; roda a cada `RECONCILIACAO_INTERVAL_MS` (padrão 30 min) e sob demanda em
+   `GET /auditoria-classificacao` (dry-run; `?aplicar=1`, `?incluir-legado=1`).
+
+**Autoria**: `custom_fields_bot`/`campos_travados` guardam o que o bot escreveu (inclusive o nome do
+deal, chave `__name`). Valor divergente disso = correção humana → campo travado para sempre, com nota.
+
 ### `src/moskit-ids.js` é a fonte única de verdade para IDs do Moskit
 
 Antes esses mapas (origem, área do direito, tipo de consulta, lost reasons, stage IDs...) estavam
@@ -109,6 +136,11 @@ por IA de visão), `atividades_sincronizadas` (dedupe de sync de atividades do M
 2. `processarConversaDirect(chatId)`: monta histórico, chama a OpenAI (`classificarConversa` +
    `extrairDadosAtendimento`) para extrair dados estruturados, decide criar/atualizar deal no
    Moskit (`buscarOuCriarContato`, `criarNegocioMoskit`/`atualizarNegocioMoskit`).
+   **Gate do caso descrito** (`aplicarGateCasoDescrito`/`deveEsperarCasoDescrito`): `area_direito`,
+   `advogado_responsavel` e `assunto` só vão pro CRM se houver observação validada
+   `cliente_descreveu_caso`/`equipe_descreveu_caso`; sem ela o lead nem vira deal (exceto se já
+   houver dupla confirmação de horário ou bloco de condições enviado). Sem esse gate a IA deduzia a
+   área do sócio que o lead mencionou — "consulta com o Dr. Berto" virava LGPD.
 3. Agendamento: `apurarDuplaConfirmacao` (cliente E equipe confirmam o mesmo horário) →
    `handleAgendamentoCalendar` → `criarEventoGoogleCalendar` (OAuth2, precisa de conta Google real
    do escritório — service account não gera link de Meet nem convida participantes).
@@ -143,6 +175,10 @@ por IA de visão), `atividades_sincronizadas` (dedupe de sync de atividades do M
 - **Moskit CRM** (`MOSKIT_BASE`): `PUT` de deal precisa reenviar o corpo do `GET` (peculiaridade da
   API); `GET` logo após um `PUT` pode retornar dados em cache por até ~4s; `limit` de paginação
   sempre retorna 10 independente do valor pedido; `deal.status` só aceita `OPEN`/`WON`/`LOST`.
+  **Autoria dos campos personalizados**: o bot guarda em `custom_fields_bot` o último valor que ele
+  mesmo escreveu; se o CRM divergir disso, alguém corrigiu na mão — o campo entra em
+  `campos_travados` e o bot nunca mais o sobrescreve (`filtrarCamposPorAutoria`). `TIPO_CONSULTA`
+  fica de fora: nele quem manda é o checkpoint do bloco de condições.
 - **Google Calendar**: OAuth2 com conta real do escritório (`autorizar-google.js`, roda uma vez,
   interativo) — necessário para gerar link de Meet e convidar participantes por e-mail.
 - **Telegram**: notifica comprovantes recebidos e conversas descartadas da fila após

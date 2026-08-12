@@ -7,25 +7,17 @@ const axios = require('axios');
 
 const MOSKIT_BASE = 'https://api.moskitcrm.com/v2';
 const API_KEY = process.env.MOSKIT_API_KEY;
-const LAYLA_USER_ID = 90607;
-const PRODUTO_CONSULTA_PAGA_ID = 75739;
+const IDS = require('./src/moskit-ids');
+const LAYLA_USER_ID = IDS.LAYLA_USER_ID;
+const PRODUTO_CONSULTA_PAGA_ID = IDS.PRODUTO_CONSULTA_PAGA_ID;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 const apiHeaders = { apikey: API_KEY, 'Content-Type': 'application/json' };
 
-// Mapeamentos (copiados do index.js)
-const MAP_ORIGEM = { 'indicacao de clientes': 200150, 'jusbrasil': 200151, 'instagram': 200152, 'artigo': 200153, 'indicacao de parceiros': 200165, 'landing page': 242974, 'youtube': 259742, 'site': 264164, 'indicacao de/ou amigos e parentes': 362034, 'nao identificado': 435777, 'vsl - trafego pago': 694860 };
-const MAP_TIPO_CONSULTA = { 'consulta gratis': 217250, 'consulta paga': 217251, 'sem consulta': 228769 };
-const MAP_CAPTACAO = { 'berto': 200154, 'bruno': 200155, 'iury': 200156 };
-const MAP_AREA = { 'direito administrativo': 228779, 'direito educacional': 228780, 'direito imobiliario': 228781, 'direito previdenciario': 228782, 'direito de familia': 228783, 'direito do consumidor': 228784, 'direito do trabalho': 228785, 'lgpd': 228786, 'direito empresarial': 228787, 'outros': 235234, 'solucoes medicas': 577809 };
-const MAP_RESP = { 'berto': 228788, 'bruno': 228789, 'iury': 228790 };
-
-function removerAcentos(s) { return s.normalize('NFD').replace(/[\u0300-\u036f]/g, ''); }
-function buscarIdOpcao(map, valor) {
-  if (!valor) return null;
-  const chave = removerAcentos(valor.toLowerCase().trim());
-  return map[chave] || null;
-}
+// Tabelas de ID e a busca vem de src/moskit-ids.js \u2014 este arquivo mantinha copias, e copia de tabela de
+// ID grava dado errado no CRM em silencio (foi o bug do 'direito empresarial' virando 'outros'). Este
+// script escreve deal de verdade, entao tem que classificar exatamente como o bot.
+const buscarIdOpcao = (indice, valor) => IDS.buscarOpcao(indice, valor);
 
 // OpenAI via fetch (mesma do index.js)
 async function openaiChat(messages, responseFormat) {
@@ -86,16 +78,17 @@ async function buscarOuCriarContato(phone, nome) {
 // Montar payload
 function montarPayload(dados, contactId) {
   const customFields = [];
-  const idOrigem = buscarIdOpcao(MAP_ORIGEM, dados.origem);
-  if (idOrigem) customFields.push({ id: 'CF_GwyMgWiEi7E0LMLA', options: [idOrigem] });
-  const idTipoConsulta = buscarIdOpcao(MAP_TIPO_CONSULTA, dados.tipo_consulta);
-  if (idTipoConsulta) customFields.push({ id: 'CF_Pj3qYeidir3ArqQe', options: [idTipoConsulta] });
-  const idCaptacao = buscarIdOpcao(MAP_CAPTACAO, dados.captacao);
-  if (idCaptacao) customFields.push({ id: 'CF_2wpDlkieioO8dmvL', options: [idCaptacao] });
-  const idArea = buscarIdOpcao(MAP_AREA, dados.area_direito);
-  if (idArea) customFields.push({ id: 'CF_6rRmwei9i6aZpq4X', options: [idArea] });
-  const idResponsavel = buscarIdOpcao(MAP_RESP, dados.advogado_responsavel);
-  if (idResponsavel) customFields.push({ id: 'CF_vG0mR0iwik846qbV', options: [idResponsavel] });
+  const push = (cfId, id) => { if (id) customFields.push({ id: cfId, options: [id] }); };
+
+  push(IDS.CF.ORIGEM, buscarIdOpcao(IDS.INDICE_BUSCA.ORIGEM, dados.origem));
+  push(IDS.CF.TIPO_CONSULTA, buscarIdOpcao(IDS.INDICE_BUSCA.TIPO_CONSULTA, dados.tipo_consulta));
+  push(IDS.CF.CAPTACAO, buscarIdOpcao(IDS.INDICE_BUSCA.CAPTACAO, dados.captacao));
+
+  // Responsavel DERIVADO da area, como no bot — nunca o palpite do modelo.
+  const idArea = buscarIdOpcao(IDS.INDICE_BUSCA.AREA_DIREITO, dados.area_direito);
+  push(IDS.CF.AREA_DIREITO, idArea);
+  const advogadoDaArea = idArea ? IDS.ADVOGADO_POR_AREA_ID[idArea] : null;
+  push(IDS.CF.RESPONSAVEL, buscarIdOpcao(IDS.INDICE_BUSCA.RESPONSAVEL_PROCESSO, advogadoDaArea));
   return {
     name: dados.assunto ? (dados.nome || 'Cliente') + ' - ' + dados.assunto : (dados.nome || 'Cliente'),
     status: 'OPEN',

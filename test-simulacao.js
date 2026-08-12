@@ -7,8 +7,14 @@ const Database = require('better-sqlite3');
 // ------------------------------------------------------------
 // Config
 // ------------------------------------------------------------
-const LAYLA_USER_ID = 90607;
-const PRODUTO_CONSULTA_PAGA_ID = 75739;
+const IDS = require('./src/moskit-ids');
+// Tabelas de ID e a propria busca vem de src/moskit-ids.js. Este arquivo mantinha copias — e elas JA
+// tinham divergido (chaves com acento que so casavam pelo antigo fallback por substring, e opcoes de
+// captacao "ana"/"layla" que nao existem na fonte unica). Copia de tabela de ID grava dado errado no CRM
+// em silencio, que e exatamente o que src/moskit-ids.js existe para impedir.
+const LAYLA_USER_ID = IDS.LAYLA_USER_ID;
+const PRODUTO_CONSULTA_PAGA_ID = IDS.PRODUTO_CONSULTA_PAGA_ID;
+const buscarIdOpcao = (indice, valor) => IDS.buscarOpcao(indice, valor);
 const MOSKIT_BASE = 'https://api.moskitcrm.com/v2';
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -22,45 +28,6 @@ const apiHeaders = {
 // ------------------------------------------------------------
 // Mapeamentos
 // ------------------------------------------------------------
-const MAPEAMENTO_ORIGEM = {
-  'indicação de clientes': 200150, 'jusbrasil': 200151, 'instagram': 200152,
-  'artigo': 200153, 'indicação de parceiros': 200165, 'landing page': 242974,
-  'youtube': 259742, 'site': 264164, 'indicação de/ou amigos e parentes': 362034,
-  'não identificado': 435777, 'vsl - tráfego pago': 694860,
-};
-const MAPEAMENTO_TIPO_CONSULTA = {
-  'consulta grátis': 217250, 'consulta paga': 217251, 'sem consulta': 228769,
-};
-const MAPEAMENTO_CAPTACAO = {
-  'berto': 200154, 'bruno': 200155, 'iury': 200156, 'ana': 578820, 'layla': 578821,
-};
-const MAPEAMENTO_AREA_DIREITO = {
-  'direito administrativo': 228779, 'direito educacional': 228780,
-  'direito imobiliário': 228781, 'direito previdenciário': 228782,
-  'direito de família': 228783, 'direito do consumidor': 228784,
-  'direito do trabalho': 228785, 'lgpd': 228786, 'direito empresarial': 228787,
-  'outros': 235234, 'soluções médicas': 577809,
-};
-const MAPEAMENTO_RESPONSAVEL_PROCESSO = {
-  'berto': 228788, 'bruno': 228789, 'iury': 228790,
-};
-
-function removerAcentos(str) {
-  return str.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-}
-
-function buscarIdOpcao(mapeamento, valor) {
-  if (!valor) return null;
-  const normalizado = removerAcentos(String(valor).toLowerCase().trim());
-  if (mapeamento[normalizado] !== undefined) return mapeamento[normalizado];
-  for (const [label, id] of Object.entries(mapeamento)) {
-    const labelSemAcento = removerAcentos(label);
-    if (normalizado === labelSemAcento ||
-        normalizado.includes(labelSemAcento) ||
-        labelSemAcento.includes(normalizado)) return id;
-  }
-  return null;
-}
 
 function montarHistorico(mensagens) {
   return mensagens.map((m) => `${m.role}: ${m.text}`).join('\n');
@@ -141,18 +108,20 @@ async function extrairDadosAtendimento(historico, temDeal, dadosAnteriores) {
   return JSON.parse(conteudo);
 }
 
+// Mesmas regras de classificacao do bot: campos por correspondencia exata (com apelidos) e RESPONSAVEL
+// DERIVADO DA AREA — nunca o que o modelo sugeriu por conta propria.
 function montarPayloadMoskit(dados, contactId) {
   const customFields = [];
-  const idOrigem = buscarIdOpcao(MAPEAMENTO_ORIGEM, dados.origem);
-  if (idOrigem) customFields.push({ id: 'CF_GwyMgWiEi7E0LMLA', options: [idOrigem] });
-  const idTipoConsulta = buscarIdOpcao(MAPEAMENTO_TIPO_CONSULTA, dados.tipo_consulta);
-  if (idTipoConsulta) customFields.push({ id: 'CF_Pj3qYeidir3ArqQe', options: [idTipoConsulta] });
-  const idCaptacao = buscarIdOpcao(MAPEAMENTO_CAPTACAO, dados.captacao);
-  if (idCaptacao) customFields.push({ id: 'CF_2wpDlkieioO8dmvL', options: [idCaptacao] });
-  const idArea = buscarIdOpcao(MAPEAMENTO_AREA_DIREITO, dados.area_direito);
-  if (idArea) customFields.push({ id: 'CF_6rRmwei9i6aZpq4X', options: [idArea] });
-  const idResponsavel = buscarIdOpcao(MAPEAMENTO_RESPONSAVEL_PROCESSO, dados.advogado_responsavel);
-  if (idResponsavel) customFields.push({ id: 'CF_vG0mR0iwik846qbV', options: [idResponsavel] });
+  const push = (cfId, id) => { if (id) customFields.push({ id: cfId, options: [id] }); };
+
+  push(IDS.CF.ORIGEM, buscarIdOpcao(IDS.INDICE_BUSCA.ORIGEM, dados.origem));
+  push(IDS.CF.TIPO_CONSULTA, buscarIdOpcao(IDS.INDICE_BUSCA.TIPO_CONSULTA, dados.tipo_consulta));
+  push(IDS.CF.CAPTACAO, buscarIdOpcao(IDS.INDICE_BUSCA.CAPTACAO, dados.captacao));
+
+  const idArea = buscarIdOpcao(IDS.INDICE_BUSCA.AREA_DIREITO, dados.area_direito);
+  push(IDS.CF.AREA_DIREITO, idArea);
+  const advogadoDaArea = idArea ? IDS.ADVOGADO_POR_AREA_ID[idArea] : null;
+  push(IDS.CF.RESPONSAVEL, buscarIdOpcao(IDS.INDICE_BUSCA.RESPONSAVEL_PROCESSO, advogadoDaArea));
 
   const nomeDeal = dados.assunto ? `${dados.nome} - ${dados.assunto}` : (dados.nome || 'Cliente sem nome');
   return {

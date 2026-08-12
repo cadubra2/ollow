@@ -13,27 +13,17 @@ const LAYLA = 90607;
 // UTILS (copiado do index.js)
 // ==============================
 
-const MAP_ORIGEM = { 'indicacao de clientes':200150, 'jusbrasil':200151, 'instagram':200152, 'artigo':200153, 'indicacao de parceiros':200165, 'landing page':242974, 'youtube':259742, 'site':264164, 'indicacao de/ou amigos e parentes':362034, 'nao identificado':435777, 'vsl - trafego pago':694860 };
-const MAP_TIPO = { 'consulta gratis':217250, 'consulta paga':217251, 'sem consulta':228769 };
-const MAP_CAPTACAO = { 'berto':200154, 'bruno':200155, 'iury':200156, 'ana':578820, 'layla':578821 };
-// 'direito empresarial' estava com 235234 (= o ID de "outros"), divergindo das outras 5 copias
-// deste mesmo mapa no repositorio. Como este script faz POST /deals de verdade, todo teste de
-// Direito Empresarial entrou no CRM classificado como "Outros".
-const MAP_AREA = { 'direito administrativo':228779, 'direito educacional':228780, 'direito imobiliario':228781, 'direito previdenciario':228782, 'direito de familia':228783, 'direito do consumidor':228784, 'direito do trabalho':228785, 'lgpd':228786, 'direito empresarial':228787, 'outros':235234, 'solucoes medicas':577809, 'direito medico e da saude':577809, 'direito da saude':577809, 'direito medico':577809 };
-const MAP_RESP = { 'berto':228788, 'bruno':228789, 'iury':228790 };
+// Tabelas de ID e busca vem de src/moskit-ids.js. Aqui vivia a copia que gravou deal errado no CRM de
+// verdade: 'direito empresarial' apontava para 235234, que e o ID de "Outros". Este script faz
+// POST /deals real, entao classificar diferente do bot nao e detalhe de teste \u2014 e dado errado no CRM.
+const IDS = require('./src/moskit-ids');
+const MAP_ORIGEM = IDS.INDICE_BUSCA.ORIGEM;
+const MAP_TIPO = IDS.INDICE_BUSCA.TIPO_CONSULTA;
+const MAP_CAPTACAO = IDS.INDICE_BUSCA.CAPTACAO;
+const MAP_AREA = IDS.INDICE_BUSCA.AREA_DIREITO;
+const MAP_RESP = IDS.INDICE_BUSCA.RESPONSAVEL_PROCESSO;
 
-function removerAcentos(s) { return s.normalize('NFD').replace(/[\u0300-\u036f]/g, ''); }
-
-function buscarId(mapeamento, valor) {
-  if (!valor) return null;
-  const norm = removerAcentos(String(valor).toLowerCase().trim());
-  if (mapeamento[norm] !== undefined) return mapeamento[norm];
-  for (const [label, id] of Object.entries(mapeamento)) {
-    const semAcento = removerAcentos(label);
-    if (norm === semAcento || norm.includes(semAcento) || semAcento.includes(norm)) return id;
-  }
-  return null;
-}
+const buscarId = (indice, valor) => IDS.buscarOpcao(indice, valor);
 
 async function chamarOpenAI(historico, temDeal, dadosAnteriores) {
   const pendentes = dadosAnteriores
@@ -98,7 +88,8 @@ function montarPayload(dados, contactId) {
   const t = buscarId(MAP_TIPO, dados.tipo_consulta); if (t) cf.push({ id:'CF_Pj3qYeidir3ArqQe', options:[t] });
   const c = buscarId(MAP_CAPTACAO, dados.captacao); if (c) cf.push({ id:'CF_2wpDlkieioO8dmvL', options:[c] });
   const a = buscarId(MAP_AREA, dados.area_direito); if (a) cf.push({ id:'CF_6rRmwei9i6aZpq4X', options:[a] });
-  const r = buscarId(MAP_RESP, dados.advogado_responsavel); if (r) cf.push({ id:'CF_vG0mR0iwik846qbV', options:[r] });
+  // Responsavel DERIVADO da area (regra do escritorio), igual ao bot — nao o que o modelo sugeriu.
+  const r = buscarId(MAP_RESP, a ? IDS.ADVOGADO_POR_AREA_ID[a] : null); if (r) cf.push({ id:'CF_vG0mR0iwik846qbV', options:[r] });
   return {
     name: dados.assunto ? `${dados.nome} - ${dados.assunto}` : dados.nome,
     status: 'OPEN',

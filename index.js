@@ -16,6 +16,7 @@ const { jaExiste, normalizarMensagens } = require('./src/mensagens');
 const { chaveConversa, ehInterno, TEAM_SUFIXOS } = require('./src/telefone');
 const { transcreverAudio } = require('./src/transcricao');
 const MOSKIT_IDS = require('./src/moskit-ids');
+const zapsign = require('./src/zapsign');
 
 // ------------------------------------------------------------
 // Config
@@ -27,6 +28,33 @@ const TEMPO_INATIVIDADE_MS = Number(process.env.TEMPO_INATIVIDADE_MS) || 5 * 60 
 const MOSKIT_STAGE_CONSULTA_AGENDADA = Number(process.env.MOSKIT_STAGE_CONSULTA_AGENDADA) || 184382;
 const MOSKIT_BASE = process.env.MOSKIT_BASE || 'https://api.moskitcrm.com/v2';
 const TZ_ESCRITORIO = process.env.TZ_ESCRITORIO || 'America/Fortaleza';
+
+// dados.data_hora_consulta / apuracao.horarioIso sao strings NAIVE (sem Z/offset) que representam
+// direto a hora do ESCRITORIO (TZ_ESCRITORIO) - ver src/evidencia.js:102-104. Pro Google Calendar,
+// mandamos { dateTime: naive, timeZone: TZ_ESCRITORIO } e deixamos o GOOGLE resolver o instante -
+// zero matematica de fuso do lado do bot, e funciona igual independente do fuso do SO onde o
+// processo roda. Era essa dependencia — new Date(naive).toISOString() SEM timeZone no payload —
+// que fazia uma reuniao marcada pras 17h30 (hora do escritorio) virar 17h30 UTC quando o processo
+// roda numa VPS sem fuso configurado (Ubuntu cloud vem em UTC por padrao): 3h mais cedo do que foi
+// combinado. Pra exibicao (notas/Telegram) e pra somar duracao, tratamos a string como se fosse UTC
+// so como TRUQUE DE CALCULO (Brasil nao tem horario de verao desde 2019, entao "+1h de relogio" ==
+// "+1h real" para TZ_ESCRITORIO) — nunca usar esse valor como o instante real enviado a uma API
+// externa sem o timeZone explicito ao lado.
+function horarioNaiveValido(isoNaive) {
+  return !isNaN(Date.parse(`${isoNaive}Z`));
+}
+function somarMinutosNaive(isoNaive, minutos) {
+  const d = new Date(`${isoNaive}Z`);
+  d.setUTCMinutes(d.getUTCMinutes() + minutos);
+  return d.toISOString().slice(0, 19);
+}
+function formatarHorarioEscritorio(isoNaive) {
+  if (!isoNaive) return null;
+  const d = new Date(`${isoNaive}Z`);
+  if (isNaN(d.getTime())) return null;
+  return d.toLocaleString('pt-BR', { timeZone: 'UTC' }); // 'UTC' aqui = nao girar de novo
+}
+
 // Valor da consulta (aceita igual ou maior — pagamento por cartao pode ter acrescimo)
 const COMPROVANTE_VALOR_ESPERADO_CENTAVOS = Number(process.env.COMPROVANTE_VALOR_ESPERADO_CENTAVOS) || 35000;
 
@@ -195,6 +223,32 @@ try { db.exec("ALTER TABLE conversations ADD COLUMN agendamento_pendente_hash TE
 // verdade e ninguem no escritorio ficava sabendo que a reuniao nao foi pra agenda. Visto no deal
 // 48346871 (token OAuth expirado): confirmacao completa, zero nota no CRM.
 try { db.exec("ALTER TABLE conversations ADD COLUMN agendamento_erro_hash TEXT"); } catch {}
+// Contrato de Prestacao de Servico gerado no ZapSign — mesmo espirito das colunas de agendamento
+// acima. contrato_zapsign_criado e o guard de idempotencia (so gera uma vez por deal);
+// _doc_token identifica o documento pro webhook de status; _pendente_hash/_erro_hash dedupam
+// nota de dado faltante vs. falha real de API, mesma distincao de agendamento_pendente_hash vs
+// agendamento_erro_hash.
+try { db.exec("ALTER TABLE conversations ADD COLUMN contrato_zapsign_criado INTEGER DEFAULT 0"); } catch {}
+try { db.exec("ALTER TABLE conversations ADD COLUMN contrato_zapsign_doc_token TEXT"); } catch {}
+try { db.exec("ALTER TABLE conversations ADD COLUMN contrato_zapsign_status TEXT"); } catch {}
+try { db.exec("ALTER TABLE conversations ADD COLUMN contrato_zapsign_pendente_hash TEXT"); } catch {}
+try { db.exec("ALTER TABLE conversations ADD COLUMN contrato_zapsign_erro_hash TEXT"); } catch {}
+// Ultimo valor que o BOT escreveu em cada campo personalizado do deal, no formato
+// {"<CF_id>": [options]}. E a memoria que permite distinguir "o CRM tem o valor que eu mesmo
+// escrevi" de "alguem da equipe corrigiu na mao": divergencia => humano mexeu.
+try { db.exec("ALTER TABLE conversations ADD COLUMN custom_fields_bot TEXT"); } catch {}
+// Ids de campo personalizado travados por edicao humana (JSON array). Trava permanente: uma vez que a
+// equipe corrigiu um campo, o bot nunca mais o reescreve, mesmo que a IA mude de opiniao depois.
+try { db.exec("ALTER TABLE conversations ADD COLUMN campos_travados TEXT"); } catch {}
+// Hashes de nota: briefing (para repostar quando o resumo do caso mudar de verdade) e nota de campos
+// preenchidos (para nao repetir a MESMA nota a cada ciclo — o deal 48423360 acumulou 6 identicas).
+try { db.exec("ALTER TABLE conversations ADD COLUMN briefing_hash TEXT"); } catch {}
+try { db.exec("ALTER TABLE conversations ADD COLUMN campos_nota_hash TEXT"); } catch {}
+// Hash do ultimo conjunto de valores que a IA devolveu e que nao existem na lista do CRM. Sem isso o
+// campo apenas nao era enviado e ninguem no escritorio ficava sabendo — e um valor recorrente ("Direito
+// Civil") continuava caindo no vazio indefinidamente em vez de virar apelido em src/moskit-ids.js.
+try { db.exec("ALTER TABLE conversations ADD COLUMN opcao_invalida_hash TEXT"); } catch {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_contrato_zapsign_doc_token ON conversations(contrato_zapsign_doc_token)"); } catch {}
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS moskit_contacts (
@@ -298,6 +352,17 @@ function removerAcentos(str) {
   return str.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
 }
 
+// Assunto que o prompt manda usar quando ninguem descreveu o caso ainda. Nao e um palpite de area \u2014
+// e o placeholder honesto, e por isso passa pelo gate do caso descrito (ver processarConversaDirect).
+// Com acento porque vai pro TITULO do negocio no CRM, que e texto lido por gente. A comparacao em
+// ehAssuntoNeutro normaliza acentos, entao o "Consulta juridica" sem acento que o prompt manda o modelo
+// devolver casa com este valor.
+const ASSUNTO_NEUTRO = 'Consulta jurídica';
+function ehAssuntoNeutro(assunto) {
+  const normalizar = (s) => removerAcentos(String(s || '').toLowerCase().trim());
+  return normalizar(assunto) === normalizar(ASSUNTO_NEUTRO);
+}
+
 function removerEmoji(str) {
   return String(str || '')
     .replace(/[\u{1F000}-\u{1FFFF}\u{2600}-\u{27BF}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}\ufe0f]/gu, '')
@@ -305,12 +370,24 @@ function removerEmoji(str) {
     .trim();
 }
 
-// Tabelas de ID vem de src/moskit-ids.js — fonte unica, importada tambem pelos scripts.
-const MAPEAMENTO_ORIGEM = MOSKIT_IDS.ORIGEM;
-const MAPEAMENTO_TIPO_CONSULTA = MOSKIT_IDS.TIPO_CONSULTA;
-const MAPEAMENTO_CAPTACAO = MOSKIT_IDS.CAPTACAO;
-const MAPEAMENTO_AREA_DIREITO = MOSKIT_IDS.AREA_DIREITO;
-const MAPEAMENTO_RESPONSAVEL_PROCESSO = MOSKIT_IDS.RESPONSAVEL_PROCESSO;
+// Tabelas de ID vem de src/moskit-ids.js — fonte unica, importada tambem pelos scripts. Aqui usamos o
+// INDICE_BUSCA (canonicas + apelidos, tudo normalizado), nao as tabelas cruas: a busca de opcao exige
+// correspondencia exata, entao "Dr. Berto" ou "familia" so chegam ao ID certo pelo indice.
+const MAPEAMENTO_ORIGEM = MOSKIT_IDS.INDICE_BUSCA.ORIGEM;
+const MAPEAMENTO_TIPO_CONSULTA = MOSKIT_IDS.INDICE_BUSCA.TIPO_CONSULTA;
+const MAPEAMENTO_CAPTACAO = MOSKIT_IDS.INDICE_BUSCA.CAPTACAO;
+const MAPEAMENTO_AREA_DIREITO = MOSKIT_IDS.INDICE_BUSCA.AREA_DIREITO;
+const MAPEAMENTO_RESPONSAVEL_PROCESSO = MOSKIT_IDS.INDICE_BUSCA.RESPONSAVEL_PROCESSO;
+
+// Campos de opcao que o bot classifica, com o nome que a equipe ve no CRM. Usado para detectar valor
+// que a IA inventou (detectarOpcoesInvalidas) e para nomear campo em nota/log.
+const CAMPOS_CLASSIFICACAO = [
+  { campo: 'origem', nome: 'Origem', mapa: MAPEAMENTO_ORIGEM },
+  { campo: 'tipo_consulta', nome: 'Tipo de Consulta', mapa: MAPEAMENTO_TIPO_CONSULTA },
+  { campo: 'captacao', nome: 'Captação', mapa: MAPEAMENTO_CAPTACAO },
+  { campo: 'area_direito', nome: 'Área do Direito', mapa: MAPEAMENTO_AREA_DIREITO },
+  { campo: 'advogado_responsavel', nome: 'Responsável pelo processo', mapa: MAPEAMENTO_RESPONSAVEL_PROCESSO },
+];
 
 // Campo "Tipo de Consulta" do deal (MULTIPLE_OPTION). Unica fonte de verdade pra leads que nunca
 // passaram pelo WhatsApp (Moskit Boost, atividade criada na mao) — ver autorizacaoParaAgendar.
@@ -318,20 +395,23 @@ const CF_TIPO_CONSULTA = MOSKIT_IDS.CF.TIPO_CONSULTA;
 const TIPO_CONSULTA_GRATIS_ID = MOSKIT_IDS.TIPO_CONSULTA_GRATIS_ID;
 const TIPO_CONSULTA_PAGA_ID = MOSKIT_IDS.TIPO_CONSULTA_PAGA_ID;
 
-function buscarIdOpcao(mapeamento, valor) {
-  if (!valor) return null;
-  const normalizado = removerAcentos(String(valor).toLowerCase().trim());
-  if (mapeamento[normalizado] !== undefined) return mapeamento[normalizado];
-  for (const [label, id] of Object.entries(mapeamento)) {
-    const labelSemAcento = removerAcentos(label);
-    if (normalizado === labelSemAcento ||
-        normalizado.includes(labelSemAcento) ||
-        labelSemAcento.includes(normalizado)) {
-      return id;
-    }
+// Correspondencia EXATA (depois de normalizar) contra o indice de busca do campo, que ja inclui as
+// chaves canonicas e os apelidos declarados em src/moskit-ids.js.
+//
+// O casamento por substring que existia aqui preenchia mais campos ao custo de escolher a opcao errada
+// em silencio: "Indicacao" sozinho virava "Indicacao de clientes", "direito" virava "Direito
+// Administrativo" e "consulta" virava "consulta gratis" — esse ultimo com consequencia financeira
+// (R$0 no CRM). Decisao de 12/08/2026: valor que nao esta na tabela deixa o campo VAZIO e vira aviso
+// (ver detectarOpcoesInvalidas/registrarOpcoesInvalidas), nunca um chute.
+//
+// `aproximado` existe para UM caso legitimo: o motivo de perda, que a IA escreve com as palavras da
+// conversa e precisa cair na opcao mais parecida da lista fixa do CRM.
+function buscarIdOpcao(mapeamento, valor, opcoes = {}) {
+  const id = MOSKIT_IDS.buscarOpcao(mapeamento, valor, opcoes);
+  if (id === null && valor) {
+    console.log(`  ⚠️ opcao nao reconhecida para "${valor}" — campo fica vazio (cadastrar apelido em src/moskit-ids.js se for recorrente)`);
   }
-  console.log(`  opcao nao encontrada para "${valor}"`);
-  return null;
+  return id;
 }
 
 // Bloco padrao de condicoes que a equipe manda quando a consulta e PAGA. Se a equipe NUNCA enviou
@@ -379,6 +459,131 @@ function customFieldsPersistiram(esperados, atuais) {
     const optsAtuais = (atual.options || []).map(String).sort();
     return optsEsperados.length === optsAtuais.length && optsEsperados.every((o, i) => o === optsAtuais[i]);
   });
+}
+
+// ------------------------------------------------------------
+// Autoria dos campos personalizados: humano ganha do bot
+// ------------------------------------------------------------
+// O bot reescreve os mesmos campos a cada ciclo, a partir de last_data. Com a verificacao pos-PUT
+// (ver atualizarNegocioMoskit) ele ainda insiste com retentativas ate o valor dele grudar — ou seja,
+// uma correcao feita na mao pela equipe era desfeita no ciclo seguinte. Regra do escritorio
+// (12/08/2026): quem corrige na mao ganha, para sempre.
+//
+// Dois campos ficam FORA da lista de proposito, porque neles nao existe "opiniao" a preservar — existe
+// regra:
+//   - TIPO_CONSULTA: quem manda e o checkpoint do bloco de condicoes, que ja sobrepoe marcacao manual
+//     de cortesia quando a equipe anuncia o valor.
+//   - RESPONSAVEL: e DERIVADO da area (MOSKIT_IDS.ADVOGADO_POR_AREA_ID) e montarPayloadMoskit o
+//     reescreve em toda escrita. Trava-lo criaria um CRM incoerente consigo mesmo — area de Familia com
+//     responsavel Iury — que e exatamente o erro que a tabela existe para eliminar. Quem quiser outro
+//     responsavel muda a AREA, ou a tabela.
+const CF_TRAVAVEIS = new Set([
+  MOSKIT_IDS.CF.ORIGEM,
+  MOSKIT_IDS.CF.CAPTACAO,
+  MOSKIT_IDS.CF.AREA_DIREITO,
+]);
+
+const CF_NOMES = {
+  [MOSKIT_IDS.CF.ORIGEM]: 'Origem',
+  [MOSKIT_IDS.CF.CAPTACAO]: 'Captação',
+  [MOSKIT_IDS.CF.AREA_DIREITO]: 'Área do Direito',
+  [MOSKIT_IDS.CF.RESPONSAVEL]: 'Responsável pelo processo',
+  [MOSKIT_IDS.CF.TIPO_CONSULTA]: 'Tipo de Consulta',
+};
+
+function nomeCampo(id) {
+  return CF_NOMES[id] || id;
+}
+
+function parseJsonSeguro(texto, padrao) {
+  try {
+    const v = JSON.parse(texto);
+    return v ?? padrao;
+  } catch {
+    return padrao;
+  }
+}
+
+function opcoesIguais(a, b) {
+  const na = (Array.isArray(a) ? a : []).map(String).sort();
+  const nb = (Array.isArray(b) ? b : []).map(String).sort();
+  return na.length === nb.length && na.every((v, i) => v === nb[i]);
+}
+
+function lerRegistroCampos(chatId) {
+  if (!chatId) return null;
+  const row = db.prepare('SELECT custom_fields_bot, campos_travados FROM conversations WHERE chat_id = ?').get(chatId);
+  if (!row) return null;
+  return {
+    escritos: parseJsonSeguro(row.custom_fields_bot, null) || {},
+    temRegistro: !!row.custom_fields_bot,
+    travados: new Set(parseJsonSeguro(row.campos_travados, null) || []),
+  };
+}
+
+function gravarRegistroCampos(chatId, escritos, travados) {
+  if (!chatId) return;
+  db.prepare('UPDATE conversations SET custom_fields_bot = ?, campos_travados = ? WHERE chat_id = ?')
+    .run(JSON.stringify(escritos), JSON.stringify([...travados]), chatId);
+}
+
+// Decide campo por campo se o bot pode escrever, comparando o que esta no CRM com o ultimo valor que
+// o PROPRIO bot escreveu (custom_fields_bot):
+//   - campo vazio no CRM              => escreve (nao ha nada de ninguem para preservar)
+//   - remoto == ultimo valor do bot   => escreve (o valor de la e dele mesmo)
+//   - remoto != ultimo valor do bot   => TRAVA para sempre (alguem corrigiu na mao) e nao escreve
+//   - sem registro (linha antiga)     => nao escreve nesta rodada e adota o remoto como referencia;
+//                                        do proximo ciclo em diante a comparacao acima ja vale
+// Sem chatId (backfills, scripts) nao ha onde guardar autoria: segue o comportamento antigo.
+function filtrarCamposPorAutoria(chatId, dealRemoto, camposDoBot, opcoes = {}) {
+  const registro = lerRegistroCampos(chatId);
+  if (!registro) return { campos: camposDoBot, travasNovas: [], baseline: [], registro: null };
+
+  const remotos = new Map(
+    (dealRemoto?.entityCustomFields || [])
+      .filter((c) => c?.id)
+      .map((c) => [c.id, (c.options || []).map(Number)])
+  );
+
+  const campos = [];
+  const travasNovas = [];
+  const baseline = [];
+
+  for (const campo of camposDoBot) {
+    if (!CF_TRAVAVEIS.has(campo.id)) { campos.push(campo); continue; }
+
+    if (registro.travados.has(campo.id)) {
+      console.log(`  🔒 ${nomeCampo(campo.id)}: travado por correcao manual — bot nao escreve`);
+      continue;
+    }
+
+    const remoto = remotos.get(campo.id);
+    if (!remoto || !remoto.length) { campos.push(campo); continue; }
+
+    const registrado = registro.escritos[campo.id];
+    if (registrado === undefined) {
+      // `forcarAutoria` e o escape hatch da reconciliacao manual (?incluir-legado=1): assume que o valor
+      // de la e do bot e escreve a decisao atual. Fora dele, o CRM ganha.
+      if (opcoes.forcarAutoria) {
+        console.log(`  🔁 ${nomeCampo(campo.id)}: sem registro de autoria, mas forcarAutoria ligado — sobrescrevendo o valor do CRM (${remoto.join(',')})`);
+        campos.push(campo);
+        continue;
+      }
+      baseline.push({ id: campo.id, options: remoto });
+      console.log(`  🧷 ${nomeCampo(campo.id)}: sem registro de autoria — preservando o valor que esta no CRM (${remoto.join(',')}) nesta rodada`);
+      continue;
+    }
+
+    if (!opcoesIguais(registrado, remoto)) {
+      travasNovas.push(campo.id);
+      console.log(`  🔒 ${nomeCampo(campo.id)}: valor no CRM (${remoto.join(',')}) diferente do que o bot escreveu (${[].concat(registrado).join(',')}) — alguem corrigiu na mao, travando para sempre`);
+      continue;
+    }
+
+    campos.push(campo);
+  }
+
+  return { campos, travasNovas, baseline, registro };
 }
 
 // ------------------------------------------------------------
@@ -451,6 +656,50 @@ function camposPendentes(dados) {
   return CAMPOS_OBRIGATORIOS.filter((k) => !dados[k] || dados[k] === 'null');
 }
 
+// GATE DO CASO DESCRITO. Area do direito, advogado responsavel e assunto so entram no CRM se alguem
+// tiver CONTADO o caso nesta conversa — observacao validada contra a mensagem real (cliente ou equipe,
+// ver src/evidencia.js). Sem isso o modelo deduzia a area do SOCIO que o lead mencionou: "gostaria de
+// agendar uma consulta com o Dr. Berto" virava area=LGPD e assunto="Direito Digital", porque LGPD e o
+// primeiro item do perfil do Berto no prompt. Foi assim que uma cliente de Direito Administrativo
+// (remocao por motivo de saude) entrou no CRM como LGPD, com briefing errado, e precisou de correcao
+// manual no deal 48423360.
+//
+// Zera para null, nunca para um valor de fachada: mergeDados so sobrescreve com valor nao-nulo, entao
+// uma area boa de um ciclo anterior sobrevive a uma rodada em que a evidencia nao aparecer.
+// Muta `dados` (mesmo contrato das outras sanitizacoes do pipeline) e devolve o veredito.
+function aplicarGateCasoDescrito(dados, obsValidas) {
+  const casoDescrito = !!(ultimaObservacao(obsValidas, 'cliente_descreveu_caso')
+    || ultimaObservacao(obsValidas, 'equipe_descreveu_caso'));
+  if (casoDescrito || !dados) return { casoDescrito };
+
+  if (dados.area_direito || dados.advogado_responsavel) {
+    console.log(`  🚫 area/advogado descartados — ninguem descreveu o caso nesta conversa (area="${dados.area_direito}", advogado="${dados.advogado_responsavel}")`);
+  }
+  dados.area_direito = null;
+  dados.advogado_responsavel = null;
+  // "Consulta juridica" e o placeholder que o proprio prompt manda usar enquanto o caso esta vago —
+  // esse passa. Qualquer outro assunto sem caso descrito e palpite (tipicamente o nome da area) e nao
+  // pode virar titulo de negocio no CRM.
+  if (dados.assunto && !ehAssuntoNeutro(dados.assunto)) {
+    console.log(`  🚫 assunto descartado (sem caso descrito): "${dados.assunto}"`);
+    dados.assunto = null;
+  }
+  return { casoDescrito };
+}
+
+// Lead que ainda nao contou o caso nao vira contato nem deal no CRM (decisao do escritorio,
+// 12/08/2026): melhor nenhum registro do que um registro com area/assunto adivinhados, que a equipe
+// so descobre errado depois.
+//
+// Duas excecoes, porque a partir dai o custo de nao ter deal deixa de ser cadastral: com dupla
+// confirmacao de horario o evento na agenda, o Meet e o contrato do ZapSign dependem de existir dealId
+// (finalizarCiclo so roda nos ramos que escrevem), e com o bloco de condicoes enviado a consulta ja
+// foi cobrada. Nesses casos o deal nasce mesmo assim — com area/advogado vazios para a equipe
+// preencher, nunca com palpite.
+function deveEsperarCasoDescrito(acao, casoDescrito, apuracao, blocoEnviado) {
+  return acao === 'criar' && !casoDescrito && !apuracao?.confirmado && !blocoEnviado;
+}
+
 function mergeDados(anteriores, novos) {
   const merged = { ...(anteriores || {}) };
   for (const key of Object.keys(novos || {})) {
@@ -459,6 +708,76 @@ function mergeDados(anteriores, novos) {
     }
   }
   return merged;
+}
+
+// O ADVOGADO E CONSEQUENCIA DA AREA, nunca uma escolha independente (MOSKIT_IDS.AREA_PARA_ADVOGADO).
+// Antes disto o responsavel era o que o modelo dissesse: area de Familia podia sair com responsavel
+// Berto e nada no codigo reclamava. Aqui a area manda, e a sugestao do modelo e so um palpite que pode
+// ser descartado.
+//
+// Area sem dono ("Outros") ou nome de area que nao esta na tabela => responsavel VAZIO, para a equipe
+// decidir. `captacao` nao e tocada: e quem trouxe o lead, nao quem cuida do caso.
+function derivarAdvogadoDaArea(dados) {
+  if (!dados) return;
+
+  if (!dados.area_direito) {
+    if (dados.advogado_responsavel) {
+      console.log(`  🚫 advogado "${dados.advogado_responsavel}" descartado — sem area do direito definida, o responsavel nao pode ser derivado`);
+      dados.advogado_responsavel = null;
+    }
+    return;
+  }
+
+  // Pelo ID da opcao, nao pelo nome: apelido de area ("Direito Medico", "familia") chega resolvido e a
+  // tabela do responsavel nunca discorda da tabela de areas sobre como uma area se chama.
+  const idArea = buscarIdOpcao(MAPEAMENTO_AREA_DIREITO, dados.area_direito);
+  const dono = idArea ? (MOSKIT_IDS.ADVOGADO_POR_AREA_ID[idArea] || null) : null;
+  if (!dono) {
+    if (dados.advogado_responsavel) {
+      console.log(`  🚫 advogado "${dados.advogado_responsavel}" descartado — a area "${dados.area_direito}" nao tem responsavel definido na tabela do escritorio`);
+      dados.advogado_responsavel = null;
+    }
+    return;
+  }
+
+  if (dados.advogado_responsavel && removerAcentos(String(dados.advogado_responsavel).toLowerCase().trim()) !== dono.toLowerCase()) {
+    console.log(`  ⚠️ advogado sugerido "${dados.advogado_responsavel}" ignorado — "${dados.area_direito}" e do ${dono}`);
+  }
+  dados.advogado_responsavel = dono;
+}
+
+// Assunto que e so o nome de uma area do direito nao e assunto: e o palpite de area vazando pro TITULO
+// do negocio (foi assim que o deal do caso 48423360 nasceu "… - Direito Digital"). Vale mesmo quando o
+// caso FOI descrito: nesse caso o modelo tinha material para resumir o tema e devolveu a area.
+function rejeitarAssuntoQueEhArea(dados) {
+  if (!dados?.assunto) return;
+  // Pelo indice de busca: pega tanto "LGPD" quanto os apelidos ("Direito Digital", "familia").
+  if (!buscarIdOpcao(MAPEAMENTO_AREA_DIREITO, dados.assunto)) return;
+  console.log(`  🚫 assunto "${dados.assunto}" e nome de area, nao tema do caso — trocado por "${ASSUNTO_NEUTRO}"`);
+  dados.assunto = ASSUNTO_NEUTRO;
+}
+
+// Tudo que o bot AFIRMA sobre o caso passa por aqui: evidencia do caso descrito, advogado derivado da
+// area e assunto que nao pode ser nome de area. Idempotente de proposito — roda na extracao da rodada e
+// DE NOVO no objeto mesclado que vai pro CRM (ver mesclarParaCrm).
+function sanitizarClassificacao(dados, obsValidas) {
+  const { casoDescrito } = aplicarGateCasoDescrito(dados, obsValidas);
+  rejeitarAssuntoQueEhArea(dados);
+  derivarAdvogadoDaArea(dados);
+  return { casoDescrito };
+}
+
+// O gate limpava so a extracao da rodada, mas o que vai pro CRM (e o que volta pro last_data) e o
+// objeto MESCLADO com os ciclos anteriores — e mergeDados ressuscitava o palpite antigo de area/assunto
+// gravado antes destas travas existirem, reenviando-o para sempre. Mesclar e sanitizar tem que ser uma
+// coisa so.
+//
+// Omitir um campo do payload nunca APAGA nada no CRM: mesclarCustomFields devolve o valor remoto para o
+// corpo do PUT. Omitir significa "nao disputo este campo nesta rodada".
+function mesclarParaCrm(dadosAnteriores, dados, obsValidas) {
+  const mesclados = mergeDados(dadosAnteriores || {}, dados);
+  sanitizarClassificacao(mesclados, obsValidas);
+  return mesclados;
 }
 
 // ------------------------------------------------------------
@@ -565,7 +884,14 @@ async function buscarDealPorContato(contactId) {
   return null;
 }
 
-function montarPayloadMoskit(dados, contactId, opcoes = {}) {
+function montarPayloadMoskit(dadosBrutos, contactId, opcoes = {}) {
+  // Ultimo ponto de estrangulamento antes de qualquer escrita no CRM (criar, atualizar, virada de
+  // cobranca, backfill, reconciliacao): a area DEFINE o responsavel. Sem isto, um caminho que nao passe
+  // pelo pipeline — backfill lendo last_data antigo, por exemplo — ainda conseguiria gravar area de
+  // Familia com responsavel Berto. Copia para nao mutar o objeto de quem chamou.
+  const dados = { ...(dadosBrutos || {}) };
+  derivarAdvogadoDaArea(dados);
+
   const customFields = [];
 
   // CHECKPOINT: o bloco de condicoes de valor e o unico fato que decide paga x cortesia.
@@ -619,14 +945,47 @@ async function criarNegocioMoskit(dados, contactId, opcoes = {}) {
     headers: { ...apiHeaders, 'X-Ollow-Origin': 'BOT_WHATSAPP' },
     validateStatus: (s) => s >= 200 && s < 300,
   });
+  // Registra a autoria dos campos (e do nome) ja no nascimento do deal: e o que permite ao proximo ciclo
+  // saber que o que esta no CRM foi escrito pelo bot, e nao corrigido por alguem da equipe.
+  registrarAutoriaCampos(opcoes.chatId, payload.entityCustomFields, [], [], payload.name);
   return response.data;
+}
+
+// Chave reservada no mesmo registro de autoria para o NOME do deal (os outros ids sao sempre "CF_...",
+// entao nao ha colisao possivel).
+const CHAVE_AUTORIA_NOME = '__name';
+
+function nomeEscritoPeloBot(chatId) {
+  const registro = lerRegistroCampos(chatId);
+  const nome = registro?.escritos?.[CHAVE_AUTORIA_NOME];
+  return typeof nome === 'string' && nome.trim() ? nome.trim() : null;
+}
+
+// Guarda em custom_fields_bot o que o bot acabou de escrever. Preserva o que ja estava registrado para
+// os campos que nao entraram nesta rodada (ex: campo travado, ou campo que a IA nao resolveu).
+function registrarAutoriaCampos(chatId, camposEscritos, travasNovas = [], baseline = [], nomeEscrito = null) {
+  if (!chatId) return;
+  const registro = lerRegistroCampos(chatId);
+  if (!registro) return;
+
+  const escritos = { ...registro.escritos };
+  for (const c of [...(camposEscritos || []), ...(baseline || [])]) {
+    if (c?.id) escritos[c.id] = (c.options || []).map(Number);
+  }
+  if (nomeEscrito) escritos[CHAVE_AUTORIA_NOME] = String(nomeEscrito).trim();
+  const travados = new Set([...registro.travados, ...travasNovas]);
+  gravarRegistroCampos(chatId, escritos, travados);
 }
 
 async function atualizarNegocioMoskit(dealId, dados, contactId, opcoes = {}) {
   const payload = montarPayloadMoskit(dados, contactId, opcoes);
   // Tudo que o bot decidiu sobre este lead NESTA rodada, antes do merge com o que ja existia
   // remotamente (que so acontece no GET abaixo) — e exatamente o que confirmamos apos o PUT.
-  const camposEsperados = payload.entityCustomFields;
+  // Reatribuido abaixo se algum campo sair do payload por autoria humana: confirmar um campo que o bot
+  // deliberadamente NAO mandou faria a atualizacao falhar para sempre.
+  let camposEsperados = payload.entityCustomFields;
+  let travasNovas = [];
+  let baselineCampos = [];
 
   // O PUT substitui o deal inteiro. Le o estado atual antes pra (1) nao apagar campo personalizado
   // que a equipe preencheu na mao e o bot nao resolveu nesta rodada, e (2) preservar marcacao manual
@@ -640,14 +999,21 @@ async function atualizarNegocioMoskit(dealId, dados, contactId, opcoes = {}) {
       validateStatus: (s) => s < 500,
     });
     if (atualRes.status >= 200 && atualRes.status < 300) {
-      // Nome: so escreve se o deal ainda estiver com o nome cru que o proprio bot gera (sem tema).
-      // Se alguem da equipe renomeou na mao, ou se o nome atual ja tem tema e esta rodada veio sem
-      // assunto, preserva o que esta la — nunca tira um tema que ja estava certo.
+      // Nome do deal, pela mesma regra de autoria dos campos personalizados:
+      //   - nome cru do bot (sem tema) ou nome que o BOT escreveu por ultimo => pode atualizar
+      //   - qualquer outro nome => alguem da equipe renomeou, preserva para sempre
+      // A trava antiga era "preserva tudo que nao seja o nome cru", e por isso um titulo que nasceu com
+      // assunto errado ("Cliente - Direito Digital") ficava congelado mesmo depois de o bot descobrir o
+      // tema real — outro caminho pelo qual a classificacao errada sobrevivia no CRM.
       const nomeRemoto = String(atualRes.data?.name || '').trim();
       const nomeCruDoBot = removerEmoji(dados.nome) || 'Cliente sem nome';
-      if (nomeRemoto && nomeRemoto !== nomeCruDoBot) {
-        if (nomeRemoto !== payload.name) console.log(`  ⏭️ nome do deal ${dealId} preservado ("${nomeRemoto}")`);
+      const nomeDoBot = nomeEscritoPeloBot(opcoes.chatId);
+      const escritoPeloBot = nomeRemoto === nomeCruDoBot || (!!nomeDoBot && nomeRemoto === nomeDoBot);
+      if (nomeRemoto && !escritoPeloBot) {
+        if (nomeRemoto !== payload.name) console.log(`  ⏭️ nome do deal ${dealId} preservado ("${nomeRemoto}") — renomeado fora do bot`);
         payload.name = atualRes.data.name;
+      } else if (nomeRemoto && nomeRemoto !== payload.name) {
+        console.log(`  ✏️ titulo do deal ${dealId} atualizado: "${nomeRemoto}" → "${payload.name}"`);
       }
 
       // Estagio: montarPayloadMoskit sempre monta o estagio INICIAL, e o PUT e full replace — sem
@@ -668,6 +1034,17 @@ async function atualizarNegocioMoskit(dealId, dados, contactId, opcoes = {}) {
           }
         }
       }
+      // Autoria: campo corrigido na mao pela equipe sai do payload. mesclarCustomFields (abaixo)
+      // devolve o valor remoto pro corpo do PUT, entao a correcao humana continua la — o bot
+      // simplesmente para de disputar aquele campo.
+      const autoria = filtrarCamposPorAutoria(opcoes.chatId, atualRes.data, payload.entityCustomFields, {
+        forcarAutoria: opcoes.forcarAutoria === true,
+      });
+      payload.entityCustomFields = autoria.campos;
+      camposEsperados = autoria.campos;
+      travasNovas = autoria.travasNovas;
+      baselineCampos = autoria.baseline;
+
       payload.entityCustomFields = mesclarCustomFields(atualRes.data?.entityCustomFields, payload.entityCustomFields);
     }
   } catch (e) {
@@ -696,6 +1073,16 @@ async function atualizarNegocioMoskit(dealId, dados, contactId, opcoes = {}) {
         `apos retentativas (esperado: ${JSON.stringify(camposEsperados)}, lido: ${JSON.stringify(deal?.entityCustomFields)})`
       );
     }
+  }
+
+  // So depois do PUT confirmado: registrar autoria de um valor que nao entrou faria o bot achar,
+  // no ciclo seguinte, que a divergencia foi correcao humana.
+  registrarAutoriaCampos(opcoes.chatId, camposEsperados, travasNovas, baselineCampos, payload.name);
+  for (const id of travasNovas) {
+    await criarNotaMoskit(
+      dealId,
+      `🔒 "${nomeCampo(id)}" foi corrigido manualmente no CRM — o bot não vai mais sobrescrever este campo nesta negociação.`
+    );
   }
   return response.data;
 }
@@ -731,16 +1118,20 @@ async function aplicarViradaCobranca(chatId, row, dados, opcoesPayload, phone) {
   if (!dealId) return; // deal ainda nao existe — vai nascer ja como paga
   try {
     const contactId = await buscarOuCriarContato(phone, dados?.nome || row.contact_name);
-    await atualizarNegocioMoskit(dealId, dados || {}, contactId, opcoesPayload);
+    // `dados` aqui e o last_data cru de ciclos anteriores, e esta rodada nem chegou na extracao — nao
+    // existe evidencia do caso para sustentar area/advogado/assunto. Sanitizar sem observacao nenhuma
+    // deixa esses campos de fora do payload, e a virada faz so o que tem que fazer: corrigir o tipo de
+    // consulta e o valor. Campo omitido nao apaga nada no CRM (mesclarCustomFields devolve o remoto).
+    const dadosVirada = { ...(dados || {}) };
+    sanitizarClassificacao(dadosVirada, []);
+    await atualizarNegocioMoskit(dealId, dadosVirada, contactId, opcoesPayload);
     console.log(`  💳 Deal ${dealId} reclassificado para PAGA (price 35000) pelo checkpoint do bloco de condicoes`);
     await criarNotaMoskit(dealId, '💳 A equipe enviou as condições de valor nesta conversa — consulta reclassificada de cortesia para PAGA (R$350,00). Valor do negócio atualizado. Aguardando comprovante.');
 
     // Se a consulta ja foi pro Google Agenda como cortesia, o evento NAO e cancelado — cancelar
     // reuniao de cliente real por inferencia e pior que o erro. Avisa pra alguem cobrar.
     if (row.evento_calendar_criado) {
-      const quando = row.evento_calendar_data
-        ? new Date(row.evento_calendar_data).toLocaleString('pt-BR', { timeZone: TZ_ESCRITORIO })
-        : 'horario nao registrado';
+      const quando = formatarHorarioEscritorio(row.evento_calendar_data) || 'horario nao registrado';
       await enviarTelegram(
         `⚠️ *Consulta agendada como cortesia virou PAGA*\n\n` +
         `Cliente: ${dados?.nome || row.contact_name || chatId}\n` +
@@ -756,6 +1147,83 @@ async function aplicarViradaCobranca(chatId, row, dados, opcoesPayload, phone) {
     // que a correcao seja tentada de novo no proximo ciclo.
     db.prepare('UPDATE conversations SET bloco_condicoes_enviado = 0, bloco_condicoes_msg_idx = NULL WHERE chat_id = ?').run(chatId);
   }
+}
+
+// Valores que a IA devolveu para campos de opcao e que NAO existem na lista do CRM (nem como apelido).
+// Esses campos ficam vazios no deal — o que e o comportamento seguro —, mas silenciosamente. Aqui eles
+// viram lista para uma nota unica no deal e um aviso no Telegram.
+function detectarOpcoesInvalidas(dados) {
+  if (!dados) return [];
+  return CAMPOS_CLASSIFICACAO
+    .filter(({ campo, mapa }) => {
+      const valor = dados[campo];
+      return valor && valor !== 'null' && buscarIdOpcao(mapa, valor) === null;
+    })
+    .map(({ campo, nome }) => ({ campo, nome, valor: dados[campo] }));
+}
+
+// Nota + Telegram uma unica vez por conjunto de valores invalidos (hash), mesmo padrao de
+// registrarPendenciaContrato. E assim que um apelido novo chega ao conhecimento de quem mantem
+// src/moskit-ids.js, em vez de o valor errado se repetir calado a cada ciclo.
+async function registrarOpcoesInvalidas(dealId, chatId, invalidas) {
+  if (!dealId || !invalidas?.length) return false;
+  const hash = invalidas.map((i) => `${i.campo}=${i.valor}`).sort().join('|');
+
+  const atual = chatId ? db.prepare('SELECT opcao_invalida_hash FROM conversations WHERE chat_id = ?').get(chatId) : null;
+  if (atual?.opcao_invalida_hash === hash) return false;
+
+  const lista = invalidas.map((i) => `• ${i.nome}: "${i.valor}"`).join('\n');
+  try {
+    await criarNotaMoskit(
+      dealId,
+      `⚠️ A IA sugeriu valor que não existe na lista do CRM — campo(s) deixado(s) em branco de propósito:\n${lista}\n\nPreencher manualmente se fizer sentido.`
+    );
+    await enviarTelegram(`⚠️ *Valor fora da lista do CRM*\nDeal \`${dealId}\`\n${lista}`);
+    if (chatId) db.prepare('UPDATE conversations SET opcao_invalida_hash = ? WHERE chat_id = ?').run(hash, chatId);
+    return true;
+  } catch (e) {
+    console.error(`  ❌ Erro ao avisar opcao invalida no deal ${dealId}: ${e.message}`);
+    return false;
+  }
+}
+
+// Briefing pre-consulta do advogado. Antes isto era uma trava de uma vez so (briefing_added): o
+// PRIMEIRO resumo que a IA produzisse ficava no deal para sempre. No deal 48423360 esse primeiro
+// resumo dizia "caso relacionado à LGPD" — deduzido do advogado que a cliente mencionou, sem uma linha
+// sobre o caso — e continuou sendo o texto que o advogado leria antes da consulta mesmo depois de o
+// bot descobrir que era remocao por motivo de saude (Direito Administrativo).
+//
+// Agora quem decide e o HASH do resumo: mudou de verdade => posta a versao nova. Texto igual nao gera
+// nota nenhuma, e o mesmo criterio dos outros hashes de nota (agendamento_pendente_hash etc).
+async function registrarBriefing(dealId, chatId, resumo, tituloInicial) {
+  if (!dealId || !resumo) return false;
+
+  const hash = crypto.createHash('sha1').update(String(resumo).replace(/\s+/g, ' ').trim()).digest('hex');
+  const atual = chatId
+    ? db.prepare('SELECT briefing_hash, briefing_added FROM conversations WHERE chat_id = ?').get(chatId)
+    : null;
+
+  if (atual?.briefing_hash === hash) {
+    console.log(`  ⏭️ briefing inalterado — nao repostado`);
+    return false;
+  }
+
+  // Conversa anterior a esta mudanca: ja tem briefing no deal, mas nao tem hash. Adota o resumo atual
+  // como referencia SEM repostar — senao todo deal ativo receberia uma nota duplicada no primeiro
+  // ciclo depois do deploy. Da proxima mudanca real em diante o hash ja funciona normalmente.
+  if (atual && !atual.briefing_hash && atual.briefing_added) {
+    db.prepare('UPDATE conversations SET briefing_hash = ? WHERE chat_id = ?').run(hash, chatId);
+    console.log(`  🧷 briefing anterior a esta versao — hash registrado sem repostar nota`);
+    return false;
+  }
+
+  const titulo = atual?.briefing_added ? '📋 Briefing atualizado' : tituloInicial;
+  await criarNotaMoskit(dealId, `${titulo}\n\n${resumo}`);
+  if (chatId) {
+    db.prepare('UPDATE conversations SET briefing_added = 1, briefing_hash = ? WHERE chat_id = ?').run(hash, chatId);
+  }
+  console.log(`  ✅ ${titulo} registrado no deal ${dealId}`);
+  return true;
 }
 
 async function criarNotaMoskit(dealId, texto) {
@@ -928,7 +1396,10 @@ async function fecharNegocioSeAplicavel(dealId, statusKey, motivoTexto, obsValid
   }
 
   // "perdido": nunca toca em stage — um lead pode ser perdido de qualquer estagio do funil.
-  const idMotivo = buscarIdOpcao(LOST_REASON, motivoTexto) || LOST_REASON_PADRAO_ID;
+  // `aproximado`: o motivo vem com as palavras da conversa ("achou o valor muito alto"), nao com o nome
+  // exato da opcao do CRM — aqui a aproximacao e o comportamento certo, e o pior caso e cair no motivo
+  // padrao "nao informou o motivo".
+  const idMotivo = buscarIdOpcao(LOST_REASON, motivoTexto, { aproximado: true }) || LOST_REASON_PADRAO_ID;
   await putDealComVerificacao(
     dealId,
     { status: STATUS_DEAL.LOST, closeDate, lostReason: { id: idMotivo } },
@@ -1080,24 +1551,24 @@ async function criarEventoGoogleCalendar(dados, chatId) {
     return null;
   }
 
-  const inicio = new Date(dados.data_hora_consulta);
-  if (isNaN(inicio.getTime())) {
+  const inicioNaive = dados.data_hora_consulta;
+  if (!horarioNaiveValido(inicioNaive)) {
     console.log(`  ⚠️ data_hora_consulta invalida: "${dados.data_hora_consulta}" — pulando criacao do evento`);
     return null;
   }
-  const fim = new Date(inicio.getTime() + 60 * 60 * 1000); // duracao media de 1h
+  const fimNaive = somarMinutosNaive(inicioNaive, 60); // duracao media de 1h
   const presencial = dados.modalidade_consulta === 'presencial';
 
   const calendar = google.calendar({ version: 'v3', auth });
   const event = {
     summary: montarResumoEvento(dados),
     description: montarDescricaoEvento(dados, chatId),
-    start: { dateTime: inicio.toISOString() },
-    end: { dateTime: fim.toISOString() },
+    start: { dateTime: inicioNaive, timeZone: TZ_ESCRITORIO },
+    end: { dateTime: fimNaive, timeZone: TZ_ESCRITORIO },
     ...(presencial ? {} : {
       conferenceData: {
         createRequest: {
-          requestId: `meet-${chatId}-${inicio.getTime()}`,
+          requestId: `meet-${chatId}-${Date.parse(`${inicioNaive}Z`)}`, // so precisa ser deterministico e unico
           conferenceSolutionKey: { type: 'hangoutsMeet' },
         },
       },
@@ -1156,6 +1627,9 @@ async function handleAgendamentoCalendar(dealId, dados, chatId, pagamentoVerific
     // sugere esse estagio (estagio_funil_sugerido so cobre o que vem DEPOIS da consulta), entao sem
     // esta chamada nenhum deal chegava la. So avanca (nunca volta, ver moverEstagioSeAvancar).
     await moverEstagioSeAvancar(dealId, 'consulta_agendada');
+    // Este ramo roda em TODO ciclo enquanto a confirmacao continuar valida (nao so na primeira
+    // vez) — handleContratoZapSign tem seu proprio guard de idempotencia (contrato_zapsign_criado).
+    await handleContratoZapSign(dealId, dados, chatId, row);
     return;
   }
 
@@ -1173,7 +1647,7 @@ async function handleAgendamentoCalendar(dealId, dados, chatId, pagamentoVerific
     const evento = await criarEventoGoogleCalendar(dadosEvento, chatId);
     if (!evento) return;
     db.prepare('UPDATE conversations SET evento_calendar_criado = 1, evento_calendar_id = ?, evento_calendar_data = ?, agendamento_pendente_hash = NULL, agendamento_erro_hash = NULL WHERE chat_id = ?').run(evento.id, apuracao.horarioIso, chatId);
-    const dataFormatada = new Date(apuracao.horarioIso).toLocaleString('pt-BR', { timeZone: TZ_ESCRITORIO });
+    const dataFormatada = formatarHorarioEscritorio(apuracao.horarioIso);
     const meetLink = extrairMeetLink(evento);
     const notaComprovante = pagamentoVerificado ? ' (comprovante verificado)' : ' ⚠️ SEM comprovante verificado';
     const evidencia = `\nCliente aceitou: "${apuracao.cliente.trecho}" · Equipe confirmou: "${apuracao.equipe.trecho}"`;
@@ -1196,6 +1670,81 @@ async function handleAgendamentoCalendar(dealId, dados, chatId, pagamentoVerific
   // Evento criado com sucesso agora — mesmo raciocinio do outro ramo (evento que ja existia):
   // avanca pra "consulta_agendada" se ainda nao passou desse ponto.
   await moverEstagioSeAvancar(dealId, 'consulta_agendada');
+  await handleContratoZapSign(dealId, dados, chatId, row);
+}
+
+// Gera automaticamente o contrato de Prestacao de Servico no ZapSign, preenchido com os dados que
+// o bot ja tem, assim que o agendamento da consulta e confirmado (dupla confirmacao cliente+equipe
+// — mesmo criterio de handleAgendamentoCalendar, que e quem chama esta funcao). So dispara UMA vez
+// por deal: o guard abaixo e necessario porque o ramo "evento ja existia" chama esta funcao em todo
+// ciclo de reprocessamento enquanto a confirmacao continuar valida, nao so na primeira vez.
+async function handleContratoZapSign(dealId, dados, chatId, row) {
+  if (!dealId || row?.contrato_zapsign_criado) return;
+
+  const faltantes = zapsign.camposContratoFaltantes(dados);
+  if (faltantes.length) {
+    await registrarPendenciaContrato(dealId, chatId, faltantes);
+    return;
+  }
+
+  try {
+    const resultado = await zapsign.criarDocumentoZapSign(dados, chatId, new Date().toISOString());
+    if (!resultado.ok) {
+      // Corrida rara: os dados passaram no gate acima mas mudaram/zeraram entre o check e a
+      // chamada (nao deveria acontecer no fluxo normal, mas nao custa nao mandar documento vazio).
+      await registrarPendenciaContrato(dealId, chatId, resultado.faltantes || []);
+      return;
+    }
+    db.prepare(
+      'UPDATE conversations SET contrato_zapsign_criado = 1, contrato_zapsign_doc_token = ?, contrato_zapsign_status = ?, contrato_zapsign_pendente_hash = NULL WHERE chat_id = ?'
+    ).run(resultado.docToken, resultado.status || 'pending', chatId);
+    await criarNotaMoskit(dealId, `📄 Contrato de Prestação de Serviço enviado para assinatura via ZapSign (convite por e-mail para ${dados.email_cliente}).`);
+    await moverEstagioSeAvancar(dealId, 'contrato_enviado');
+  } catch (e) {
+    console.error(`  ❌ Erro ao criar contrato no ZapSign (deal ${dealId}): ${e.message}`);
+    // Erro real de API (token/template invalido, rede, etc) — nao confundir com dado faltante.
+    // Nao relanca: mesmo raciocinio de criarEventoGoogleCalendar, a causa mais provavel aqui e
+    // configuracao errada, nao falha transitoria, entao nao faz sentido entrar na fila de retry.
+    await registrarErroContrato(dealId, chatId, e.message);
+  }
+}
+
+// Nota no deal quando falta algum dado pro contrato (CPF, profissao, endereco, e-mail, valor de
+// honorarios...) — mesmo padrao de registrarAgendamentoPendente: hash evita repetir a nota a cada
+// ciclo de 5 min enquanto a mesma lista de campos continuar faltando. Como o bot nunca manda
+// mensagem pro cliente (so le o que a Zernio ja trouxe), esta nota e o unico jeito de a equipe
+// saber que precisa pedir esses dados pelo WhatsApp real dela.
+async function registrarPendenciaContrato(dealId, chatId, faltantes) {
+  if (!dealId || !faltantes?.length) return;
+  const hash = faltantes.slice().sort().join(',');
+
+  const atual = db.prepare('SELECT contrato_zapsign_pendente_hash FROM conversations WHERE chat_id = ?').get(chatId);
+  if (atual?.contrato_zapsign_pendente_hash === hash) return;
+
+  try {
+    await criarNotaMoskit(dealId, `⏳ Contrato de Prestação de Serviço NÃO gerado — faltam: ${faltantes.join(', ')}. Peça esses dados ao cliente pelo WhatsApp.`);
+    db.prepare('UPDATE conversations SET contrato_zapsign_pendente_hash = ? WHERE chat_id = ?').run(hash, chatId);
+  } catch (e) {
+    console.error(`  ❌ Erro ao anotar pendencia de contrato no deal ${dealId}: ${e.message}`);
+  }
+}
+
+// Nota no deal quando os dados estavam completos mas a CHAMADA a API do ZapSign falhou de verdade
+// (token/template invalido, rede, etc) — eixo diferente de registrarPendenciaContrato (dado
+// faltante). Mesmo padrao de registrarErroAgendamento.
+async function registrarErroContrato(dealId, chatId, mensagemErro) {
+  if (!dealId) return;
+  const hash = String(mensagemErro || '').slice(0, 200);
+
+  const atual = db.prepare('SELECT contrato_zapsign_erro_hash FROM conversations WHERE chat_id = ?').get(chatId);
+  if (atual?.contrato_zapsign_erro_hash === hash) return;
+
+  try {
+    await criarNotaMoskit(dealId, `❌ Falha ao gerar contrato no ZapSign: ${mensagemErro}. Verificar manualmente (ZAPSIGN_API_KEY/ZAPSIGN_TEMPLATE_TOKEN configurados corretamente?).`);
+    db.prepare('UPDATE conversations SET contrato_zapsign_erro_hash = ? WHERE chat_id = ?').run(hash, chatId);
+  } catch (e) {
+    console.error(`  ❌ Erro ao anotar FALHA de contrato no deal ${dealId}: ${e.message}`);
+  }
 }
 
 // Nota no deal quando ha horario em jogo mas o agendamento esta travado. O hash evita repetir a mesma
@@ -1209,9 +1758,7 @@ async function registrarAgendamentoPendente(dealId, chatId, apuracao, remarcacao
   const atual = db.prepare('SELECT agendamento_pendente_hash FROM conversations WHERE chat_id = ?').get(chatId);
   if (atual?.agendamento_pendente_hash === hash) return;
 
-  const quando = horario
-    ? new Date(horario).toLocaleString('pt-BR', { timeZone: TZ_ESCRITORIO })
-    : 'horário ainda não definido';
+  const quando = formatarHorarioEscritorio(horario) || 'horário ainda não definido';
   const acao = remarcacao ? 'Reunião NÃO remarcada' : 'Consulta NÃO lançada na agenda';
   try {
     await criarNotaMoskit(dealId, `⏳ ${acao}: ${quando} — ${descreverPendencia({ motivo })}. O evento é criado quando as duas confirmações aparecerem na conversa.`);
@@ -1251,29 +1798,30 @@ async function atualizarEventoSeRemarcado(dealId, dados, chatId, row) {
   const auth = getGoogleAuthClient();
   if (!auth) return;
 
-  const novoInicio = new Date(dados.data_hora_consulta);
-  if (isNaN(novoInicio.getTime())) return;
+  const novoInicioNaive = dados.data_hora_consulta;
+  if (!horarioNaiveValido(novoInicioNaive)) return;
+
+  // evento_calendar_data grava sempre a mesma string naive usada no payload (criacao: acima em
+  // handleAgendamentoCalendar; atualizacao: mais abaixo) — comparar por igualdade de STRING e mais
+  // simples e robusto que reconverter timestamps, e dispensa reler o evento do Google so pra essa
+  // checagem (era o `calendar.events.get` + `inicioAtual` que existiam so pra isso).
+  if (row?.evento_calendar_data === novoInicioNaive) return; // nao mudou de verdade, evita ruido a cada ciclo
 
   try {
     const calendar = google.calendar({ version: 'v3', auth });
-    const eventoAtual = await calendar.events.get({ calendarId: GOOGLE_CALENDAR_ID, eventId: row.evento_calendar_id });
-    const inicioAtual = new Date(eventoAtual.data.start?.dateTime || eventoAtual.data.start?.date);
-
-    if (Math.abs(novoInicio.getTime() - inicioAtual.getTime()) < 60 * 1000) return; // nao mudou de verdade, evita ruido a cada ciclo
-
-    const novoFim = new Date(novoInicio.getTime() + 60 * 60 * 1000);
+    const novoFimNaive = somarMinutosNaive(novoInicioNaive, 60);
     const patched = await calendar.events.patch({
       calendarId: GOOGLE_CALENDAR_ID,
       eventId: row.evento_calendar_id,
       requestBody: {
-        start: { dateTime: novoInicio.toISOString() },
-        end: { dateTime: novoFim.toISOString() },
+        start: { dateTime: novoInicioNaive, timeZone: TZ_ESCRITORIO },
+        end: { dateTime: novoFimNaive, timeZone: TZ_ESCRITORIO },
       },
     });
 
-    db.prepare('UPDATE conversations SET evento_calendar_data = ?, agendamento_pendente_hash = NULL, agendamento_erro_hash = NULL WHERE chat_id = ?').run(dados.data_hora_consulta, chatId);
+    db.prepare('UPDATE conversations SET evento_calendar_data = ?, agendamento_pendente_hash = NULL, agendamento_erro_hash = NULL WHERE chat_id = ?').run(novoInicioNaive, chatId);
 
-    const dataFormatada = novoInicio.toLocaleString('pt-BR', { timeZone: TZ_ESCRITORIO });
+    const dataFormatada = formatarHorarioEscritorio(novoInicioNaive);
     const meetLink = extrairMeetLink(patched.data);
     console.log(`  🔁 Reunião remarcada para ${dataFormatada} (chat ${chatId})`);
 
@@ -1371,9 +1919,10 @@ Analise a conversa completa e extraia dados para criar/atualizar um negocio no C
 Raciocine passo a passo antes de responder:
 1. Esta conversa ja tem um deal no CRM? Se sim, quais campos estao pendentes?
 2. Quais campos obrigatorios consigo identificar com confianca?
-3. ATENCAO: advogado_responsavel eh DEFINIDO pela area_direito, NAO por qual socio o lead mencionou.
-4. O lead fez pagamento ou enviou comprovante?
-5. Qual acao e mais adequada?
+3. O cliente contou algum fato do caso dele? Se NAO (so saudacao, so pedido de consulta, so o nome de um advogado), area_direito e advogado_responsavel ficam null e o assunto e "Consulta juridica".
+4. ATENCAO: advogado_responsavel eh DEFINIDO pela area_direito, NAO por qual socio o lead mencionou.
+5. O lead fez pagamento ou enviou comprovante?
+6. Qual acao e mais adequada?
 
 CONTEXTO ATUAL:
 - Data/hora da ultima mensagem desta conversa: {dataAtual}
@@ -1391,11 +1940,11 @@ REGRAS DE DECISAO:
 - "ignorar": passou pela classificacao mas nao foi possivel extrair informacoes uteis. Ignorar permanentemente.
 
 CAMPOS OBRIGATORIOS (nunca podem ser null em criar):
-1. assunto — tema curto do caso, 2 a 5 palavras (ex: "Inventario", "Usucapiao de imovel", "Abatimento do FIES", "Rescisao de contrato"). E o que aparece no titulo do negocio no CRM, entao seja especifico e direto, sem frase completa. NUNCA deixe null: se o caso ainda estiver vago, use a propria area_direito como assunto.
+1. assunto — tema curto do caso, 2 a 5 palavras (ex: "Inventario", "Usucapiao de imovel", "Abatimento do FIES", "Rescisao de contrato"). E o que aparece no titulo do negocio no CRM, entao seja especifico e direto, sem frase completa. NUNCA deixe null: se o cliente ainda NAO contou o caso, use exatamente "Consulta juridica" — NUNCA use o nome de uma area do direito como assunto (isso transforma um palpite de area no titulo do negocio).
 2. origem — SEMPRE preencher. Extraia da mensagem inicial. Se nao encontrar, use "Nao identificado".
 3. tipo_consulta — "consulta paga" por padrao. Use "consulta gratis" APENAS se a equipe disser explicitamente que a consulta e cortesia/gratuita/sem custo/isenta. Use "sem consulta" so se o lead disser EXPLICITAMENTE que nao quer contratar.
-4. area_direito — Use seu conhecimento juridico para inferir pela conversa.
-5. advogado_responsavel — Determinado UNICAMENTE pela area_direito. Se area_direito estiver clara, use os PERFIS para definir. Se area_direito estiver null ou incerta, mantenha null. NAO derive do nome do lead ou de qual socio ele mencionou.
+4. area_direito — Use seu conhecimento juridico para inferir a area A PARTIR DO QUE O CLIENTE CONTOU SOBRE O CASO, e de nada mais. Se ele so cumprimentou, so pediu consulta, so disse por qual canal chegou ou so citou o nome de um advogado ("quero falar com o Dr. Berto"), voce NAO sabe a area: devolva null. E PROIBIDO derivar a area de captacao, de origem, do advogado que o lead mencionou ou dos PERFIS DOS ADVOGADOS abaixo — o caminho e sempre area -> advogado, nunca advogado -> area. Deixar null e o resultado correto e esperado nessa situacao; a area entra numa rodada seguinte, quando o cliente descrever o caso.
+5. advogado_responsavel — Determinado UNICAMENTE pela area_direito, pela TABELA AREA -> ADVOGADO abaixo. Se area_direito estiver null ou incerta, mantenha null. NAO derive do nome do lead ou de qual socio ele mencionou. (O sistema reaplica essa tabela em cima do que voce responder: se divergir, o valor da tabela vence.)
 6. captacao — Se mencionou rede social de Berto, Bruno ou Iury, ou foi indicado por um deles, preencha com o nome do socio (INDEPENDENTE de area_direito estar definida). CASO CONTRARIO, preencha com o MESMO valor de advogado_responsavel (que pode ser null se area_direito nao identificada).
 7. pagamento_confirmado — boolean. True APENAS se DISSE que pagou OU enviou comprovante. Senao false.
 
@@ -1420,6 +1969,15 @@ CAMPOS OPCIONAIS (usados pra agendar a reuniao no Google Agenda — deixe null s
    Seja MAIS conservador aqui do que em qualquer outro campo: fechar ou perder um negocio errado nao tem volta facil no CRM. Na menor duvida, deixe null.
 13. motivo_perda_sugerido — SO preencha se status_negocio_sugerido = "perdido". Frase curta com o motivo, nas palavras da conversa (ex: "fechou com outro escritorio", "achou o valor alto", "desistiu do processo"). Null se status_negocio_sugerido nao for "perdido", ou se nao houver motivo claro.
 
+CAMPOS DO CONTRATO (usados so pra preencher automaticamente o contrato de Prestacao de Servico no ZapSign quando a consulta e agendada — SAO DADOS SENSIVEIS. Extraia APENAS se a pessoa (cliente ou equipe) escreveu literalmente na conversa. NUNCA infira, calcule ou derive CPF/endereco/profissao/estado civil a partir de outro campo, do nome ou de qualquer suposicao — e melhor deixar null do que errar um desses. Deixe null se nao tiver 100% de certeza):
+14. cpf — APENAS se o cliente escreveu literalmente o numero do CPF na conversa.
+15. profissao — APENAS se o cliente mencionou explicitamente sua profissao.
+16. estado_civil — APENAS se mencionado explicitamente ("sou casado", "sou solteira", "divorciado", etc).
+17. endereco — APENAS se o cliente escreveu um endereco (rua/numero/bairro/cidade) na conversa.
+18. valor_honorarios_inicial — valor em reais (numero, sem "R$") dos honorarios ADVOCATICIOS do CASO negociados pela EQUIPE (proposta de honorarios) — DIFERENTE do valor da consulta (R$350). So preencha se a equipe mencionou um valor especifico de honorarios nesta conversa.
+19. valor_honorarios_liminar — idem, valor em reais dos honorarios de LIMINAR, se mencionado pela equipe. Null se nao houver liminar no caso.
+20. valor_mensalidade — idem, valor em reais de MENSALIDADE do contrato, se mencionado pela equipe. Null se o contrato nao tiver mensalidade.
+
 OBSERVACOES (obrigatorio — array "observacoes" no nivel raiz do JSON):
 Cada linha da conversa comeca com um indice entre colchetes, tipo "[12] Cliente: ...". Relate os fatos abaixo CITANDO o indice da mensagem que prova cada um. O sistema confere a citacao: se o indice nao existir, se o papel de quem falou nao bater com o tipo, ou se o trecho nao aparecer mesmo na mensagem, a observacao e DESCARTADA. Nao invente citacao — observacao descartada e pior que observacao ausente.
 
@@ -1430,6 +1988,8 @@ O campo "horario_iso" e OBRIGATORIO em todo tipo que termina em "_horario" — s
 REGRA DE PAPEL (a que mais causa observacao descartada): o prefixo do tipo tem que bater com o rotulo da linha citada. Linha "[7] Cliente: ..." so aceita tipo comecando com "cliente_". Linha "[7] Equipe do escritório: ..." so aceita tipo comecando com "equipe_". Antes de escrever cada observacao, olhe o rotulo daquele indice e escolha o prefixo por ele — nao pelo conteudo da frase. Um cliente dizendo "consigo sexta as 14h" e "cliente_propos_horario", nunca "equipe_propos_horario".
 
 Tipos permitidos:
+- "cliente_descreveu_caso" (mensagem do CLIENTE) — o cliente contou O QUE ACONTECEU ou o que precisa resolver, com algum fato concreto do caso ("meu tio morreu e deixou uma casa sem testamento", "fui exonerada do cargo por motivo de saude", "recebi uma notificacao da ANPD"). Sem horario_iso. NAO valem como descricao do caso: saudacao ("ola", "bom dia"), pedido de consulta sem conteudo ("gostaria de agendar uma consulta"), preferencia de advogado ("quero falar com o Dr. Berto"), canal de origem ("vi seu Instagram") nem pergunta sobre preco. Esta observacao e o que autoriza o sistema a gravar area_direito/advogado_responsavel/assunto: se ninguem descreveu o caso, NAO emita esta observacao e devolva area_direito e advogado_responsavel null.
+- "equipe_descreveu_caso" (mensagem da EQUIPE) — a EQUIPE descreveu o caso do cliente na conversa (resumo depois de uma ligacao, "ela quer entrar com acao de remocao por motivo de saude"). Sem horario_iso. Vale como a mesma evidencia do tipo acima. NAO vale a equipe apenas encaminhar o lead para um advogado ("vou passar pro Dr. Berto") — isso nao diz qual e o caso.
 - "equipe_anunciou_valor" (mensagem da EQUIPE) — a equipe informou que a consulta tem custo, em qualquer formato: o bloco padrao de condicoes, "a consulta e 350", "o investimento e de trezentos e cinquenta", valor negociado diferente, parcelamento. Sem horario_iso.
 - "equipe_propos_horario" (mensagem da EQUIPE) — a equipe SUGERIU um dia/hora, sem fechar ("podemos quarta as 17:30?").
 - "equipe_confirmou_horario" (mensagem da EQUIPE) — a equipe afirmou que a consulta ESTA marcada ("marquei sua consulta pra sexta 14h", "ficou confirmado dia 10 as 15h"). Uma PERGUNTA nunca e confirmacao.
@@ -1456,12 +2016,17 @@ Estruture em 4 linhas (uma por topico, com quebra de linha \n entre elas — NAO
 📌 Ja tentou: [acoes anteriores mencionadas pelo cliente — se nao houver, escreva "Nada mencionado"]
 Se a conversa nao tiver detalhe suficiente pra algum topico, escreva "Nao mencionado" em vez de inventar ou generalizar.
 
-EXEMPLOS REAIS DE CAPTACAO:
+EXEMPLOS REAIS DE CAPTACAO (captacao = quem TROUXE o lead; adv_resp = quem CUIDA da area — podem ser pessoas diferentes):
 - "Instagram do Bruno" + area=Familia → origem: Instagram, captacao: Bruno, adv_resp: Bruno
-- "link da bio no Instagram do Dr. Berto" + area=Educacional → origem: Instagram, captacao: Berto, adv_resp: Berto
+- "link da bio no Instagram do Dr. Berto" + area=Educacional → origem: Instagram, captacao: Berto, adv_resp: Iury (Educacional e do Iury, mesmo o lead tendo vindo pelo Berto)
 - "vi a pagina do Bruno" + sem caso descrito → origem: Instagram, captacao: Bruno, adv_resp: null (sem area definida)
 - "acessei o site do escritorio" + sem mencao a socio → origem: Site, captacao: [mesmo adv_resp, ou null se adv null]
 - "minha prima falou, ela e amiga do escritorio" → origem: Indicacao de amigos e parentes, captacao: [mesmo adv_resp]
+
+CONTRAEXEMPLO (lead que ainda nao contou o caso — caso real que entrou errado no CRM):
+Cliente: "Olá!" / "Bom dia!" / "Tudo bem?" / "Gostaria de agendar uma consulta com o Dr. Berto, por videoconferencia."
+Resposta correta: area_direito: null, advogado_responsavel: null, assunto: "Consulta juridica", captacao: "Berto", origem: [o canal, se ele disse], modalidade_consulta: "online", observacoes SEM "cliente_descreveu_caso".
+ERRADO (foi o que aconteceu e nao pode repetir): area_direito: "LGPD", assunto: "Direito Digital" — deduzidos do perfil do Dr. Berto, sem uma linha sobre o caso. O cliente era servidora publica com caso de remocao por motivo de saude (Direito Administrativo).
 
 Formato de resposta (use dados reais extraidos, nao descricoes):
 {
@@ -1469,6 +2034,7 @@ Formato de resposta (use dados reais extraidos, nao descricoes):
   "justificativa": "Lead agendou consulta sobre inventario",
   "confianca": 8,
   "observacoes": [
+    {"tipo": "cliente_descreveu_caso", "msg_idx": 2, "trecho": "meu pai faleceu e deixou uma casa"},
     {"tipo": "equipe_anunciou_valor", "msg_idx": 4, "trecho": "O valor da consulta é de R$350,00"},
     {"tipo": "equipe_propos_horario", "msg_idx": 7, "trecho": "podemos marcar na quarta às 17:30", "horario_iso": "2026-08-05T17:30:00"},
     {"tipo": "cliente_aceitou_horario", "msg_idx": 8, "trecho": "pode ser", "horario_iso": "2026-08-05T17:30:00"},
@@ -1489,7 +2055,14 @@ Formato de resposta (use dados reais extraidos, nao descricoes):
     "modalidade_consulta": "online",
     "status_negocio_sugerido": null,
     "motivo_perda_sugerido": null,
-    "resumo_atendimento": "📌 Caso: pai do cliente faleceu ha 3 meses e deixou uma casa; os dois irmaos querem vender o imovel sem repassar a parte do cliente na heranca.\n📌 Objetivo do cliente: entender seus direitos no inventario e formalizar a partilha antes que os irmaos vendam a casa.\n📌 Urgencia/prazo: Nao mencionado.\n📌 Ja tentou: Nada mencionado."
+    "resumo_atendimento": "📌 Caso: pai do cliente faleceu ha 3 meses e deixou uma casa; os dois irmaos querem vender o imovel sem repassar a parte do cliente na heranca.\n📌 Objetivo do cliente: entender seus direitos no inventario e formalizar a partilha antes que os irmaos vendam a casa.\n📌 Urgencia/prazo: Nao mencionado.\n📌 Ja tentou: Nada mencionado.",
+    "cpf": null,
+    "profissao": null,
+    "estado_civil": null,
+    "endereco": null,
+    "valor_honorarios_inicial": null,
+    "valor_honorarios_liminar": null,
+    "valor_mensalidade": null
   }
 }
 
@@ -1498,9 +2071,17 @@ Valores permitidos:
 - tipo_consulta: consulta gratis, consulta paga, sem consulta
 - captacao: Berto, Bruno, Iury
 - area_direito: Direito Administrativo, Direito Educacional, Direito Imobiliario, Direito Previdenciario, Direito de Familia, Direito do Consumidor, Direito do Trabalho, LGPD, Direito Empresarial, Outros, Solucoes Medicas
-- advogado_responsavel: Berto (Administrativo/Digital), Bruno (Imobiliario/Familia), Iury (Solucoes Medicas)
+- advogado_responsavel: Berto, Bruno ou Iury — sempre pela TABELA AREA -> ADVOGADO abaixo
 
-PERFIS DOS ADVOGADOS:
+TABELA AREA -> ADVOGADO (regra do escritorio; e de mao unica, area define advogado e nunca o contrario):
+- Direito Administrativo, LGPD                                                              -> Berto
+- Direito Imobiliario, Direito de Familia, Direito Empresarial                              -> Bruno
+- Solucoes Medicas, Direito Educacional, Direito Previdenciario, Direito do Consumidor,
+  Direito do Trabalho                                                                       -> Iury
+- Outros                                                                                    -> null (sem responsavel automatico)
+
+PERFIS DOS ADVOGADOS (tabela de mao unica: serve para ir de AREA -> ADVOGADO. NUNCA use no sentido
+inverso: o lead mencionar um advogado nao diz nada sobre a area do caso dele):
 1. Berto Caballero — Direito Digital (LGPD, crimes digitais, propriedade intelectual) e Direito Administrativo (licitacoes, servidores publicos, concurseiros).
 2. Bruno Rocha — Direito Imobiliario (compra/venda, locacao, usucapiao, reintegracao) e Direito de Familia (divorcio, guarda, alimentos, inventario).
 3. Iury Carvalho — Solucoes Medicas (defesa de profissionais da saude, erro medico, planos de saude).
@@ -1632,6 +2213,10 @@ function processarConversa(chatId) {
 // cobranca nao chegava ao CRM) e o ramo "criar" tinha uma verificacao de deal incompleta. Com um
 // lugar so, corrigir passa a valer para os tres de uma vez.
 async function finalizarCiclo({ dealId, dados, dadosMesclados, chatId, row, apuracao, acao, resumo, obsValidas }) {
+  // Antes de qualquer outra consequencia: se algum campo de classificacao ficou vazio porque a IA
+  // inventou um valor que nao existe no CRM, isso precisa aparecer para a equipe.
+  await registrarOpcoesInvalidas(dealId, chatId, detectarOpcoesInvalidas(dadosMesclados || dados));
+
   const resultadoPagamento = await handlePagamentoConfirmado(dealId, dados, chatId);
   await handleAgendamentoCalendar(
     dealId, dadosMesclados, chatId, resultadoPagamento.verificadoPorComprovante, row, apuracao
@@ -1700,7 +2285,10 @@ async function processarConversaDirect(chatId) {
     const bloco = detectarBlocoCondicoes(mensagens);
     const blocoJaRegistrado = row.bloco_condicoes_enviado === 1;
     const viradaCobranca = bloco.enviado && !blocoJaRegistrado;
-    const opcoesPayload = { condicoesValorEnviadas: bloco.enviado };
+    // chatId viaja no mesmo objeto porque criarNegocioMoskit/atualizarNegocioMoskit precisam saber
+    // ONDE registrar a autoria dos campos personalizados (custom_fields_bot/campos_travados), e todos
+    // os ramos — inclusive aplicarViradaCobranca e garantirDealExiste — ja repassam `opcoesPayload`.
+    const opcoesPayload = { condicoesValorEnviadas: bloco.enviado, chatId };
 
     if (viradaCobranca) {
       db.prepare('UPDATE conversations SET bloco_condicoes_enviado = 1, bloco_condicoes_msg_idx = ? WHERE chat_id = ?').run(bloco.msgIdx, chatId);
@@ -1792,6 +2380,8 @@ async function processarConversaDirect(chatId) {
         break;
       }
     }
+    const { casoDescrito } = sanitizarClassificacao(dados, obsValidas);
+
     const jsonDados = JSON.stringify(dados);
     const confianca = result.confianca ?? 0;
 
@@ -1802,6 +2392,11 @@ async function processarConversaDirect(chatId) {
       acao = 'ignorar';
     }
 
+    if (deveEsperarCasoDescrito(acao, casoDescrito, apuracao, bloco.enviado)) {
+      console.log(`  ⏳ "criar" sem caso descrito (e sem horario confirmado nem bloco de condicoes) — tratando como aguardar, nada e criado no CRM`);
+      acao = 'aguardar';
+    }
+
     if (acao === 'ignorar') {
       stmtUpdateProcessed.run(jsonDados, acao, chatId);
       db.prepare("UPDATE conversations SET last_processed_at = datetime('now') WHERE chat_id = ?").run(chatId);
@@ -1810,7 +2405,7 @@ async function processarConversaDirect(chatId) {
     }
 
     if (acao === 'aguardar') {
-      const dadosMesclados = mergeDados(dadosAnteriores || {}, dados);
+      const dadosMesclados = mesclarParaCrm(dadosAnteriores, dados, obsValidas);
       stmtUpdateProcessed.run(JSON.stringify(dadosMesclados), acao, chatId);
       db.prepare("UPDATE conversations SET last_processed_at = datetime('now') WHERE chat_id = ?").run(chatId);
       console.log(`  ⏳ Aguardando mais mensagens de ${chatId}`);
@@ -1829,7 +2424,7 @@ async function processarConversaDirect(chatId) {
       // Mescla com o que ja tinha sido extraido antes — sem isso um campo que veio null nesta
       // rodada (tipicamente o assunto) descarta o valor bom de um ciclo anterior. Os branches
       // aguardar/nota/atualizar_campos ja faziam isso; o criar era o unico que usava dados cru.
-      const dadosMesclados = mergeDados(dadosAnteriores || {}, dados);
+      const dadosMesclados = mesclarParaCrm(dadosAnteriores, dados, obsValidas);
 
       // Tres bugs viviam aqui, todos por causa de um if/else que decidia o caminho antes de saber
       // o resultado da verificacao:
@@ -1857,17 +2452,12 @@ async function processarConversaDirect(chatId) {
       // Se o deal foi recriado com outro id, o banco precisa saber agora — o briefing e o
       // evento_calendar_* abaixo dependem disso, e nao no fim do ciclo.
       if (dealId !== row.deal_id) {
-        db.prepare('UPDATE conversations SET deal_id = ?, briefing_added = 0 WHERE chat_id = ?').run(dealId, chatId);
+        db.prepare('UPDATE conversations SET deal_id = ?, briefing_added = 0, briefing_hash = NULL, campos_nota_hash = NULL, custom_fields_bot = NULL, campos_travados = NULL WHERE chat_id = ?').run(dealId, chatId);
         row.deal_id = dealId;
         row.briefing_added = 0;
       }
 
-      if (dados.resumo_atendimento && !row.briefing_added) {
-        console.log('  Adicionando nota com resumo do caso...');
-        await criarNotaMoskit(dealId, `📋 Briefing pré-reunião\n\n${dados.resumo_atendimento}`);
-        db.prepare('UPDATE conversations SET briefing_added = 1 WHERE chat_id = ?').run(chatId);
-        console.log(`  ✅ Nota adicionada ao deal ${dealId}`);
-      }
+      await registrarBriefing(dealId, chatId, dados.resumo_atendimento, '📋 Briefing pré-reunião');
 
       await finalizarCiclo({ dealId, dados, dadosMesclados, chatId, row, apuracao, acao, obsValidas,
         resumo: `Processamento de ${chatId} concluido` });
@@ -1884,27 +2474,22 @@ async function processarConversaDirect(chatId) {
 
       const contactId = await buscarOuCriarContato(phone, dados.nome || dadosAnteriores?.nome);
       let dealId = row.deal_id;
-      const dealVerificado = await garantirDealExiste(dealId, mergeDados(dadosAnteriores || {}, dados), contactId, opcoesPayload);
+      const dealVerificado = await garantirDealExiste(dealId, mesclarParaCrm(dadosAnteriores, dados, obsValidas), contactId, opcoesPayload);
       if (dealVerificado !== dealId) {
         dealId = dealVerificado;
-        db.prepare('UPDATE conversations SET deal_id = ?, briefing_added = 0 WHERE chat_id = ?').run(dealId, chatId);
+        db.prepare('UPDATE conversations SET deal_id = ?, briefing_added = 0, briefing_hash = NULL, campos_nota_hash = NULL, custom_fields_bot = NULL, campos_travados = NULL WHERE chat_id = ?').run(dealId, chatId);
         row.briefing_added = 0;
         console.log(`  ✅ Deal recriado como ${dealId} (o anterior nao existia mais no Moskit)`);
       }
 
-      if (dados.resumo_atendimento && !row.briefing_added) {
-        console.log(`  Adicionando nota atualizada ao deal ${dealId}...`);
-        await criarNotaMoskit(dealId, `📋 Briefing atualizado\n\n${dados.resumo_atendimento}`);
-        db.prepare('UPDATE conversations SET briefing_added = 1 WHERE chat_id = ?').run(chatId);
-        console.log(`  ✅ Nota adicionada ao deal ${dealId}`);
-      } else if (!dados.resumo_atendimento) {
+      if (!dados.resumo_atendimento) {
         console.log(`  ⏭️ acao "nota" sem resumo — ignorando`);
       } else {
-        console.log(`  ⏭️ Briefing ja adicionado para este deal — ignorando`);
+        await registrarBriefing(dealId, chatId, dados.resumo_atendimento, '📋 Briefing pré-reunião');
       }
 
       await finalizarCiclo({
-        dealId, dados, dadosMesclados: mergeDados(dadosAnteriores || {}, dados),
+        dealId, dados, dadosMesclados: mesclarParaCrm(dadosAnteriores, dados, obsValidas),
         chatId, row, apuracao, acao, obsValidas, resumo: `Nota adicionada para ${chatId}`,
       });
       return;
@@ -1923,7 +2508,7 @@ async function processarConversaDirect(chatId) {
       // sombreando a do escopo da funcao. A externa e `null` quando nao ha dados salvos, a interna
       // era `{}` — e as linhas abaixo usavam a sombra enquanto os ramos "criar" e "nota" usavam a
       // externa. Tres ramos que parecem identicos operando sobre objetos diferentes.
-      const dadosMesclados = mergeDados(dadosAnteriores || {}, dados);
+      const dadosMesclados = mesclarParaCrm(dadosAnteriores, dados, obsValidas);
       const pendentes = camposPendentes(dadosMesclados);
 
       console.log('  Dados anteriores:', JSON.stringify(dadosAnteriores));
@@ -1936,7 +2521,7 @@ async function processarConversaDirect(chatId) {
       const dealVerificado = await garantirDealExiste(dealId, dadosMesclados, contactId, opcoesPayload);
       if (dealVerificado !== dealId) {
         dealId = dealVerificado;
-        db.prepare('UPDATE conversations SET briefing_added = 0 WHERE chat_id = ?').run(chatId);
+        db.prepare('UPDATE conversations SET briefing_added = 0, briefing_hash = NULL, campos_nota_hash = NULL, custom_fields_bot = NULL, campos_travados = NULL WHERE chat_id = ?').run(chatId);
         row.briefing_added = 0;
         console.log(`  ✅ Deal recriado como ${dealId} (o anterior nao existia mais no Moskit)`);
       } else {
@@ -1950,16 +2535,23 @@ async function processarConversaDirect(chatId) {
       );
       if (camposAlterados.length > 0) {
         const descricao = camposAlterados.map((k) => `${k}: ${dados[k]}`).join(', ');
-        await criarNotaMoskit(dealId, `🔄 Campos preenchidos: ${descricao}`);
-        console.log(`  ✅ Nota de atualizacao adicionada`);
+        // Hash: a IA devolve os mesmos campos a cada ciclo enquanto a conversa nao muda, e essa nota
+        // era postada de novo toda vez — o deal 48423360 acumulou SEIS notas identicas, ruido que
+        // ainda por cima escondia o problema real (o campo que nao estava pegando no CRM).
+        const hashNota = crypto.createHash('sha1').update(descricao).digest('hex');
+        const notaAtual = db.prepare('SELECT campos_nota_hash FROM conversations WHERE chat_id = ?').get(chatId);
+        if (notaAtual?.campos_nota_hash === hashNota) {
+          console.log(`  ⏭️ nota de campos identica a ultima — nao repostada`);
+        } else {
+          await criarNotaMoskit(dealId, `🔄 Campos preenchidos: ${descricao}`);
+          db.prepare('UPDATE conversations SET campos_nota_hash = ? WHERE chat_id = ?').run(hashNota, chatId);
+          console.log(`  ✅ Nota de atualizacao adicionada`);
+        }
       }
 
       if (pendentes.length === 0) {
         console.log('  🎯 Todos os campos obrigatorios preenchidos!');
-        if (dadosMesclados.resumo_atendimento && !row.briefing_added) {
-          await criarNotaMoskit(dealId, `📋 Briefing completo\n\n${dadosMesclados.resumo_atendimento}`);
-          db.prepare('UPDATE conversations SET briefing_added = 1 WHERE chat_id = ?').run(chatId);
-        }
+        await registrarBriefing(dealId, chatId, dadosMesclados.resumo_atendimento, '📋 Briefing completo');
       }
 
       await finalizarCiclo({ dealId, dados, dadosMesclados, chatId, row, apuracao, acao, obsValidas,
@@ -2050,6 +2642,23 @@ function assinaturaGithubValida(req) {
   return comparacaoSegura(recebida, esperada);
 }
 
+// Segredo do webhook do ZapSign (documento assinado/recusado/e-mail nao entregue). DIFERENTE de
+// assinaturaValida/assinaturaGithubValida: a ZapSign nao assina o corpo com HMAC — a autenticacao
+// e um header HTTP customizado que a gente mesmo escolhe ao cadastrar o webhook (painel:
+// Configuracoes > Integracoes > API ZapSign > Webhooks > Headers, ou via
+// POST /api/v1/user/company/webhook/ com {url, type, headers}). O NOME do header e fixo aqui
+// (X-Zapsign-Webhook-Secret) — cadastre esse mesmo nome e o valor de ZAPSIGN_WEBHOOK_SECRET do lado
+// de la. Sem ZAPSIGN_WEBHOOK_SECRET configurado, periodo de tolerancia (mesmo padrao de /webhook)
+// — pior caso de aceitar sem checar aqui e uma nota indevida no CRM, nao um risco de seguranca
+// como /deploy-webhook (execucao de codigo) ou /webhook (injecao de mensagem "equipe").
+const ZAPSIGN_WEBHOOK_SECRET = process.env.ZAPSIGN_WEBHOOK_SECRET || null;
+
+function zapsignWebhookValido(req) {
+  if (!ZAPSIGN_WEBHOOK_SECRET) return true;
+  const recebido = req.get('X-Zapsign-Webhook-Secret');
+  return comparacaoSegura(recebido, ZAPSIGN_WEBHOOK_SECRET);
+}
+
 // Sem ADMIN_TOKEN a rota fica DESLIGADA (503), nao aberta. Perder /sincronizar por falta de config
 // e preferivel a deixar /cliente-existente respondendo pra qualquer um.
 function exigeAdmin(req, res, next) {
@@ -2100,6 +2709,19 @@ app.post('/sincronizar-atividades', exigeAdmin, rota(async (req, res) => {
   console.log('\n🔧 Sincronizando atividades do Moskit com o Google Calendar...');
   const resultado = await sincronizarAtividadesMoskit();
   res.json({ ok: true, ...resultado });
+}));
+
+// Auditoria da classificacao: compara o que esta no CRM com o que o bot apurou na conversa.
+// DRY-RUN por padrao (nao escreve nada) — `?aplicar=1` corrige o que o proprio bot escreveu e
+// `?incluir-legado=1` alcanca tambem os deals sem registro de autoria (anteriores a esta versao), que no
+// modo normal sao preservados. Campo corrigido na mao pela equipe nunca e tocado, em nenhum modo.
+app.get('/auditoria-classificacao', exigeAdmin, rota(async (req, res) => {
+  const aplicar = req.query.aplicar === '1' || req.query.aplicar === 'true';
+  const incluirLegado = req.query['incluir-legado'] === '1' || req.query['incluir-legado'] === 'true';
+  const limite = Math.min(Number(req.query.limite) || 100, 500);
+  console.log(`\n🔍 Auditoria de classificacao (${aplicar ? 'APLICANDO correcoes' : 'so leitura'}${incluirLegado ? ', incluindo legado' : ''})...`);
+  const relatorio = await reconciliarClassificacao({ aplicar, incluirLegado, limite });
+  res.json({ ok: true, ...relatorio });
 }));
 
 // Auditoria SO-LEITURA: mostra quais atividades seriam liberadas sem comprovante por estarem
@@ -2406,6 +3028,49 @@ app.post('/deploy-webhook', (req, res) => {
 
   res.status(202).json({ ok: true, deploy: 'iniciado' });
 });
+
+// Status de assinatura do contrato (doc_signed/doc_refused/email_bounce) — configurar no painel do
+// ZapSign apontando pra https://<seu-dominio>/zapsign-webhook, com o header customizado descrito em
+// zapsignWebhookValido. Responde 200 antes de processar, mesmo padrao de /webhook — a ZapSign nao
+// precisa esperar o Moskit responder pra considerar a entrega bem-sucedida.
+app.post('/zapsign-webhook', (req, res) => {
+  res.sendStatus(200);
+  if (!zapsignWebhookValido(req)) {
+    console.log('  ⚠️ /zapsign-webhook: header de autenticacao invalido ou ausente — evento ignorado');
+    return;
+  }
+  processarWebhookZapSign(req.body).catch((e) => {
+    console.error(`  ❌ Erro ao processar webhook do ZapSign: ${e.message}`);
+  });
+});
+
+// So gera nota pros eventos que interessam ao escritorio (assinado/recusado/e-mail nao entregue) —
+// doc_created/doc_deleted so atualizam o status em silencio, pra nao poluir o deal com nota
+// redundante do que o proprio bot ja anotou ao criar o documento.
+async function processarWebhookZapSign(payload) {
+  const info = zapsign.interpretarStatusWebhook(payload);
+  if (!info.docToken) return;
+
+  const row = db.prepare('SELECT deal_id FROM conversations WHERE contrato_zapsign_doc_token = ?').get(info.docToken);
+  if (!row?.deal_id) {
+    console.log(`  ⚠️ webhook ZapSign: doc_token ${info.docToken} nao corresponde a nenhum deal conhecido`);
+    return;
+  }
+
+  db.prepare('UPDATE conversations SET contrato_zapsign_status = ? WHERE contrato_zapsign_doc_token = ?')
+    .run(info.status || info.eventType || null, info.docToken);
+
+  // Fechamento do negocio (WON/LOST) continua exclusivo de equipe_declarou_ganho/perdido na
+  // conversa (ver fecharNegocioSeAplicavel) — assinatura do contrato NAO fecha o deal
+  // automaticamente, e uma decisao de produto que nao foi pedida e fica de fora de proposito.
+  if (info.assinado) {
+    await criarNotaMoskit(row.deal_id, '✅ Contrato de Prestação de Serviço assinado pelo cliente via ZapSign.');
+  } else if (info.recusado) {
+    await criarNotaMoskit(row.deal_id, '❌ Cliente recusou assinar o contrato de Prestação de Serviço (ZapSign).');
+  } else if (info.emailFalhou) {
+    await criarNotaMoskit(row.deal_id, '⚠️ Falha ao entregar o e-mail de assinatura do contrato (ZapSign) — verificar o endereço ou reenviar manualmente.');
+  }
+}
 
 function processarMensagemRecebida(chatId, phone, contactName, corpo, role, idZernio) {
   try {
@@ -2926,6 +3591,230 @@ async function importarContatosMoskit() {
 }
 
 // ------------------------------------------------------------
+// Reconciliacao da classificacao (o CRM tem que refletir a decisao ATUAL do bot)
+// ------------------------------------------------------------
+// Por que existe: todas as travas de classificacao agem NO MOMENTO do ciclo. Se um PUT falhar fora de um
+// ciclo, se a conversa parar de receber mensagens, ou se alguem mexer no CRM depois, nada nunca
+// reconferia — foi assim que "LGPD" ficou preso no deal 48423360 enquanto o bot dizia "Direito
+// Administrativo" a cada rodada. Aqui o bot volta e confere.
+//
+// Regras (as mesmas do caminho normal de escrita, por reuso de atualizarNegocioMoskit):
+//   - campo vazio no CRM e o bot sabe o valor        => preenche
+//   - divergente e o valor de la foi escrito pelo bot => corrige
+//   - divergente e travado por correcao manual        => NAO toca, entra no resumo do Telegram
+//   - sem registro de autoria (deal anterior a isto)  => NAO toca (incluirLegado forca)
+//   - deal WON/LOST                                   => NAO toca, so reporta
+const RECONCILIACAO_INTERVAL_MS = Number(process.env.RECONCILIACAO_INTERVAL_MS) || 30 * 60 * 1000;
+const RECONCILIACAO_ATIVA = process.env.RECONCILIACAO_ATIVA !== 'false'; // default ligada
+const RECONCILIACAO_DIAS = Number(process.env.RECONCILIACAO_DIAS) || 30;
+// Pausa entre as leituras da varredura: uma passada por 64 deals ja levou 429 do Moskit.
+const RECONCILIACAO_PAUSA_MS = Number(process.env.RECONCILIACAO_PAUSA_MS) || 300;
+// Ultimo resumo enviado ao Telegram. Sem isso, uma pendencia que depende de acao humana (campo travado)
+// seria reenviada a cada rodada. Memoria de processo de proposito: um restart avisa de novo, o que e
+// barato e melhor do que perder o aviso.
+let ultimoResumoReconciliacao = null;
+
+// Nome canonico da area a partir do ID da opcao — o caminho inverso de buscarIdOpcao, usado pela
+// reconciliacao para adotar a area que esta no CRM como fonte da verdade.
+function nomeAreaPorId(idOpcao) {
+  if (!idOpcao) return null;
+  const alvo = Number(idOpcao);
+  return Object.keys(MOSKIT_IDS.AREA_DIREITO).find((k) => MOSKIT_IDS.AREA_DIREITO[k] === alvo) || null;
+}
+
+// Os campos de classificacao que o bot afirma hoje, montados pelas MESMAS regras do payload real.
+function camposClassificacaoDe(dados, condicoesValorEnviadas) {
+  const payload = montarPayloadMoskit(dados, 0, { condicoesValorEnviadas });
+  return payload.entityCustomFields || [];
+}
+
+async function reconciliarClassificacao({ aplicar = false, incluirLegado = false, limite = 100 } = {}) {
+  const linhas = db.prepare(`
+    SELECT chat_id, deal_id, last_data, bloco_condicoes_enviado, messages
+    FROM conversations
+    WHERE deal_id IS NOT NULL AND last_data IS NOT NULL
+      AND (updated_at IS NULL OR updated_at >= datetime('now', ?))
+    ORDER BY updated_at DESC
+    LIMIT ?
+  `).all(`-${RECONCILIACAO_DIAS} days`, limite);
+
+  const relatorio = {
+    aplicar, incluir_legado: incluirLegado, janela_dias: RECONCILIACAO_DIAS,
+    analisados: 0, sem_divergencia: 0,
+    corrigidos: [], a_corrigir: [], travados: [], legado: [], fechados: [],
+    nao_rebaixados: [], deals_apagados: [], bloco_recalculado: [], erros: [],
+  };
+
+  let primeira = true;
+  for (const linha of linhas) {
+    const dados = parseJsonSeguro(linha.last_data, null);
+    if (!dados) continue;
+
+    // BLOCO DE CONDICOES RECALCULADO DAS MENSAGENS, nao lido da coluna. `bloco_condicoes_enviado` foi
+    // adicionada depois de muitas conversas existirem, e nelas o valor e 0 — que significa "nunca
+    // enviou o bloco", ou seja CORTESIA. Confiar na coluna aqui rebaixaria consulta paga para R$0 em
+    // massa (13 deals na varredura de 12/08/2026). As mensagens estao no banco: e delas que sai a
+    // verdade. Se o recalculo discordar da coluna, a coluna e corrigida de passagem.
+    const mensagens = parseJsonSeguro(linha.messages, null) || [];
+    const blocoRecalculado = mensagens.length ? detectarBlocoCondicoes(mensagens).enviado : linha.bloco_condicoes_enviado === 1;
+    if (blocoRecalculado !== (linha.bloco_condicoes_enviado === 1)) {
+      relatorio.bloco_recalculado.push({ chat_id: linha.chat_id, coluna: linha.bloco_condicoes_enviado, mensagens: blocoRecalculado ? 1 : 0 });
+      console.log(`  💳 ${linha.chat_id}: bloco de condicoes recalculado das mensagens (coluna dizia ${linha.bloco_condicoes_enviado}, agora ${blocoRecalculado ? 1 : 0})`);
+      // Persistir so quando for pra valer: dry-run tem que ser leitura pura, senao "conferir sem
+      // escrever" deixa de ser verdade e ninguem confia no relatorio. O valor recalculado vale para esta
+      // rodada de qualquer forma (esta em `blocoRecalculado`).
+      if (aplicar) {
+        db.prepare('UPDATE conversations SET bloco_condicoes_enviado = ? WHERE chat_id = ?').run(blocoRecalculado ? 1 : 0, linha.chat_id);
+      }
+    }
+
+    relatorio.analisados++;
+
+    try {
+      // Espaco entre as leituras: a varredura de 64 deals ja tomou 429 do Moskit.
+      if (!primeira) await new Promise((r) => setTimeout(r, RECONCILIACAO_PAUSA_MS));
+      primeira = false;
+
+      const dealRes = await axios.get(`${MOSKIT_BASE}/deals/${linha.deal_id}`, {
+        headers: apiHeaders,
+        validateStatus: (s) => s < 500,
+      });
+      if (dealRes.status === 404) {
+        // Caso conhecido e acionavel (alguem apagou o deal no CRM e o banco ainda aponta pra ele), nao
+        // um erro de integracao — separar evita esconder falha de verdade num monte de 404.
+        relatorio.deals_apagados.push({ chat_id: linha.chat_id, deal_id: linha.deal_id });
+        continue;
+      }
+      if (dealRes.status < 200 || dealRes.status >= 300) {
+        relatorio.erros.push({ chat_id: linha.chat_id, deal_id: linha.deal_id, erro: `HTTP ${dealRes.status}` });
+        continue;
+      }
+      const deal = dealRes.data;
+
+      if (deal?.status && deal.status !== STATUS_DEAL.OPEN) {
+        relatorio.fechados.push({ chat_id: linha.chat_id, deal_id: linha.deal_id, status: deal.status });
+        continue;
+      }
+
+      const remotos = new Map((deal?.entityCustomFields || []).filter((c) => c?.id).map((c) => [c.id, (c.options || []).map(Number)]));
+      const registro = lerRegistroCampos(linha.chat_id) || { escritos: {}, travados: new Set() };
+
+      // NUNCA REBAIXAR: se o deal ja esta como consulta paga no CRM, o payload nao pode ser montado como
+      // cortesia (montarPayloadMoskit tira o price junto com o campo). Corrigir PARA paga e seguro
+      // — tem evidencia do bloco na conversa; rebaixar para R$0 nao e, porque a cobranca pode ter sido
+      // combinada por telefone ou vindo num anexo que o detector nao le. Decisao do escritorio, 12/08/2026.
+      const tipoRemotoEhPaga = (remotos.get(CF_TIPO_CONSULTA) || []).includes(TIPO_CONSULTA_PAGA_ID);
+      const condicoesParaPayload = blocoRecalculado || tipoRemotoEhPaga;
+      if (tipoRemotoEhPaga && !blocoRecalculado) {
+        relatorio.nao_rebaixados.push({ chat_id: linha.chat_id, deal_id: linha.deal_id, motivo: 'CRM esta "consulta paga" e o bloco nao aparece nas mensagens — nao rebaixado' });
+      }
+
+      // A AREA QUE MANDA AQUI E A DO CRM, quando existe: ela foi curada pela equipe, enquanto a do
+      // last_data pode ser palpite anterior as travas. Trocando a area no objeto (em vez de remendar o
+      // campo do responsavel depois), tudo que deriva dela — inclusive o responsavel — sai coerente, e o
+      // relatorio promete exatamente o que a escrita vai fazer. Area vazia no CRM continua sendo
+      // preenchida com a do bot.
+      const nomeAreaDoCrm = nomeAreaPorId((remotos.get(MOSKIT_IDS.CF.AREA_DIREITO) || [])[0]);
+      const dadosParaEscrita = nomeAreaDoCrm ? { ...dados, area_direito: nomeAreaDoCrm } : dados;
+
+      const esperados = camposClassificacaoDe(dadosParaEscrita, condicoesParaPayload);
+      if (!esperados.length) continue;
+
+      const divergentes = esperados.filter((e) => !opcoesIguais(remotos.get(e.id), e.options));
+      if (!divergentes.length) { relatorio.sem_divergencia++; continue; }
+
+      const detalhe = (campo) => ({
+        chat_id: linha.chat_id,
+        deal_id: linha.deal_id,
+        campo: nomeCampo(campo.id),
+        no_crm: (remotos.get(campo.id) || []).join(',') || '(vazio)',
+        do_bot: (campo.options || []).join(','),
+      });
+
+      let corrigiveis = 0;
+      for (const campo of divergentes) {
+        const remoto = remotos.get(campo.id);
+        const registrado = registro.escritos[campo.id];
+        const temValorRemoto = !!(remoto && remoto.length);
+
+        // Campo fora de CF_TRAVAVEIS (tipo de consulta e responsavel) e regido por regra, nao por
+        // opiniao: nao existe autoria a respeitar nele, e o caminho de escrita tambem nao o filtra.
+        // Sem esta linha os 4 responsaveis incoerentes cairiam em "legado" e nunca seriam corrigidos.
+        if (!CF_TRAVAVEIS.has(campo.id)) {
+          corrigiveis++;
+          relatorio[aplicar ? 'corrigidos' : 'a_corrigir'].push(detalhe(campo));
+          continue;
+        }
+
+        if (registro.travados.has(campo.id)) { relatorio.travados.push(detalhe(campo)); continue; }
+        if (temValorRemoto && registrado === undefined && !incluirLegado) { relatorio.legado.push(detalhe(campo)); continue; }
+        // Valor remoto que o bot nao escreveu: o caminho de escrita vai TRAVAR este campo (correcao
+        // manual) em vez de corrigir. Nao prometemos no relatorio o que nao vai acontecer.
+        if (temValorRemoto && registrado !== undefined && !opcoesIguais(registrado, remoto) && !incluirLegado) {
+          relatorio.travados.push(detalhe(campo));
+          continue;
+        }
+        corrigiveis++;
+        relatorio[aplicar ? 'corrigidos' : 'a_corrigir'].push(detalhe(campo));
+      }
+
+      if (!corrigiveis || !aplicar) continue;
+
+      const contactId = deal?.contacts?.[0]?.id;
+      if (!contactId) {
+        relatorio.erros.push({ chat_id: linha.chat_id, deal_id: linha.deal_id, erro: 'deal sem contato — nao da pra montar o payload' });
+        continue;
+      }
+
+      // Reusa o caminho normal de escrita: merge com o remoto, autoria/trava e confirmacao pos-PUT — uma
+      // correcao que nao gruda no CRM vira erro visivel, nao sucesso silencioso.
+      await atualizarNegocioMoskit(linha.deal_id, dadosParaEscrita, contactId, {
+        chatId: linha.chat_id,
+        condicoesValorEnviadas: condicoesParaPayload,
+        forcarAutoria: incluirLegado,
+      });
+      await criarNotaMoskit(
+        linha.deal_id,
+        '🔁 Classificação reconciliada automaticamente (o CRM estava diferente do que o bot apurou na conversa): ' +
+        divergentes.map((c) => nomeCampo(c.id)).join(', ') + '.'
+      );
+      console.log(`  🔁 Deal ${linha.deal_id} reconciliado (${divergentes.length} campo(s))`);
+    } catch (e) {
+      relatorio.erros.push({ chat_id: linha.chat_id, deal_id: linha.deal_id, erro: e.message });
+      console.error(`  ❌ Reconciliacao do deal ${linha.deal_id}: ${e.message}`);
+    }
+  }
+
+  return relatorio;
+}
+
+// Rotina periodica: corrige sozinha o que o proprio bot escreveu e avisa no Telegram o que ela NAO pode
+// tocar (campo corrigido na mao, deal fechado, deal legado sem autoria) — essas dependem de decisao
+// humana, entao viram aviso, nunca escrita.
+async function rodarReconciliacaoPeriodica() {
+  const r = await reconciliarClassificacao({ aplicar: true });
+
+  const pendencias = [...r.travados, ...r.legado];
+  if (!r.corrigidos.length && !pendencias.length) return r;
+
+  console.log(`  🔁 Reconciliacao: ${r.analisados} deals conferidos, ${r.corrigidos.length} corrigidos, ${pendencias.length} pendencia(s) humana(s)`);
+
+  const linhasResumo = [
+    r.corrigidos.length ? `✅ ${r.corrigidos.length} campo(s) corrigido(s) automaticamente` : '',
+    ...pendencias.slice(0, 10).map((p) => `• Deal \`${p.deal_id}\` — ${p.campo}: CRM "${p.no_crm}" x bot "${p.do_bot}"`),
+    pendencias.length > 10 ? `… e mais ${pendencias.length - 10}` : '',
+  ].filter(Boolean);
+
+  const resumo = `🔁 *Reconciliação de classificação*\n${linhasResumo.join('\n')}`;
+  if (resumo === ultimoResumoReconciliacao) return r; // nada novo desde a ultima rodada
+  ultimoResumoReconciliacao = resumo;
+  if (pendencias.length) {
+    await enviarTelegram(`${resumo}\n\nEsses o bot não toca (correção manual, deal fechado ou negócio anterior ao registro de autoria).`);
+  }
+  return r;
+}
+
+// ------------------------------------------------------------
 // Backfill: criar deals pendentes
 // ------------------------------------------------------------
 async function backfillDeals() {
@@ -3014,7 +3903,11 @@ async function backfillDeals() {
       } else {
         console.log(`  🔶 Criando novo deal para ${phone}...`);
         try {
-          const deal = await criarNegocioMoskit(dados, contactId);
+          // Passa pelas MESMAS travas do pipeline: `dados` aqui e last_data cru, que pode carregar um
+          // palpite de area gravado antes delas existirem, e nao ha observacao nenhuma pra sustentar.
+          // `chatId` vai junto para que a autoria dos campos fique registrada desde o nascimento.
+          sanitizarClassificacao(dados, []);
+          const deal = await criarNegocioMoskit(dados, contactId, { chatId });
           console.log(`  ✅ Deal criado: ${deal.id}`);
           db.prepare("UPDATE conversations SET deal_id = ?, updated_at = datetime('now') WHERE chat_id = ?").run(deal.id, chatId);
 
@@ -3366,6 +4259,18 @@ app.listen(PORT, () => {
     sincronizarAtividadesMoskit().catch((e) => console.error(`  ❌ Erro na sincronizacao de atividades: ${e.message}`));
   }, SYNC_INTERVAL_MS);
 
+  // Reconciliacao da classificacao: rede de seguranca para o CRM nao ficar diferente do que o bot apurou
+  // (PUT que nao pegou, conversa que parou de receber mensagem, alteracao feita fora do bot). Intervalo
+  // proprio, bem maior que o da sincronizacao: e uma varredura de deals, 1 GET por deal.
+  if (RECONCILIACAO_ATIVA) {
+    console.log(`   Reconciliacao de classificacao: a cada ${Math.round(RECONCILIACAO_INTERVAL_MS / 60000)} min (janela de ${RECONCILIACAO_DIAS} dias)`);
+    setInterval(() => {
+      rodarReconciliacaoPeriodica().catch((e) => console.error(`  ❌ Erro na reconciliacao periodica: ${e.message}`));
+    }, RECONCILIACAO_INTERVAL_MS);
+  } else {
+    console.log('   Reconciliacao de classificacao: DESLIGADA (RECONCILIACAO_ATIVA=false)');
+  }
+
   // Expor via ngrok para receber webhooks do Zernio
   const { spawn } = require('child_process');
   const ngrokPath = process.platform === 'win32'
@@ -3425,6 +4330,19 @@ module.exports = {
   buscarOuCriarContato,
   aplicarViradaCobranca,
   atualizarNegocioMoskit,
+  // Gate do caso descrito e autoria de campos: funcoes puras (ou so-banco) exercitadas direto em
+  // test-pipeline.js, porque processarConversaDirect depende da OpenAI e nao roda nos testes.
+  aplicarGateCasoDescrito,
+  deveEsperarCasoDescrito,
+  sanitizarClassificacao,
+  mesclarParaCrm,
+  derivarAdvogadoDaArea,
+  detectarOpcoesInvalidas,
+  registrarOpcoesInvalidas,
+  registrarBriefing,
+  filtrarCamposPorAutoria,
+  reconciliarClassificacao,
+  buscarIdOpcao,
   handleAgendamentoCalendar,
   finalizarCiclo,
   moverParaEstagio,

@@ -18,6 +18,15 @@ const TIPOS_OBSERVACAO = {
   cliente_propos_horario:   { role: 'cliente', exigeHorario: true },
   cliente_aceitou_horario:  { role: 'cliente', exigeHorario: true },
   cliente_alegou_pagamento: { role: 'cliente', exigeHorario: false },
+  // O cliente contou o que aconteceu / o que precisa. E a evidencia que autoriza o bot a escrever
+  // area_direito, advogado_responsavel e assunto: sem ela, o modelo deduzia a area do SOCIO que o
+  // lead mencionou ("quero consulta com o Dr. Berto" => LGPD, porque LGPD e o primeiro item do perfil
+  // do Berto no prompt) e o lead entrava no CRM na area errada, com o briefing errado.
+  cliente_descreveu_caso:   { role: 'cliente', exigeHorario: false },
+  // A equipe tambem descreve o caso na conversa com alguma frequencia (resumo depois de uma ligacao,
+  // "ela quer entrar com acao de remocao"). Vale como evidencia do MESMO fato — o que nao vale, e era
+  // o bug, e deduzir a area de quem o lead pediu para falar.
+  equipe_descreveu_caso:    { role: 'equipe',  exigeHorario: false },
   equipe_declarou_ganho:    { role: 'equipe',  exigeHorario: false },
   equipe_declarou_perdido:  { role: 'equipe',  exigeHorario: false },
   cliente_declarou_perdido: { role: 'cliente', exigeHorario: false },
@@ -36,6 +45,10 @@ const TIPOS_OBSERVACAO = {
 const TIPOS_CORRIGIVEIS = {
   equipe_propos_horario: 'cliente_propos_horario',
   cliente_propos_horario: 'equipe_propos_horario',
+  // Descrever o caso tambem existe nos dois papeis e trocar o prefixo nao inventa evidencia: o fato
+  // provado ("alguem contou o caso nesta mensagem") e o mesmo, e quem falou o codigo sabe pelo role.
+  cliente_descreveu_caso: 'equipe_descreveu_caso',
+  equipe_descreveu_caso: 'cliente_descreveu_caso',
 };
 
 function removerAcentos(texto) {

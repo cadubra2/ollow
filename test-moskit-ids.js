@@ -43,9 +43,11 @@ checar(
 );
 
 console.log('\n=== Aliases de Direito Medico ===');
-// Estavam presentes em apenas 2 das 6 copias; nas outras, "Direito Medico" caia em null.
-for (const alias of ['solucoes medicas', 'direito medico e da saude', 'direito da saude', 'direito medico']) {
-  igual(`'${alias}' → 577809`, AREA_DIREITO[alias], 577809);
+// Estavam presentes em apenas 2 das 6 copias; nas outras, "Direito Medico" caia em null. Hoje vivem em
+// APELIDOS e sao resolvidos pelo INDICE_BUSCA — as tabelas canonicas tem uma chave por opcao.
+igual("'solucoes medicas' e a chave canonica", AREA_DIREITO['solucoes medicas'], 577809);
+for (const alias of ['direito medico e da saude', 'direito da saude', 'direito medico', 'Direito Médico', 'DIREITO MEDICO']) {
+  igual(`'${alias}' → 577809 pelo indice`, IDS.INDICE_BUSCA.AREA_DIREITO[IDS.normalizarChave(alias)], 577809);
 }
 
 // ============================================================
@@ -74,12 +76,13 @@ for (const [nome, tabela] of Object.entries(TABELAS)) {
 
 // ============================================================
 console.log('\n=== Duplicatas dentro das tabelas ===');
-// Duas chaves com o mesmo ID so e legitimo quando sao alias declarado. Em AREA_DIREITO os 4 aliases
-// medicos colapsam em 1 valor: 14 chaves, 11 valores distintos.
-igual('AREA_DIREITO tem 14 chaves', Object.keys(AREA_DIREITO).length, 14);
+// Agora as tabelas canonicas tem UMA chave por opcao do CRM (os apelidos foram para APELIDOS), entao a
+// invariante "nenhum ID repetido" vale para AREA_DIREITO tambem — e ela e o que pega duas areas
+// diferentes apontando para o mesmo ID por engano, que foi o bug do 'direito empresarial' → 'outros'.
+igual('AREA_DIREITO tem 11 chaves canonicas', Object.keys(AREA_DIREITO).length, 11);
 igual('AREA_DIREITO tem 11 valores distintos', new Set(Object.values(AREA_DIREITO)).size, 11);
 
-for (const nome of ['ORIGEM', 'TIPO_CONSULTA', 'CAPTACAO', 'RESPONSAVEL_PROCESSO']) {
+for (const nome of ['ORIGEM', 'TIPO_CONSULTA', 'CAPTACAO', 'AREA_DIREITO', 'RESPONSAVEL_PROCESSO']) {
   const t = TABELAS[nome];
   checar(
     `${nome}: nenhum ID repetido`,
@@ -97,6 +100,65 @@ checar('gratis !== paga', TIPO_CONSULTA_GRATIS_ID !== TIPO_CONSULTA_PAGA_ID);
 checar("nenhuma delas e 'sem consulta'", ![TIPO_CONSULTA_GRATIS_ID, TIPO_CONSULTA_PAGA_ID].includes(TIPO_CONSULTA['sem consulta']));
 igual('os atalhos batem com a tabela (gratis)', TIPO_CONSULTA_GRATIS_ID, TIPO_CONSULTA['consulta gratis']);
 igual('os atalhos batem com a tabela (paga)', TIPO_CONSULTA_PAGA_ID, TIPO_CONSULTA['consulta paga']);
+
+// ============================================================
+console.log('\n=== Apelidos e indice de busca ===');
+// A busca de opcao passou a exigir correspondencia exata (12/08/2026). O que segura os valores que a IA
+// escreve de outro jeito ("Dr. Berto", "familia", "Indicacao de amigos e parentes") sao os APELIDOS —
+// se um deles apontar para uma chave que nao existe, o campo volta a ficar vazio em silencio.
+for (const [tabela, apelidos] of Object.entries(IDS.APELIDOS)) {
+  const orfaos = Object.entries(apelidos).filter(([, canonica]) => IDS[tabela][canonica] === undefined);
+  checar(`APELIDOS.${tabela}: todo apelido aponta para chave canonica existente`, orfaos.length === 0, orfaos);
+
+  const naoNormalizados = Object.keys(apelidos).filter((k) => k !== IDS.normalizarChave(k));
+  checar(`APELIDOS.${tabela}: chaves ja normalizadas`, naoNormalizados.length === 0, naoNormalizados);
+
+  const colidindo = Object.keys(apelidos).filter((k) => IDS[tabela][k] !== undefined);
+  checar(`APELIDOS.${tabela}: nenhum apelido duplica chave canonica`, colidindo.length === 0, colidindo);
+}
+for (const [tabela, indice] of Object.entries(IDS.INDICE_BUSCA)) {
+  const canonicasFora = Object.keys(IDS[tabela]).filter((k) => indice[IDS.normalizarChave(k)] !== IDS[tabela][k]);
+  checar(`INDICE_BUSCA.${tabela}: contem todas as canonicas`, canonicasFora.length === 0, canonicasFora);
+}
+// Regressoes das armadilhas concretas do casamento por substring que existia antes.
+igual('"Indicacao" (vago) NAO resolve para nenhuma origem', IDS.INDICE_BUSCA.ORIGEM[IDS.normalizarChave('Indicação')], undefined);
+igual('"direito" (vago) NAO resolve para nenhuma area', IDS.INDICE_BUSCA.AREA_DIREITO[IDS.normalizarChave('direito')], undefined);
+igual('"consulta" (vago) NAO resolve para tipo de consulta', IDS.INDICE_BUSCA.TIPO_CONSULTA[IDS.normalizarChave('consulta')], undefined);
+igual('"Indicacao de amigos e parentes" resolve (grafia do exemplo do prompt)', IDS.INDICE_BUSCA.ORIGEM[IDS.normalizarChave('Indicação de amigos e parentes')], ORIGEM['indicacao de/ou amigos e parentes']);
+igual('"Dr. Berto" resolve para o responsavel Berto', IDS.INDICE_BUSCA.RESPONSAVEL_PROCESSO[IDS.normalizarChave('Dr. Berto')], RESPONSAVEL_PROCESSO['berto']);
+igual('"Direito Digital" resolve para LGPD', IDS.INDICE_BUSCA.AREA_DIREITO[IDS.normalizarChave('Direito Digital')], AREA_DIREITO['lgpd']);
+
+// ============================================================
+console.log('\n=== Area -> advogado (regra do escritorio) ===');
+// A area DEFINE o responsavel; antes quem escolhia era o modelo. Aqui garantimos que a tabela cobre as
+// areas com dono, aponta so para advogado que existe, e que "Outros" continua sem dono automatico.
+{
+  const ESPERADO = {
+    'direito administrativo': 'Berto',
+    'lgpd': 'Berto',
+    'direito imobiliario': 'Bruno',
+    'direito de familia': 'Bruno',
+    'direito empresarial': 'Bruno',
+    'solucoes medicas': 'Iury',
+    'direito educacional': 'Iury',
+    'direito previdenciario': 'Iury',
+    'direito do consumidor': 'Iury',
+    'direito do trabalho': 'Iury',
+  };
+  for (const [area, advogado] of Object.entries(ESPERADO)) {
+    igual(`${area} → ${advogado}`, IDS.ADVOGADO_POR_AREA_ID[AREA_DIREITO[area]], advogado);
+  }
+  igual('"outros" NAO tem responsavel automatico', IDS.ADVOGADO_POR_AREA_ID[AREA_DIREITO['outros']], undefined);
+  igual('a tabela cobre 10 das 11 areas', Object.keys(IDS.ADVOGADO_POR_AREA_ID).length, 10);
+
+  const semResponsavel = Object.values(IDS.ADVOGADO_POR_AREA_ID)
+    .filter((adv) => RESPONSAVEL_PROCESSO[IDS.normalizarChave(adv)] === undefined);
+  checar('todo advogado da tabela existe em RESPONSAVEL_PROCESSO', semResponsavel.length === 0, semResponsavel);
+
+  const idsInvalidos = Object.keys(IDS.ADVOGADO_POR_AREA_ID)
+    .filter((id) => !Object.values(AREA_DIREITO).map(String).includes(String(id)));
+  checar('toda chave e um ID de area existente', idsInvalidos.length === 0, idsInvalidos);
+}
 
 // ============================================================
 console.log('\n=== Campos personalizados ===');

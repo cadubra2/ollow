@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "node test-telefone.js && node test-moskit-ids.js && node test-evidencia.js && node test-fila.js && node test-payload.js && node test-rotas.js && node test-pipeline.js && node test-guards-internos.js && node test-agendamento-bloco-mensagens.js && node test-transcricao.js",
+    "test": "node test-telefone.js && node test-moskit-ids.js && node test-evidencia.js && node test-fila.js && node test-payload.js && node test-rotas.js && node test-pipeline.js && node test-guards-internos.js && node test-agendamento-bloco-mensagens.js && node test-transcricao.js && node test-zapsign.js",
     "test:ia": "node test-dupla-confirmacao.js"
   },
   "keywords": [
@@ -22,6 +22,7 @@
     "better-sqlite3": "^12.11.1",
     "dotenv": "^16.4.5",
     "express": "^4.21.0",
+    "extenso": "^3.0.0",
     "googleapis": "^173.0.0",
     "openai": "^4.67.3"
   },
