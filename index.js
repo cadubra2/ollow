@@ -15,6 +15,7 @@ const { enfileirar, TEMP_DIR } = require('./src/fila');
 const { jaExiste, normalizarMensagens } = require('./src/mensagens');
 const { chaveConversa, ehInterno, TEAM_SUFIXOS } = require('./src/telefone');
 const { transcreverAudio } = require('./src/transcricao');
+const { montarPayloadAtividade, horarioNaiveParaInstante } = require('./src/atividade-moskit');
 const MOSKIT_IDS = require('./src/moskit-ids');
 const zapsign = require('./src/zapsign');
 
@@ -65,6 +66,16 @@ const FUNIL_DRY_RUN = process.env.FUNIL_DRY_RUN !== 'false'; // default true (so
 // separada de FUNIL_DRY_RUN de proposito, pra poder ligar o avanco de estagio primeiro, observar,
 // e so depois (com confianca independente) ligar o fechamento automatico.
 const FUNIL_FECHAMENTO_DRY_RUN = process.env.FUNIL_FECHAMENTO_DRY_RUN !== 'false'; // default true
+// Desliga a escrita na AGENDA do Moskit (a Atividade que representa a consulta) sem precisar de
+// redeploy: basta mudar o .env na VPS e reiniciar. E botao de emergencia, nao encenacao.
+//
+// ATENCAO — a comparacao aqui e INVERTIDA em relacao as duas flags acima (`=== 'true'` em vez de
+// `!== 'false'`), de proposito: esta flag default FALSE, ou seja, a agenda funciona por padrao. As
+// outras seguram PALPITE DE IA sobre estagio de funil, e por isso nascem desligadas; aqui a regra e
+// deterministica — houve dupla confirmacao de cliente e equipe, entao a consulta existe e tem que
+// aparecer na agenda. Nao "conserte" esta linha para `!== 'false'`: isso desligaria a funcionalidade
+// em producao em silencio (ha teste cobrindo os dois caminhos).
+const AGENDA_MOSKIT_DRY_RUN = process.env.AGENDA_MOSKIT_DRY_RUN === 'true'; // default FALSE
 // Cria evento/Meet sem comprovante quando o deal esta marcado como "consulta gratis" no Moskit.
 // Default DESLIGADO de proposito: sobe o codigo, roda GET /auditoria-consulta-gratis pra ver o que
 // seria liberado, e so entao liga no .env.
@@ -88,6 +99,18 @@ const ZERNIO_API_KEY = process.env.ZERNIO_API_KEY;
 // Teto de paginas na busca de contato: protege contra base grande + resposta sem token de proxima
 // pagina, que viraria loop. 20 x 100 cobre a base atual com folga.
 const MAX_PAGINAS_BUSCA_CONTATO = Number(process.env.MAX_PAGINAS_BUSCA_CONTATO) || 20;
+// Teto da varredura de atividades. Cada pagina traz 10 (ver listarAtividadesMoskit), entao 20
+// paginas = 200 atividades por ciclo — a varredura completa da base em 12/08/2026 devolveu 190
+// registros unicos, ou seja, hoje o teto cobre tudo com folga e `truncou` nunca dispara.
+//
+// E teto, nao janela: a varredura para sozinha na primeira pagina incompleta. Serve so para uma base
+// que cresca muito, e mesmo ai o essencial esta coberto — a lista vem por id desc (ordem de criacao)
+// e cada atividade so precisa ser vista UMA vez, porque depois disso fica em
+// atividades_sincronizadas e nunca mais entra na conta.
+//
+// O teto efetivo de 10 que existia antes nao era uma escolha: era `?page=` sendo ignorado em
+// silencio pela API.
+const MAX_PAGINAS_ATIVIDADES = Number(process.env.MAX_PAGINAS_ATIVIDADES) || 20;
 // Timeout de toda chamada HTTP feita por axios (Moskit, Zernio, download de anexo). Aplicado como
 // default global mais abaixo, junto com o httpsAgent — cobre os 25 call sites de uma vez.
 const TIMEOUT_HTTP_MS = Number(process.env.TIMEOUT_HTTP_MS) || 30000;
@@ -223,6 +246,11 @@ try { db.exec("ALTER TABLE conversations ADD COLUMN agendamento_pendente_hash TE
 // verdade e ninguem no escritorio ficava sabendo que a reuniao nao foi pra agenda. Visto no deal
 // 48346871 (token OAuth expirado): confirmacao completa, zero nota no CRM.
 try { db.exec("ALTER TABLE conversations ADD COLUMN agendamento_erro_hash TEXT"); } catch {}
+// Atividade criada no Moskit para a consulta desta conversa — e o compromisso na AGENDA do CRM,
+// irmao do evento em evento_calendar_id. Guarda o id para (a) nao criar duas e (b) mover o horario
+// junto quando a consulta e remarcada. Antes disto o agendamento so existia no Google Agenda e como
+// texto de nota: quem trabalha dentro do Moskit nao via a consulta em lugar nenhum.
+try { db.exec("ALTER TABLE conversations ADD COLUMN atividade_moskit_id INTEGER"); } catch {}
 // Contrato de Prestacao de Servico gerado no ZapSign — mesmo espirito das colunas de agendamento
 // acima. contrato_zapsign_criado e o guard de idempotencia (so gera uma vez por deal);
 // _doc_token identifica o documento pro webhook de status; _pendente_hash/_erro_hash dedupam
@@ -1240,6 +1268,116 @@ async function criarNotaMoskit(dealId, texto) {
   );
 }
 
+// A consulta na AGENDA do Moskit. Contrato levantado em 12/08/2026 com test-moskit-atividade-real.js
+// contra a API real (o repositorio so lia /activities ate entao): `dueDate` e instante absoluto
+// ("2026-08-07T12:00:00.000+00:00"), `duration` em minutos, `deals`/`contacts` como arrays de {id}.
+//
+// NUNCA LANCA — de proposito. Quando esta funcao roda, o evento no Google Agenda ja existe e a dupla
+// confirmacao ja aconteceu; deixar uma excecao subir aqui derrubaria o avanco de estagio e a geracao
+// do contrato no ZapSign por causa da agenda do CRM. A falha vira nota no deal, que e onde o
+// escritorio ve.
+async function criarAtividadeMoskit(dealId, payload) {
+  if (!dealId || !payload) return null;
+  try {
+    const res = await axios.post(`${MOSKIT_BASE}/activities`, payload, {
+      headers: { ...apiHeaders, 'X-Ollow-Origin': 'BOT_WHATSAPP' },
+      validateStatus: (s) => s < 500,
+    });
+    // Resposta 2xx sem id e tao inutil quanto um erro: sem o id nao da pra remarcar nem pra impedir
+    // que a sincronizacao periodica crie um evento duplicado no Google Agenda.
+    const atividadeId = res.data?.id;
+    if (res.status >= 300 || !atividadeId) {
+      console.error(`  ❌ Atividade nao criada no Moskit (HTTP ${res.status}): ${JSON.stringify(res.data)}`);
+      await criarNotaMoskit(dealId, '⚠️ A consulta NAO entrou na agenda do Moskit (falha ao criar a atividade). O evento no Google Agenda foi criado normalmente — marque a atividade na mao para ela aparecer na agenda do CRM.').catch(() => {});
+      return null;
+    }
+    return atividadeId;
+  } catch (e) {
+    console.error(`  ❌ Erro ao criar atividade no Moskit: ${e.message}`);
+    await criarNotaMoskit(dealId, `⚠️ A consulta NAO entrou na agenda do Moskit (${e.message}). O evento no Google Agenda foi criado normalmente — marque a atividade na mao para ela aparecer na agenda do CRM.`).catch(() => {});
+    return null;
+  }
+}
+
+// Move o horario da atividade quando a consulta e remarcada. Mesmo contrato de nao-lancar: o evento
+// no Google ja foi movido quando chegamos aqui, e o pior desfecho e a agenda do CRM ficar no horario
+// velho — o que precisa virar nota, nao excecao.
+async function atualizarAtividadeMoskit(atividadeId, dueDate, dealId) {
+  if (!atividadeId || !dueDate) return false;
+  try {
+    // MEDIDO em 12/08/2026 com test-moskit-atividade-real.js contra a API real: `/activities` tem a
+    // MESMA peculiaridade do PUT de deal — um payload minimo `{dueDate}` e rejeitado com 422, e so o
+    // corpo do GET de volta (com o dueDate trocado) move o horario. Por isso o GET abaixo nao e
+    // firula: sem ele nenhuma remarcacao jamais chegaria na agenda do CRM.
+    const atualRes = await axios.get(`${MOSKIT_BASE}/activities/${atividadeId}`, {
+      headers: { ...apiHeaders, 'X-Ollow-Origin': 'BOT_WHATSAPP' },
+      validateStatus: (s) => s < 500,
+    });
+    if (atualRes.status >= 300) {
+      console.error(`  ❌ Atividade ${atividadeId} nao pode ser lida para remarcar (HTTP ${atualRes.status})`);
+      if (dealId) await criarNotaMoskit(dealId, '⚠️ A atividade na agenda do Moskit NAO foi remarcada (nao consegui ler a atividade) e continua no horario antigo. O Google Agenda ja esta no horario novo — corrija a atividade na mao.').catch(() => {});
+      return false;
+    }
+
+    const res = await axios.put(`${MOSKIT_BASE}/activities/${atividadeId}`, { ...atualRes.data, dueDate }, {
+      headers: { ...apiHeaders, 'X-Ollow-Origin': 'BOT_WHATSAPP' },
+      validateStatus: (s) => s < 500,
+    });
+    if (res.status >= 300) {
+      console.error(`  ❌ Atividade ${atividadeId} nao remarcada no Moskit (HTTP ${res.status})`);
+      if (dealId) await criarNotaMoskit(dealId, '⚠️ A atividade na agenda do Moskit NAO foi remarcada e continua no horario antigo. O Google Agenda ja esta no horario novo — corrija a atividade na mao.').catch(() => {});
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.error(`  ❌ Erro ao remarcar atividade ${atividadeId} no Moskit: ${e.message}`);
+    if (dealId) await criarNotaMoskit(dealId, `⚠️ A atividade na agenda do Moskit NAO foi remarcada (${e.message}) e continua no horario antigo. O Google Agenda ja esta no horario novo — corrija a atividade na mao.`).catch(() => {});
+    return false;
+  }
+}
+
+// Varre as atividades do Moskit paginando por OFFSET (`?start=`).
+//
+// MEDIDO em 12/08/2026 contra a API real, testando um parametro de cada vez. Em `/activities`:
+//   - `?page=`      IGNORADO — page=1 ate page=5 devolvem os MESMOS 10 registros
+//   - `?pageToken=` IGNORADO — devolve a mesma pagina e repete o mesmo token (diferente de
+//                   `/contacts`, onde esse mecanismo funciona e buscarOuCriarContato depende dele)
+//   - `?limit=`     IGNORADO — sempre 10, qualquer que seja o valor
+//   - `?offset=` / `?skip=` / `?from=` / `?maxId=` / `?beforeId=` — todos ignorados
+//   - **`?start=`   FUNCIONA** — offset real: start=10 devolve os 10 seguintes, sem sobreposicao
+//   - `?sort=`/`?order=` funcionam (order=asc devolve as mais antigas)
+//
+// Nenhum desses parametros ignorados devolve erro: a chamada responde 200 com a primeira pagina de
+// novo. Um loop mal escrito aqui nao quebra — ele rele os mesmos 10 registros e parece ter varrido
+// tudo. Foi assim que a sincronizacao e a auditoria passaram a enxergar so as 10 atividades mais
+// recentes achando que varriam 100.
+//
+// Devolve tambem `truncou`, para o chamador poder AVISAR quando o teto cortou a varredura — teto
+// silencioso aqui se leria como "varri tudo e nao achei nada", que e exatamente o engano acima.
+async function listarAtividadesMoskit(maxPaginas = MAX_PAGINAS_ATIVIDADES) {
+  const atividades = [];
+  let truncou = false;
+
+  for (let pagina = 0; pagina < maxPaginas; pagina++) {
+    const res = await axios.get(`${MOSKIT_BASE}/activities`, {
+      params: { start: atividades.length, limit: 100, sort: 'id', order: 'desc' },
+      headers: apiHeaders,
+      validateStatus: (s) => s < 500,
+    });
+    if (res.status < 200 || res.status >= 300) break;
+
+    const lote = Array.isArray(res.data) ? res.data : [];
+    atividades.push(...lote);
+
+    // Pagina incompleta = fim da lista. Nao da pra confiar no header `x-moskit-listing-total`: ele
+    // dizia 1165 numa base cuja varredura completa devolveu 190 registros unicos.
+    if (lote.length < 10) break;
+    if (pagina === maxPaginas - 1) truncou = true; // ainda vinha pagina cheia quando o teto chegou
+  }
+
+  return { atividades, truncou };
+}
+
 // CONFIRMADO empiricamente em 04/08/2026 via test-moskit-put.js contra um deal de teste: o PUT com
 // o corpo do GET de volta (padrao abaixo) FUNCIONA e preserva name/price/contacts/entityCustomFields
 // — a duvida de corrigir-tipo-consulta.js estava desatualizada. Um PUT so com {stage:{id}} (payload
@@ -1517,6 +1655,59 @@ function montarDescricaoEvento(dados, chatId) {
   ].filter(Boolean).join('\n');
 }
 
+// Cria, na AGENDA do Moskit, a atividade que corresponde ao evento recem-criado no Google Agenda.
+//
+// O PONTO CRITICO AQUI E O `stmtAtividadeMarcarSincronizada` NO FIM. sincronizarAtividadesMoskit roda
+// a cada SYNC_INTERVAL_MS e cria um evento no Google para toda atividade de consulta futura que nao
+// esteja nessa tabela — ou seja, sem essa linha o proprio bot criaria um SEGUNDO evento para a mesma
+// consulta minutos depois. Marcar a atividade como ja sincronizada, apontando para o evento que
+// acabamos de criar, e o que fecha o circuito entre as duas agendas.
+//
+// Nao lanca: quem chama esta no meio do caminho feliz do agendamento (nota, Telegram, estagio,
+// contrato) e nada disso pode cair porque a agenda do CRM falhou. Devolve true se entrou na agenda.
+async function registrarConsultaNaAgendaMoskit({ dealId, dados, chatId, horarioIso, meetLink, eventoId, row }) {
+  if (!dealId) return false;
+  if (row?.atividade_moskit_id) return false; // ja tem atividade — nao duplicar na agenda do CRM
+
+  if (AGENDA_MOSKIT_DRY_RUN) {
+    // Uma nota so: esta funcao roda no ramo de CRIACAO do evento, guardado por
+    // evento_calendar_criado — uma vez por conversa, nao a cada ciclo.
+    const quando = formatarHorarioEscritorio(horarioIso);
+    console.log(`  ⏭️ [dry-run] atividade do Moskit NAO criada para o deal ${dealId} (AGENDA_MOSKIT_DRY_RUN ativo)`);
+    await criarNotaMoskit(dealId, `🤖 [dry-run] A consulta de ${quando} NAO foi lançada na agenda do Moskit (AGENDA_MOSKIT_DRY_RUN ativo) — marque a atividade na mão. O evento no Google Agenda foi criado normalmente.`).catch(() => {});
+    return false;
+  }
+
+  const dueDate = horarioNaiveParaInstante(horarioIso, TZ_ESCRITORIO);
+  if (!dueDate) {
+    console.error(`  ⚠️ horario "${horarioIso}" nao converteu para instante — atividade do Moskit nao criada`);
+    return false;
+  }
+
+  // O contato ja foi resolvido antes neste ciclo (buscarOuCriarContato) e ficou no espelho local;
+  // vincular a atividade a ele e o que a faz aparecer tambem na ficha do cliente, nao so no negocio.
+  const phoneClean = String(chatId || '').replace(/\D/g, '').slice(-13);
+  const contatoId = phoneClean.length >= 8 ? stmtMoskitGet.get(phoneClean)?.moskit_id || null : null;
+
+  const payload = montarPayloadAtividade({
+    dealId,
+    contatoId,
+    titulo: montarResumoEvento(dados), // mesmo titulo do evento do Google: e o mesmo compromisso
+    assunto: dados.assunto,
+    dueDate,
+    presencial: dados.modalidade_consulta === 'presencial',
+    meetLink,
+  });
+
+  const atividadeId = await criarAtividadeMoskit(dealId, payload);
+  if (!atividadeId) return false;
+
+  db.prepare('UPDATE conversations SET atividade_moskit_id = ? WHERE chat_id = ?').run(atividadeId, chatId);
+  stmtAtividadeMarcarSincronizada.run(atividadeId, eventoId, dealId); // <- trava anti-evento-duplicado
+  console.log(`  🗓️ Consulta marcada na agenda do Moskit (atividade ${atividadeId}, deal ${dealId})`);
+  return true;
+}
+
 // Corrige titulo/descricao de um evento ja criado quando os dados melhoraram depois — tipico do
 // evento que nasceu com "(a definir)" porque o ciclo que o criou nao tinha o advogado ainda.
 // Nao mexe em data/hora, entao nao exige confirmacao (diferente de remarcar).
@@ -1651,7 +1842,11 @@ async function handleAgendamentoCalendar(dealId, dados, chatId, pagamentoVerific
     const meetLink = extrairMeetLink(evento);
     const notaComprovante = pagamentoVerificado ? ' (comprovante verificado)' : ' ⚠️ SEM comprovante verificado';
     const evidencia = `\nCliente aceitou: "${apuracao.cliente.trecho}" · Equipe confirmou: "${apuracao.equipe.trecho}"`;
-    await criarNotaMoskit(dealId, `📅 Reunião agendada no Google Calendar: ${dataFormatada}${notaComprovante}${evidencia}${meetLink ? `\nLink do Meet: ${meetLink}` : ''}`);
+    // A mesma consulta na agenda do CRM. Antes da nota, para que ela ja diga se entrou ou nao.
+    const naAgendaMoskit = await registrarConsultaNaAgendaMoskit({
+      dealId, dados: dadosEvento, chatId, horarioIso: apuracao.horarioIso, meetLink, eventoId: evento.id, row,
+    });
+    await criarNotaMoskit(dealId, `📅 Reunião agendada no Google Calendar: ${dataFormatada}${notaComprovante}${evidencia}${meetLink ? `\nLink do Meet: ${meetLink}` : ''}${naAgendaMoskit ? '\n🗓️ Também marcada na agenda do Moskit.' : ''}`);
     await notificarTelegramMeet({
       nome: dados.nome,
       telefone: chatId,
@@ -1825,7 +2020,14 @@ async function atualizarEventoSeRemarcado(dealId, dados, chatId, row) {
     const meetLink = extrairMeetLink(patched.data);
     console.log(`  🔁 Reunião remarcada para ${dataFormatada} (chat ${chatId})`);
 
-    await criarNotaMoskit(dealId, `🔁 Reunião remarcada para ${dataFormatada}${meetLink ? `\nLink do Meet (o mesmo de antes): ${meetLink}` : ''}`);
+    // As duas agendas movem juntas. Sem isto, a agenda do CRM continuaria mostrando o horario velho
+    // — pior que nao ter compromisso nenhum la, porque parece certo e esta errado. O guard de
+    // "nao mudou de verdade" la em cima ja impede um PUT redundante a cada ciclo.
+    const naAgendaMoskit = row?.atividade_moskit_id
+      ? await atualizarAtividadeMoskit(row.atividade_moskit_id, horarioNaiveParaInstante(novoInicioNaive, TZ_ESCRITORIO), dealId)
+      : false;
+
+    await criarNotaMoskit(dealId, `🔁 Reunião remarcada para ${dataFormatada}${meetLink ? `\nLink do Meet (o mesmo de antes): ${meetLink}` : ''}${naAgendaMoskit ? '\n🗓️ Agenda do Moskit atualizada também.' : ''}`);
     await notificarTelegramMeet({
       nome: dados.nome,
       telefone: chatId,
@@ -2731,14 +2933,11 @@ app.get('/auditoria-consulta-gratis', exigeAdmin, rota(async (req, res) => {
   console.log('\n🔍 Auditoria de consultas gratis (so leitura)...');
   const linhas = [];
   try {
-    const ativRes = await axios.get(`${MOSKIT_BASE}/activities`, {
-      params: { page: 1, limit: 100, sort: 'id', order: 'desc' },
-      headers: apiHeaders,
-      validateStatus: (s) => s < 500,
-    });
+    const { atividades, truncou } = await listarAtividadesMoskit();
+    if (truncou) console.log(`  ⚠️ teto de ${MAX_PAGINAS_ATIVIDADES} paginas atingido — auditoria cobre so as ${atividades.length} atividades mais recentes`);
     const agora = Date.now();
 
-    for (const atv of (ativRes.data || [])) {
+    for (const atv of atividades) {
       if (!ATIVIDADE_TIPOS_CONSULTA.has(atv.type?.id)) continue;
       if (atv.doneDate) continue;
       if (!atv.dueDate || new Date(atv.dueDate).getTime() <= agora) continue;
@@ -3157,14 +3356,13 @@ async function sincronizarAtividadesMoskit() {
   sincronizacaoAtividadesEmAndamento = true;
 
   try {
-    const res = await axios.get(`${MOSKIT_BASE}/activities`, {
-      params: { page: 1, limit: 100, sort: 'id', order: 'desc' },
-      headers: apiHeaders,
-      validateStatus: (s) => s < 500,
-    });
-    const atividades = res.data || [];
+    const { atividades, truncou } = await listarAtividadesMoskit();
     relatorio.atividades_verificadas = atividades.length;
+    relatorio.varredura_truncada = truncou;
     console.log(`  📅 ${atividades.length} atividades recentes encontradas no Moskit`);
+    // Teto silencioso aqui se leria como "varri tudo e nao tinha nada" — que foi exatamente o engano
+    // enquanto `?page=` era ignorado e a varredura via 10 de 1165.
+    if (truncou) console.log(`  ⚠️ teto de ${MAX_PAGINAS_ATIVIDADES} paginas atingido — atividades mais antigas que essas nao foram verificadas neste ciclo`);
 
     const agora = Date.now();
 
@@ -4344,6 +4542,9 @@ module.exports = {
   reconciliarClassificacao,
   buscarIdOpcao,
   handleAgendamentoCalendar,
+  // Exportada para teste: a paginacao por pageToken (e NAO por ?page=) e o tipo de detalhe que passa
+  // despercebido — o codigo antigo "paginava" e lia sempre os mesmos 10 registros sem erro nenhum.
+  listarAtividadesMoskit,
   finalizarCiclo,
   moverParaEstagio,
   moverEstagioSeAvancar,

@@ -23,6 +23,11 @@ process.env.TELEGRAM_CHAT_ID = '1';
 // ligado de verdade la). Os testes de dry-run abaixo dependem de comecar em 'true'.
 process.env.FUNIL_DRY_RUN = 'true';
 process.env.FUNIL_FECHAMENTO_DRY_RUN = 'true';
+// Mesmo motivo, sinal trocado: AGENDA_MOSKIT_DRY_RUN default FALSE (a agenda funciona sem a
+// variavel), e todas as assercoes de agenda deste arquivo cobrem o caminho LIGADO. Fixar em 'false'
+// impede que um .env de producao com a flag ligada faca esses testes passarem por engano, sem
+// escrever nada. O caminho desligado tem arquivo proprio: test-agenda-dry-run.js.
+process.env.AGENDA_MOSKIT_DRY_RUN = 'false';
 
 // ---------- dublê do axios ----------
 const axios = require('axios');
@@ -51,7 +56,7 @@ google.calendar = () => ({
 
 const {
   moverParaEstagio, criarNotaMoskit, aplicarViradaCobranca, atualizarNegocioMoskit,
-  handleAgendamentoCalendar, finalizarCiclo,
+  handleAgendamentoCalendar, listarAtividadesMoskit, finalizarCiclo,
   aplicarGateCasoDescrito, deveEsperarCasoDescrito, registrarBriefing, mergeDados,
   mesclarParaCrm, derivarAdvogadoDaArea, detectarOpcoesInvalidas, registrarOpcoesInvalidas,
   reconciliarClassificacao, montarPayloadMoskit,
@@ -69,13 +74,25 @@ function checar(nome, condicao, detalhe) {
 }
 const igual = (nome, obtido, esperado) => checar(nome, obtido === esperado, obtido);
 
+// Id devolvido pelo POST /activities simulado. Precisa existir: sem id o bot trata a criacao como
+// falha (nao teria como remarcar nem como travar o evento duplicado) e posta uma nota de aviso, que
+// desalinharia notas()[0] em todos os testes de agendamento.
+const ID_ATIVIDADE = 990001;
+
 function limpar() {
-  rede.chamadas = []; rede.get = rede.post = rede.put = null;
+  rede.chamadas = []; rede.get = rede.put = null;
+  rede.post = (url) => (url.includes('/activities') ? { status: 200, data: { id: ID_ATIVIDADE } } : { status: 200, data: {} });
   agenda.insert = []; agenda.patch = []; agenda.get = []; agenda.delete = [];
   agenda.respostaInsert = { id: 'ev1', htmlLink: 'https://exemplo/ev1' };
+  // Tabela de dedupe entre as duas agendas — sem limpar, o INSERT OR IGNORE do teste anterior faria
+  // o proximo enxergar uma linha velha e passar por engano.
+  db.prepare('DELETE FROM atividades_sincronizadas').run();
 }
 const de = (metodo, fragmento) => rede.chamadas.filter((c) => c.metodo === metodo && c.url.includes(fragmento));
 const notas = () => de('POST', '/notes');
+const atividadesCriadas = () => de('POST', '/activities');
+const atividadesRemarcadas = () => de('PUT', '/activities');
+const sincronizada = (id) => db.prepare('SELECT * FROM atividades_sincronizadas WHERE activity_id = ?').get(id);
 const telegrams = () => de('POST', 'api.telegram.org');
 const linha = (chatId) => db.prepare('SELECT * FROM conversations WHERE chat_id = ?').get(chatId);
 
@@ -436,6 +453,179 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     await handleAgendamentoCalendar(20, { ...DADOS, email_cliente: 'cliente@exemplo.com' }, CHAT, true, row, CONFIRMADO);
     igual('email do cliente → vira convidado', agenda.insert[0].requestBody.attendees[0].email, 'cliente@exemplo.com');
     igual('   e o convite e enviado', agenda.insert[0].sendUpdates, 'all');
+  }
+
+  // ============================================================
+  // MEDIDO em 12/08/2026 contra a API real: em /activities o UNICO parametro que pagina e `?start=`.
+  // `page`, `pageToken`, `limit`, `offset`, `skip`, `from` sao todos ignorados EM SILENCIO — a
+  // chamada responde 200 com a primeira pagina de novo. Um loop errado aqui nao quebra: rele os
+  // mesmos 10 registros e parece ter varrido tudo, que foi exatamente o bug (a varredura enxergava
+  // 10 achando que enxergava 100). Estas assercoes existem para ninguem voltar a esse padrao.
+  console.log('\n=== listarAtividadesMoskit: pagina por ?start=, nao por page/pageToken ===');
+  {
+    limpar();
+    const pagina = (ids) => ids.map((id) => ({ id, type: { id: moskitIds.ATIVIDADE_TIPO.reuniao } }));
+    const lotes = [
+      pagina([10, 9, 8, 7, 6, 5, 4, 3, 2, 1]), // pagina cheia (10) → ha mais
+      pagina([20, 19, 18]),                    // incompleta → fim da lista
+    ];
+    let i = 0;
+    rede.get = () => ({ status: 200, data: lotes[i++] || [], headers: {} });
+
+    const { atividades, truncou } = await listarAtividadesMoskit();
+    const gets = de('GET', '/activities');
+    igual('para na primeira pagina incompleta', gets.length, 2);
+    igual('   juntando os dois lotes', atividades.length, 13);
+    igual('   a primeira pede start=0', gets[0].cfg.params.start, 0);
+    igual('   a segunda avanca o offset pelo que ja veio', gets[1].cfg.params.start, 10);
+    checar('   e nunca manda page nem pageToken (ambos ignorados por esta API)',
+      gets.every((g) => g.cfg.params.page === undefined && g.cfg.params.pageToken === undefined),
+      gets.map((g) => g.cfg.params));
+    igual('   nao marca truncado quando a lista acabou sozinha', truncou, false);
+  }
+  {
+    // Teto silencioso se leria como "varri tudo e nao achei nada" — exatamente o engano anterior.
+    limpar();
+    const cheia = Array.from({ length: 10 }, (_, k) => ({ id: k, type: { id: moskitIds.ATIVIDADE_TIPO.reuniao } }));
+    rede.get = () => ({ status: 200, data: cheia, headers: {} });
+    const { atividades, truncou } = await listarAtividadesMoskit(3);
+    igual('teto de paginas respeitado', de('GET', '/activities').length, 3);
+    igual('   e devolve o que deu tempo de varrer', atividades.length, 30);
+    checar('   sinalizando que a varredura foi truncada', truncou === true, truncou);
+  }
+  {
+    limpar();
+    rede.get = () => ({ status: 500, data: null, headers: {} });
+    const r = await listarAtividadesMoskit();
+    igual('erro na primeira pagina → devolve lista vazia, nao lanca', r.atividades.length, 0);
+  }
+
+  // ============================================================
+  // A consulta tem que existir nas DUAS agendas. Ate 12/08/2026 o bot so criava o evento no Google e
+  // uma nota no negocio: quem trabalha dentro do Moskit nao via consulta nenhuma na agenda do CRM.
+  console.log('\n=== handleAgendamentoCalendar: a consulta na agenda do Moskit ===');
+  {
+    limpar();
+    const row = semear(CHAT, { deal_id: 20 });
+    await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, true, row, CONFIRMADO);
+
+    igual('dupla confirmacao → 1 atividade criada no Moskit', atividadesCriadas().length, 1);
+    const corpo = atividadesCriadas()[0]?.corpo || {};
+    igual('   vinculada ao deal', corpo.deals?.[0]?.id, 20);
+    igual('   tipo Videoconferencia (consulta online)', corpo.type?.id, moskitIds.ATIVIDADE_TIPO.videoconferencia);
+    igual('   responsavel e o usuario do bot', corpo.responsible?.id, moskitIds.LAYLA_USER_ID);
+    igual('   titulo igual ao do evento do Google', corpo.title, agenda.insert[0].requestBody.summary);
+    // O ponto mais facil de errar em silencio: o horario combinado e hora LOCAL do escritorio, e o
+    // Moskit guarda instante absoluto. 17:30 em Fortaleza (UTC-3) = 20:30Z.
+    igual('   dueDate e o instante absoluto do horario confirmado', corpo.dueDate, '2026-08-05T20:30:00.000Z');
+    igual('   duracao de 1h, igual a do evento', corpo.duration, 60);
+
+    igual('   banco: atividade_moskit_id guardado', linha(CHAT).atividade_moskit_id, ID_ATIVIDADE);
+
+    // A REGRESSAO QUE IMPORTA: sincronizarAtividadesMoskit cria um evento no Google para toda
+    // atividade de consulta futura que nao esteja nessa tabela. Sem esta linha, o proprio bot criaria
+    // um SEGUNDO evento para a mesma consulta no ciclo seguinte (a cada SYNC_INTERVAL_MS).
+    const marca = sincronizada(ID_ATIVIDADE);
+    checar('   atividade ja entra marcada como sincronizada (trava anti-evento-duplicado)', !!marca);
+    igual('   apontando para o evento que o bot acabou de criar', marca?.evento_calendar_id, 'ev1');
+    igual('   e para o deal', marca?.deal_id, 20);
+
+    checar('   a nota do negocio avisa que entrou na agenda do Moskit',
+      notas()[0]?.corpo.description.includes('agenda do Moskit'));
+  }
+  {
+    limpar();
+    const row = semear(CHAT, { deal_id: 20 });
+    await handleAgendamentoCalendar(20, { ...DADOS, modalidade_consulta: 'presencial' }, CHAT, true, row, CONFIRMADO);
+    // Precisa concordar com o evento do Google, que nesse caso nasce sem Meet: consulta presencial
+    // marcada como Videoconferencia manda a equipe procurar um link que nao existe.
+    igual('presencial → tipo Reuniao', atividadesCriadas()[0]?.corpo.type?.id, moskitIds.ATIVIDADE_TIPO.reuniao);
+    checar('   e a nota da atividade nao promete link de Meet', !atividadesCriadas()[0]?.corpo.notes.includes('Meet'));
+  }
+  {
+    limpar();
+    const row = semear(CHAT, { deal_id: 20 });
+    await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, true, row, SO_CLIENTE);
+    igual('sem dupla confirmacao → NENHUMA atividade no Moskit', atividadesCriadas().length, 0);
+  }
+  {
+    // Idempotencia: o ramo "evento ja existe" roda em todo ciclo enquanto a confirmacao valer.
+    limpar();
+    const row = semear(CHAT, {
+      deal_id: 20, evento_calendar_criado: 1, evento_calendar_id: 'ev1',
+      evento_calendar_data: '2026-08-05T17:30:00', atividade_moskit_id: ID_ATIVIDADE,
+    });
+    await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, true, row, CONFIRMADO);
+    igual('conversa que ja tem atividade → nao cria outra', atividadesCriadas().length, 0);
+    igual('   e nao remarca (horario nao mudou)', atividadesRemarcadas().length, 0);
+  }
+  {
+    limpar();
+    const novoHorario = '2026-08-06T10:00:00';
+    // Corpo que o GET da atividade devolve — o PUT tem que reenviar isto inteiro (ver assercao
+    // abaixo). Os outros GETs (deal, em moverEstagioSeAvancar) seguem no dublê padrão.
+    const ATIVIDADE_NO_CRM = {
+      id: ID_ATIVIDADE, title: 'Consulta — Fulano de Tal (Bruno)', type: { id: moskitIds.ATIVIDADE_TIPO.videoconferencia },
+      dueDate: '2026-08-05T20:30:00.000Z', duration: 60, deals: [{ id: 20 }], responsible: { id: moskitIds.LAYLA_USER_ID },
+    };
+    rede.get = (url) => ({ status: 200, data: url.includes('/activities/') ? ATIVIDADE_NO_CRM : { stage: { id: 179388 } } });
+    const row = semear(CHAT, {
+      deal_id: 20, evento_calendar_criado: 1, evento_calendar_id: 'ev1',
+      evento_calendar_data: '2026-08-05T17:30:00', atividade_moskit_id: ID_ATIVIDADE,
+    });
+    await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, true, row, { ...CONFIRMADO, horarioIso: novoHorario });
+    igual('remarcacao → 1 PUT na atividade', atividadesRemarcadas().length, 1);
+    checar('   na atividade certa', atividadesRemarcadas()[0].url.endsWith(`/activities/${ID_ATIVIDADE}`), atividadesRemarcadas()[0].url);
+    // MEDIDO em 12/08/2026 contra a API real: `/activities` tem a mesma peculiaridade do PUT de deal
+    // — `{dueDate}` sozinho volta 422. Sem reenviar o corpo do GET, NENHUMA remarcacao chega ao CRM.
+    igual('   le a atividade antes de escrever', de('GET', `/activities/${ID_ATIVIDADE}`).length, 1);
+    checar('   e o PUT reenvia o corpo do GET (payload minimo volta 422 na API real)',
+      atividadesRemarcadas()[0].corpo.title === ATIVIDADE_NO_CRM.title
+      && atividadesRemarcadas()[0].corpo.type?.id === ATIVIDADE_NO_CRM.type.id
+      && atividadesRemarcadas()[0].corpo.duration === 60,
+      atividadesRemarcadas()[0].corpo);
+    // 10:00 em Fortaleza = 13:00Z. As duas agendas movem juntas; se so o Google mover, a agenda do
+    // CRM continua mostrando o horario velho — que parece certo e esta errado.
+    igual('   com o novo horario como instante absoluto', atividadesRemarcadas()[0].corpo.dueDate, '2026-08-06T13:00:00.000Z');
+    checar('   e a nota avisa que a agenda do Moskit acompanhou',
+      notas()[0]?.corpo.description.includes('Agenda do Moskit'));
+  }
+  {
+    // Conversa agendada antes desta versao: tem evento no Google mas nunca teve atividade. Nao ha o
+    // que remarcar no CRM, e isso nao pode impedir a remarcacao no Google.
+    limpar();
+    const row = semear(CHAT, {
+      deal_id: 20, evento_calendar_criado: 1, evento_calendar_id: 'ev1',
+      evento_calendar_data: '2026-08-05T17:30:00',
+    });
+    await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, true, row, { ...CONFIRMADO, horarioIso: '2026-08-06T10:00:00' });
+    igual('conversa legada sem atividade → nenhum PUT em /activities', atividadesRemarcadas().length, 0);
+    igual('   mas o evento do Google e remarcado normalmente', agenda.patch.filter((p) => p.requestBody?.start).length, 1);
+  }
+  {
+    // Falha na agenda do CRM nao pode derrubar o resto do agendamento: o evento no Google ja existe e
+    // o contrato/estagio dependem de o fluxo continuar.
+    limpar();
+    rede.post = (url) => {
+      if (url.includes('/activities')) throw new Error('Moskit fora do ar');
+      return { status: 200, data: {} };
+    };
+    const row = semear(CHAT, { deal_id: 20 });
+    await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, true, row, CONFIRMADO);
+    igual('POST /activities falhou → o evento do Google foi criado assim mesmo', agenda.insert.length, 1);
+    igual('   banco: atividade_moskit_id fica nulo (proximo ciclo nao tenta de novo, ver nota)', linha(CHAT).atividade_moskit_id, null);
+    checar('   uma nota avisa que a consulta NAO entrou na agenda do Moskit',
+      notas().some((n) => n.corpo.description.includes('NAO entrou na agenda do Moskit')));
+    checar('   e nenhuma atividade fica marcada como sincronizada', !sincronizada(ID_ATIVIDADE));
+  }
+  {
+    // 2xx sem id e tao inutil quanto um erro: sem id nao da pra remarcar nem pra travar o duplicado.
+    limpar();
+    rede.post = (url) => ({ status: 200, data: url.includes('/activities') ? {} : {} });
+    const row = semear(CHAT, { deal_id: 20 });
+    await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, true, row, CONFIRMADO);
+    igual('POST /activities 200 sem id → tratado como falha', linha(CHAT).atividade_moskit_id, null);
+    checar('   com aviso no negocio', notas().some((n) => n.corpo.description.includes('NAO entrou na agenda do Moskit')));
   }
 
   // "consulta_agendada" ficou orfa desde que foi mapeada em MOSKIT_STAGE_MAP: nada disparava o
