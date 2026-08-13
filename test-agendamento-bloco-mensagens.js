@@ -64,6 +64,15 @@ igual('null', horarioTemHoraDefinida(null), false);
 igual('string vazia', horarioTemHoraDefinida(''), false);
 igual('data invalida', horarioTemHoraDefinida('nao-e-data'), false);
 
+// Le a hora da propria STRING, sem Date: getHours() devolvia a hora do fuso do PROCESSO, e a VPS roda
+// em UTC. Com um ISO que traga "Z" o resultado mudava conforme o servidor — "2026-08-10T00:00:00Z" era
+// recusado numa VPS em UTC (meia-noite) e aceito em America/Fortaleza (21:00 do dia anterior). Estes
+// dois casos passam a valer igual nos dois fusos, e a suite roda em UTC (ver rodar-testes.js).
+igual('meia-noite com Z e recusada tambem (nao depende do fuso do processo)', horarioTemHoraDefinida('2026-08-10T00:00:00Z'), false);
+igual('hora com Z e lida da string, nao convertida', horarioTemHoraDefinida('2026-08-10T14:00:00Z'), true);
+igual('meia-noite sem os segundos', horarioTemHoraDefinida('2026-08-10T00:00'), false);
+igual('so o dia, sem hora nenhuma', horarioTemHoraDefinida('2026-08-10'), false);
+
 // ============================================================
 console.log('\n=== descreverPendencia ===');
 

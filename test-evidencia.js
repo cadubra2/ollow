@@ -2,7 +2,15 @@
 //   node test-evidencia.js
 // Cobrem o nucleo que decide agendamento e cobranca: validacao de evidencia e deteccao do bloco.
 
-const { validarObservacoes, ultimaObservacao, conferirTrecho } = require('./src/evidencia');
+const {
+  validarObservacoes,
+  ultimaObservacao,
+  conferirTrecho,
+  motivoHorarioImplausivel,
+  normalizarHorarioNaive,
+  instanteParaNaiveLocal,
+  corrigirDataRelativa,
+} = require('./src/evidencia');
 const {
   BLOCO_CONDICOES_PAGA,
   detectarBlocoCondicoes,
@@ -532,6 +540,179 @@ console.log('\n=== cliente_descreveu_caso / equipe_descreveu_caso ===');
     const { validas } = so([{ tipo: 'cliente_descreveu_caso', msg_idx: 2, trecho: 'remocao por motivo de saude' }]);
     checar('ultimaObservacao encontra a evidencia do caso', !!ultimaObservacao(validas, 'cliente_descreveu_caso'));
     checar('nao inventa evidencia da equipe a partir dela', !ultimaObservacao(validas, 'equipe_descreveu_caso'));
+  }
+}
+
+// ------------------------------------------------------------
+// Rede deterministica contra o horario que o modelo NAO derivou da conversa.
+//
+// Todos os valores abaixo saem de producao (medido em 13/08/2026): de 32 conversas com horario
+// registrado, 5 gravaram como horario da consulta o timestamp exato de uma mensagem, e 3 viraram
+// reuniao real na agenda em horario que ninguem combinou.
+console.log('\n=== Horario implausivel (eco da data-ancora, formato, janela) ===');
+{
+  const ANCORA = '2026-08-10T18:54:58.000Z'; // ultima mensagem da conversa do deal 48370184 ("Disponha!")
+  const DIA_ANCORA = '2026-08-10';
+  const rejeita = (nome, valor) => checar(nome, !!motivoHorarioImplausivel(valor, ANCORA, DIA_ANCORA), motivoHorarioImplausivel(valor, ANCORA, DIA_ANCORA));
+  const aceita = (nome, valor) => checar(nome, !motivoHorarioImplausivel(valor, ANCORA, DIA_ANCORA), motivoHorarioImplausivel(valor, ANCORA, DIA_ANCORA));
+
+  aceita('horario combinado de verdade (11/08 09:00, deal 48370184)', '2026-08-11T09:00:00');
+  aceita('sem os segundos tambem vale', '2026-08-05T17:30');
+  aceita('07:00 e 20:00 sao os limites da janela, inclusive', '2026-08-11T07:00:00');
+  aceita('20:30 ainda esta na janela (limite e por hora)', '2026-08-11T20:30:00');
+  aceita('consulta que ja passou, com a conversa seguindo depois dela', '2026-08-08T14:00:00');
+
+  rejeita('eco da ancora como veio, com Z (deal 48407621)', '2026-08-07T20:19:05.000Z');
+  rejeita('eco da ancora sem o Z, mas com os segundos', '2026-08-10T18:54:58');
+  rejeita('eco lido pela hora UTC crua da ancora', '2026-08-10T18:54:00');
+  rejeita('eco lido pela hora do escritorio da ancora', '2026-08-10T15:54:00');
+  rejeita('com offset embutido (deal 48346871)', '2026-08-07T09:00:00-03:00');
+  rejeita('com milissegundos', '2026-08-11T09:00:00.000');
+  rejeita('segundos diferentes de 00 (consulta nao comeca em :58)', '2026-08-11T09:00:58');
+  rejeita('3 da manha', '2026-08-11T03:00:00');
+  rejeita('21h, fora do atendimento', '2026-08-11T21:00:00');
+  rejeita('ano errado (regra do prompt sem rede em codigo, ate agora)', '2025-08-11T09:00:00');
+  rejeita('texto que nao e data', 'amanha de tarde');
+
+  // O motivo e nomeado porque vai pra nota no CRM e pro Telegram. Cada checagem tem a sua mensagem, e
+  // a ordem importa: formato primeiro (pega o valor com Z), depois janela, depois eco. Aqui o valor
+  // passa no formato de proposito, pra exercitar a mensagem do ECO e nao a do formato.
+  checar('o motivo do eco diz que o modelo copiou a ancora',
+    /copiou a data-ancora/.test(motivoHorarioImplausivel('2026-08-10T15:54:00', ANCORA, DIA_ANCORA) || ''),
+    motivoHorarioImplausivel('2026-08-10T15:54:00', ANCORA, DIA_ANCORA));
+  checar('o motivo do formato diz o que era esperado',
+    /esperado AAAA-MM-DDTHH:MM:00/.test(motivoHorarioImplausivel('2026-08-10T18:54:58.000Z', ANCORA, DIA_ANCORA) || ''),
+    motivoHorarioImplausivel('2026-08-10T18:54:58.000Z', ANCORA, DIA_ANCORA));
+
+  // Canonizacao: o pipeline compara horario por igualdade de STRING (evento_calendar_data em
+  // atualizarEventoSeRemarcado), entao "17:30" e "17:30:00" nao podem parecer horarios diferentes.
+  checar('normalizarHorarioNaive canoniza sem os segundos', normalizarHorarioNaive('2026-08-05T17:30') === '2026-08-05T17:30:00');
+  checar('normalizarHorarioNaive e idempotente', normalizarHorarioNaive('2026-08-05T17:30:00') === '2026-08-05T17:30:00');
+  checar('normalizarHorarioNaive recusa Z', normalizarHorarioNaive('2026-08-05T17:30:00Z') === null);
+  checar('normalizarHorarioNaive recusa hora impossivel', normalizarHorarioNaive('2026-08-05T99:30:00') === null);
+
+  // instanteParaNaiveLocal converte pelo Intl, nao por getHours(): a VPS roda em UTC.
+  checar('instanteParaNaiveLocal traz o instante pra hora do escritorio',
+    instanteParaNaiveLocal('2026-08-10T18:54:58.000Z') === '2026-08-10T15:54',
+    instanteParaNaiveLocal('2026-08-10T18:54:58.000Z'));
+  checar('e vira o DIA pra tras quando precisa (01:00Z = 22:00 do dia anterior)',
+    instanteParaNaiveLocal('2026-08-07T01:00:00.000Z') === '2026-08-06T22:00',
+    instanteParaNaiveLocal('2026-08-07T01:00:00.000Z'));
+}
+
+{
+  // A observacao continua VALIDA (o fato citado aconteceu); so o horario cai pra null, e o motivo fica
+  // registrado pra virar nota + Telegram em vez de reuniao no horario errado.
+  const conversaEco = [
+    /* 0 */ { role: 'equipe', text: 'Podemos marcar na quarta as 17:30?', timestamp: '2026-08-10T18:00:00.000Z' },
+    /* 1 */ { role: 'cliente', text: 'pode ser', timestamp: '2026-08-10T18:54:58.000Z' },
+  ];
+  const { validas } = validarObservacoes([
+    { tipo: 'cliente_aceitou_horario', msg_idx: 1, trecho: 'pode ser', horario_iso: '2026-08-10T18:54:58.000Z' },
+  ], conversaEco);
+  checar('observacao com eco continua valida', validas.length === 1, validas);
+  checar('   mas sem horario, entao nao serve de perna de confirmacao', validas[0]?.horario_iso === null, validas[0]);
+  checar('   e o motivo fica anotado na observacao', !!validas[0]?._horarioImplausivel, validas[0]);
+  checar('   apuracao nao confirma nada com ela', apurarDuplaConfirmacao(validas).confirmado === false);
+}
+
+{
+  // Regressao achada no replay do deal 47543238 contra a OpenAI real: o modelo devolveu
+  // "2026-08-05T17:11:00" (17:11 = hora de envio da ultima mensagem, no fuso do escritorio) nas tres
+  // observacoes. A que citava "Pode ser amanha, na quarta" tinha a DATA reescrita por
+  // corrigirDataRelativa antes da checagem de eco, deixava de bater com a ancora, e entrava na apuracao
+  // como horario combinado — levando 17:11 pra dentro da reuniao. Eco nao se corrige, se descarta.
+  const ANCORA = '2026-08-05T20:11:40.000Z'; // = 17:11 em America/Fortaleza
+  const conversa47543238 = [
+    /* 0 */ { role: 'equipe', text: 'Pode ser amanha, na quarta, pela manha', timestamp: '2026-07-28T20:04:22.000Z' },
+    /* 1 */ { role: 'cliente', text: 'Sim', timestamp: '2026-07-28T20:05:00.000Z' },
+    /* 2 */ { role: 'equipe', text: 'Perfeito, esta marcado', timestamp: ANCORA },
+  ];
+  const { validas } = validarObservacoes([
+    { tipo: 'equipe_propos_horario', msg_idx: 0, trecho: 'Pode ser amanha, na quarta, pela manha', horario_iso: '2026-08-05T17:11:00' },
+    { tipo: 'cliente_aceitou_horario', msg_idx: 1, trecho: 'Sim', horario_iso: '2026-08-05T17:11:00' },
+    { tipo: 'equipe_confirmou_horario', msg_idx: 2, trecho: 'Perfeito, esta marcado', horario_iso: '2026-08-05T17:11:00' },
+  ], conversa47543238);
+
+  const proposta = validas.find((o) => o.tipo === 'equipe_propos_horario');
+  checar('eco com "amanha" no trecho NAO escapa pela correcao de dia relativo', proposta?.horario_iso === null, proposta);
+  checar('   e o motivo registrado e o do eco', /copiou a data-ancora/.test(proposta?._horarioImplausivel?.motivo || ''), proposta?._horarioImplausivel);
+  checar('   nenhuma das tres observacoes fica com horario', validas.every((o) => o.horario_iso === null), validas.map((o) => o.horario_iso));
+  checar('   entao a apuracao nao agenda nada', apurarDuplaConfirmacao(validas).confirmado === false);
+
+  // O relogio da ancora em outro DIA tambem e eco: 1 em 1440 de ser coincidencia, e o eco produz isso
+  // sempre. Ja um horario de slot no mesmo dia continua valendo.
+  checar('mesmo relogio da ancora em outro dia e eco', !!motivoHorarioImplausivel('2026-08-12T17:11:00', ANCORA, '2026-08-05'));
+  checar('horario de slot legitimo passa', !motivoHorarioImplausivel('2026-08-06T09:30:00', ANCORA, '2026-08-05'),
+    motivoHorarioImplausivel('2026-08-06T09:30:00', ANCORA, '2026-08-05'));
+}
+
+{
+  // Regressao do deal 47543238, a que fez o cliente esperar sozinho na sala em 04/08.
+  // O modelo deu o MESMO horario as tres observacoes. A proposta, de 28/07, citava "amanha" e foi
+  // corrigida pra 29/07. A confirmacao da equipe e de 03/08 — e o aceite da REMARCACAO — mas herdou
+  // 29/07 pela propagacao "mesmo valor bruto = mesmo compromisso". A apuracao fechava no horario
+  // ANTIGO, igual ao que ja estava no Google, entao a remarcacao nunca acontecia. Confirmacao de 03/08
+  // nao pode ser sobre 29/07.
+  const conversa = [
+    /* 0 */ { role: 'equipe', text: 'Pode ser amanha, na quarta, pela manha', timestamp: '2026-07-28T20:04:22.000Z' },
+    /* 1 */ { role: 'cliente', text: 'Sim', timestamp: '2026-07-28T20:15:34.000Z' },
+    /* 2 */ { role: 'equipe', text: 'Perfeito, esta marcado', timestamp: '2026-08-03T11:58:19.000Z' },
+  ];
+  const { validas } = validarObservacoes([
+    { tipo: 'equipe_propos_horario', msg_idx: 0, trecho: 'Pode ser amanha, na quarta, pela manha', horario_iso: '2026-08-20T09:30:00' },
+    { tipo: 'cliente_aceitou_horario', msg_idx: 1, trecho: 'Sim', horario_iso: '2026-08-20T09:30:00' },
+    { tipo: 'equipe_confirmou_horario', msg_idx: 2, trecho: 'Perfeito, esta marcado', horario_iso: '2026-08-20T09:30:00' },
+  ], conversa);
+
+  const proposta = validas.find((o) => o.msg_idx === 0);
+  const confirmacao = validas.find((o) => o.msg_idx === 2);
+  checar('proposta de 28/07 com "amanha" e corrigida pra 29/07', proposta?.horario_iso === '2026-07-29T09:30:00', proposta?.horario_iso);
+  checar('confirmacao de 03/08 NAO herda o 29/07 da proposta', confirmacao?.horario_iso === null, confirmacao?.horario_iso);
+  checar('   e o motivo da recusa fica registrado', !!confirmacao?._propagacaoRecusada, confirmacao);
+  checar('   entao a apuracao nao fecha no horario ANTIGO', apurarDuplaConfirmacao(validas).confirmado === false, apurarDuplaConfirmacao(validas).horarioIso);
+
+  // A propagacao continua funcionando quando ela e legitima (o caso do deal 48346871, mesmo dia):
+  // confirmacao no MESMO dia da proposta herda a correcao normalmente.
+  const mesmoDia = [
+    /* 0 */ { role: 'equipe', text: 'Pode ser amanha as 09h', timestamp: '2026-08-06T13:25:04.664Z' },
+    /* 1 */ { role: 'cliente', text: 'Combinado, iremos amanha', timestamp: '2026-08-06T13:25:52.765Z' },
+    /* 2 */ { role: 'equipe', text: 'Perfeito, esta agendado', timestamp: '2026-08-06T13:27:48.884Z' },
+  ];
+  const r2 = validarObservacoes([
+    { tipo: 'equipe_propos_horario', msg_idx: 0, trecho: 'Pode ser amanha as 09h', horario_iso: '2026-08-06T09:00:00' },
+    { tipo: 'cliente_aceitou_horario', msg_idx: 1, trecho: 'Combinado, iremos amanha', horario_iso: '2026-08-06T09:00:00' },
+    { tipo: 'equipe_confirmou_horario', msg_idx: 2, trecho: 'Perfeito, esta agendado', horario_iso: '2026-08-06T09:00:00' },
+  ], mesmoDia);
+  checar('propagacao legitima segue funcionando (deal 48346871): tudo vai pra 07/08',
+    r2.validas.every((o) => o.horario_iso === '2026-08-07T09:00:00'), r2.validas.map((o) => o.horario_iso));
+  checar('   e a dupla confirmacao fecha no dia certo', apurarDuplaConfirmacao(r2.validas).horarioIso === '2026-08-07T09:00:00', apurarDuplaConfirmacao(r2.validas).horarioIso);
+}
+
+// ------------------------------------------------------------
+// Dia da semana pelo nome: antes so "hoje/amanha/depois de amanha" tinham rede deterministica.
+console.log('\n=== Correcao de dia da semana citado pelo nome ===');
+{
+  // 06/08/2026 = quinta · 07 = sexta · 10 = segunda · 11 = terca · 13 = quinta · 14 = sexta
+  const casos = [
+    ['Pode ser amanha as 09h', '2026-08-06T09:00:00', '2026-08-06T13:25:04.664Z', '2026-08-07T09:00:00', 'amanha resolvido pro dia da propria mensagem (deal 48346871)'],
+    ['Podemos remarcar para segunda as 14:00', '2026-08-07T14:00:00', '2026-08-07T19:35:58.000Z', '2026-08-10T14:00:00', '"segunda" dita numa sexta (deal 48226006)'],
+    ['Terca 16:00 esta disponivel', '2026-08-11T16:00:00', '2026-08-07T11:53:17.000Z', '2026-08-11T16:00:00', 'modelo acertou a terca — nao mexe'],
+    ['podemos na sexta as 10h', '2026-08-14T10:00:00', '2026-08-06T12:00:00.000Z', '2026-08-14T10:00:00', 'sexta da semana seguinte: respeita a SEMANA escolhida pelo modelo'],
+    ['podemos na sexta as 10h', '2026-08-06T10:00:00', '2026-08-06T12:00:00.000Z', '2026-08-07T10:00:00', 'resolveu numa quinta: corrige pra sexta'],
+    ['na quinta as 15h', '2026-08-06T15:00:00', '2026-08-06T12:00:00.000Z', '2026-08-13T15:00:00', 'quinta dita numa quinta = a proxima'],
+    ['hoje, na quinta, as 15h', '2026-08-06T15:00:00', '2026-08-06T12:00:00.000Z', '2026-08-06T15:00:00', '"hoje" tem precedencia sobre o nome do dia'],
+    ['pode ser sabado as 9h', '2026-08-06T09:00:00', '2026-08-06T12:00:00.000Z', '2026-08-08T09:00:00', 'sabado'],
+    ['pode ser terca feira as 9h', '2026-08-06T09:00:00', '2026-08-06T12:00:00.000Z', '2026-08-11T09:00:00', '"terca feira" (o acento ja foi normalizado antes)'],
+    ['as 15h, sem dizer o dia', '2026-08-06T15:00:00', '2026-08-06T12:00:00.000Z', '2026-08-06T15:00:00', 'sem dia citado: nao mexe'],
+    // Em portugues o nome do dia tambem e ordinal. Sem esta guarda, "segunda via" movia a consulta.
+    ['vou mandar a segunda via do documento', '2026-08-11T10:00:00', '2026-08-07T12:00:00.000Z', '2026-08-11T10:00:00', '"segunda via" NAO e segunda-feira'],
+    ['pago na segunda parcela', '2026-08-11T10:00:00', '2026-08-07T12:00:00.000Z', '2026-08-11T10:00:00', '"segunda parcela" NAO e segunda-feira'],
+    ['fica pra segunda-feira as 9h', '2026-08-07T09:00:00', '2026-08-07T12:00:00.000Z', '2026-08-10T09:00:00', '"segunda-feira" explicito continua funcionando'],
+  ];
+  for (const [trecho, iso, ts, esperado, nome] of casos) {
+    const obtido = corrigirDataRelativa(trecho, iso, ts);
+    checar(nome, obtido === esperado, obtido);
   }
 }
 

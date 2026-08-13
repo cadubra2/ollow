@@ -23,12 +23,20 @@ npm run test:ia          # chama a OpenAI de verdade (test-dupla-confirmacao.js)
 node test-telefone.js    # roda um arquivo de teste isolado (mesmo padrão para os demais test-*.js)
 ```
 
-`npm test` executa em sequência: `test-telefone.js`, `test-moskit-ids.js`, `test-atividade-moskit.js`, `test-evidencia.js`,
+`npm test` roda `rodar-testes.js`, que executa em sequência (parando no primeiro que falhar):
+`test-telefone.js`, `test-moskit-ids.js`, `test-atividade-moskit.js`, `test-evidencia.js`,
 `test-fila.js`, `test-payload.js`, `test-rotas.js`, `test-pipeline.js`, `test-agenda-dry-run.js`,
-`test-guards-internos.js`,
-`test-agendamento-bloco-mensagens.js`, `test-transcricao.js`. Todos usam `DB_PATH` apontando para
-um arquivo inexistente (banco descartável) — **nunca** deixe um teste abrir `conversations.db` de
-produção.
+`test-guards-internos.js`, `test-agendamento-bloco-mensagens.js`, `test-transcricao.js`,
+`test-zapsign.js`. Todos usam `DB_PATH` apontando para um arquivo inexistente (banco descartável) —
+**nunca** deixe um teste abrir `conversations.db` de produção.
+
+**A suíte roda com `TZ=UTC`, o fuso da VPS** — é isso que o `rodar-testes.js` existe para garantir.
+Antes ela rodava no fuso de quem executava, que na máquina de dev é `America/Fortaleza`, o *mesmo* do
+escritório: todo bug de fuso passava batido porque o relógio do teste e o relógio esperado eram o
+mesmo. Para investigar um caso específico, `TZ_TESTES=America/Fortaleza npm test` troca o fuso; rodar
+um arquivo isolado (`node test-pipeline.js`) usa o fuso do sistema, então prefira o `npm test` antes
+de commitar. A suíte passa em UTC, `America/Fortaleza`, `Asia/Tokyo`, `America/Los_Angeles` e
+`Pacific/Kiritimati` — se um teste novo só passa num fuso, ele encontrou um bug de verdade.
 
 ### Scripts manuais — NUNCA rodar automaticamente/em CI
 
@@ -53,6 +61,19 @@ Escrevem em dados reais de produção (Moskit e/ou banco real):
   escreve em produção, então não é `npm test`.
 - `GET /auditoria-classificacao?aplicar=1` — escreve nos deals reais (corrige a classificação). Em
   dry-run (sem `aplicar`) é só leitura e pode rodar à vontade.
+- `varrer-agenda-horarios.js [inicio] [fim]` — varre o Google Agenda, as atividades do Moskit e o
+  `conversations.db` de produção em busca de consulta em horário errado. **Só leitura, sem `--aplicar`
+  nenhum** (nada foi deixado atrás de um `if`), mas lê três produções ao mesmo tempo, então fica fora
+  do `npm test`. Diferente de `GET /auditoria-agenda`, que parte do banco, este parte da AGENDA — vê o
+  que foi marcado direto no CRM ou na mão, inclusive evento que o banco não conhece (foi assim que
+  apareceram dois casos de horário errado que a rota não enxergava). Para ler o banco de produção de
+  dentro de um worktree, passe `CONVERSATIONS_DB=/caminho/conversations.db`.
+- `replay-dupla-confirmacao.js [dealId...]` — replay de conversa REAL contra a OpenAI (custa créditos),
+  para descobrir por que uma perna da dupla confirmação se perdeu. Mostra as observações que o modelo
+  emitiu, o que foi descartado e por quê, e dá o veredito: regra de prompt, validação, ou horário
+  recusado pela rede determinística (que é o comportamento correto). Só leitura — abre o banco de
+  produção num handle readonly e usa `DB_PATH` descartável para o boot do `index.js`. Foi ele que
+  revelou os dois defeitos descritos em "O eco da data-âncora" e "Propagação de dia corrigido".
 - `test-cenarios-classificacao.js` e `test-simulacao.js` — chamam a OpenAI de verdade mas não têm
   asserção automática de pass/fail; servem para inspeção manual, não regressão.
 - `corrigir-*.js` — scripts pontuais de correção de dados já aplicados (histórico, não reexecutar).
@@ -130,6 +151,13 @@ Tabelas: `conversations` (uma linha por chat/telefone, mensagens em JSON na colu
 `moskit_contacts` (cache de contato por telefone), `comprovantes` (recibos de pagamento verificados
 por IA de visão), `atividades_sincronizadas` (dedupe de sync de atividades do Moskit → Calendar).
 
+- `conversations.agendamento_apuracao` (JSON) guarda a última decisão de dupla confirmação: as
+  observações de horário validadas, as duas pernas escolhidas e o motivo quando não fechou. Existe
+  porque essa decisão só vivia num `console.log` — quando o cliente do deal 47543238 esperou sozinho na
+  sala e o do 48226006 ficou com a reunião no dia velho, não havia como saber, depois do fato, se a
+  perna do cliente não foi emitida pelo modelo ou se foi descartada na validação, e as duas hipóteses
+  levam a correções opostas. É o **estado atual**, uma linha por conversa, não histórico.
+
 - `DB_PATH` (env var) sobrepõe o caminho padrão `conversations.db` — **testes sempre devem setar
   isso** para um arquivo inexistente; senão o `require('./index.js')` do teste abre o banco de
   produção e roda `ALTER TABLE`/writes nele.
@@ -192,6 +220,54 @@ risco de evento duplicado.
   é instante absoluto. A conversão é `horarioNaiveParaInstante` (`src/atividade-moskit.js`), que
   pergunta o offset ao `Intl` em vez de fixar `-03:00`. Errar aqui não quebra nada: só põe a consulta
   três horas fora do lugar na agenda, em silêncio.
+- **O eco da data-âncora, e por que o horário é validado em código.** O maior defeito de horário
+  medido em produção (13/08/2026) não era fuso: era o modelo **copiar a data-âncora**. O prompt
+  entregava `- Data/hora da ultima mensagem desta conversa: 2026-08-10T18:54:58.000Z`, e quando o
+  modelo não conseguia derivar o horário da conversa, devolvia essa string como horário da consulta.
+  De 32 conversas com horário registrado, 5 (16%) gravaram o timestamp de uma mensagem, e 3 viraram
+  reunião real na agenda (deals 48370184, 48407621, 48177138 — uma delas às 15:54:58). Duas defesas:
+  `descreverAncora` (`index.js`) manda a âncora em **texto do escritório** (`"10/08/2026
+  (segunda-feira), 15:54"`), que não se parece com o formato de saída, e `motivoHorarioImplausivel`
+  (`src/evidencia.js`) recusa em código todo horário com `Z`/offset/milissegundos, com segundos ≠ `00`,
+  igual ao horário de envio da última mensagem, fora da janela `HORA_MIN_ATENDIMENTO`–
+  `HORA_MAX_ATENDIMENTO`, ou mais de 7 dias antes da âncora. O motivo é **nomeado** porque vai pra nota
+  no deal e pro Telegram. Regressões em `test-evidencia.js`.
+  **A checagem do eco roda no valor CRU, antes de `corrigirDataRelativa`** (`ehEcoDaAncora`): a correção
+  de dia relativo reescreve a data e faria um timestamp copiado deixar de parecer com a âncora. Medido
+  no replay do deal 47543238, onde o modelo devolveu `17:11:00` (a hora de envio da última mensagem) nas
+  três observações e uma delas escapava por citar "amanhã". Eco não se corrige, se descarta. E o
+  *relógio* da âncora em qualquer dia já conta como eco: consulta cair exatamente no minuto da última
+  mensagem é 1 em 1440, o eco produz isso sempre.
+- **Propagação de dia corrigido não anda pra trás.** `validarObservacoes` propaga a correção de dia
+  para observações que citam o mesmo horário bruto sem repetir "amanhã" (a confirmação "Perfeito, está
+  agendado!"). Só que **"mesmo valor bruto = mesmo compromisso" não vale quando o valor bruto é lixo** —
+  aí todas as observações têm o mesmo valor e o sinal não quer dizer nada. No deal 47543238 a
+  confirmação da equipe de **03/08** (o aceite da remarcação) herdava o 29/07 corrigido de uma proposta
+  de 28/07; a apuração fechava no horário **antigo**, igual ao que já estava no Google, então a
+  remarcação para 04/08 nunca acontecia — e o cliente esperou sozinho na sala. Agora a propagação é
+  recusada quando colocaria a consulta antes do dia da mensagem que a afirma, e o caso vira pendência
+  com aviso. Os dois lados têm regressão em `test-evidencia.js` (o bloqueio e a propagação legítima do
+  deal 48346871).
+- **Nenhuma falha de agendamento em silêncio.** Se a dupla confirmação aconteceu e o evento não
+  existe, isso **sempre** vira nota no deal + Telegram (`registrarErroAgendamento`). Antes,
+  `criarEventoGoogleCalendar` devolvia `null` e o chamador fazia `if (!evento) return`: o horário
+  inválido era descartado e ninguém no escritório sabia que a consulta combinada não tinha ido pra
+  agenda — o sintoma deixou de ser "reunião no horário errado" e passou a ser "reunião que ninguém
+  marcou e ninguém soube", repetindo a cada 5 min só no console. Por isso a função **lança** em vez de
+  devolver `null`. `registrarAgendamentoPendente` também avisa no Telegram, mas só no que é acionável
+  (remarcação travada ou horário recusado pela validação) — pendência de rotina viraria ruído diário.
+- **Dia relativo.** `corrigirDataRelativa` (`src/evidencia.js`) confere em código o dia que o modelo
+  resolveu, contra o timestamp da **própria mensagem** citada: `hoje`/`amanhã`/`depois de amanhã` e
+  também dia da semana pelo nome (`"na sexta"`, `"quarta-feira"`). No dia da semana a correção é
+  conservadora de propósito: se o dia que o modelo escolheu já cai no dia da semana citado, a **semana**
+  dele é respeitada ("sexta" e "sexta que vem" são as duas sextas, e a conversa pode ter dito qual com
+  palavras que o código não lê). Cuidado ao mexer: em português o nome do dia também é ordinal, e
+  `"segunda via"` já foi lido como segunda-feira (tem teste).
+- **Auditoria.** `GET /auditoria-agenda` (só leitura, atrás de `exigeAdmin`) cruza as três fontes de
+  horário de cada consulta — `conversations.evento_calendar_data`, o evento no Google e a Atividade no
+  Moskit — e lista divergências. `?todas=1` inclui consulta passada. Separa `problemas` (a consulta
+  pode estar no horário errado agora) de `observacoes` (contexto): um alerta que dispara em toda linha
+  afoga justamente os casos que importam.
 - **Responsável.** A atividade sai no nome da Layla (`LAYLA_USER_ID`), como todo contato, deal e nota
   criados pelo bot. Não confundir com `advogado_responsavel`, que é campo personalizado do deal.
 - **Botão de emergência.** `AGENDA_MOSKIT_DRY_RUN=true` desliga a escrita na agenda do CRM sem

@@ -60,6 +60,7 @@ const {
   aplicarGateCasoDescrito, deveEsperarCasoDescrito, registrarBriefing, mergeDados,
   mesclarParaCrm, derivarAdvogadoDaArea, detectarOpcoesInvalidas, registrarOpcoesInvalidas,
   reconciliarClassificacao, montarPayloadMoskit,
+  descreverAncora, somarMinutosNaive, formatarHorarioEscritorio,
 } = require('./index');
 const moskitIds = require('./src/moskit-ids');
 const { BLOCO_CONDICOES_PAGA } = require('./src/bloco-condicoes');
@@ -677,15 +678,32 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     igual('   e SEM avanco de estagio (o return no catch impede)', notas().length, 1);
   }
   {
-    // Caminho legitimo de `if (!evento) return`: data invalida faz criarEventoGoogleCalendar devolver
-    // null sem lancar. Nada pode ser gravado.
+    // Horario invalido com dupla confirmacao VALIDA nao pode ser silencioso. Antes era `return null`
+    // mudo e o escritorio nao ficava sabendo: cliente e equipe combinaram, nao existe reuniao, e a
+    // unica pista era uma linha de console repetida a cada ciclo de 5 min. Foi assim que o caso do
+    // deal 48370184 (Arthur) passou batido. Agora lanca, e o catch de handleAgendamentoCalendar vira
+    // nota no deal + Telegram.
     limpar();
     const row = semear(CHAT, { deal_id: 20 });
     const apuracaoRuim = { ...CONFIRMADO, horarioIso: 'amanha de tarde' };
     await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, true, row, apuracaoRuim);
     igual('horario invalido → nenhum evento, sem crash', agenda.insert.length, 0);
     igual('   banco intocado', linha(CHAT).evento_calendar_criado, 0);
-    igual('   nenhuma nota', notas().length, 0);
+    igual('   1 nota de FALHA (a equipe fica sabendo)', notas().filter((n) => n.corpo.description.startsWith('❌')).length, 1);
+    checar('   a nota cita o valor recusado', notas()[0].corpo.description.includes('amanha de tarde'));
+    igual('   e nenhuma nota de sucesso', notas().filter((n) => n.corpo.description.startsWith('📅')).length, 0);
+  }
+  {
+    // Eco da data-ancora: o valor que o modelo copiou da "ultima mensagem desta conversa" e o defeito
+    // que colocou 3 reunioes reais em horario errado (deals 48370184, 48407621, 48177138). Com Z ou
+    // com segundos, nao pode virar evento — e tem que avisar.
+    for (const ruim of ['2026-08-10T18:54:58.000Z', '2026-08-10T18:54:58', '2026-08-07T09:00:00-03:00']) {
+      limpar();
+      const row = semear(CHAT, { deal_id: 20 });
+      await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, true, row, { ...CONFIRMADO, horarioIso: ruim });
+      igual(`eco "${ruim}" → nenhum evento`, agenda.insert.length, 0);
+      igual('   com nota de falha', notas().filter((n) => n.corpo.description.startsWith('❌')).length, 1);
+    }
   }
   {
     limpar();
@@ -1255,6 +1273,37 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     igual('404 entra em deals_apagados', r.deals_apagados.length, 1);
     igual('   e nao em erros', r.erros.length, 0);
     igual('   nenhum PUT', de('PUT', '/deals/70').length, 0);
+  }
+
+  // ============================================================
+  // Funcoes de horario que nunca tiveram teste direto. Todas rodam com TZ=UTC (ver rodar-testes.js),
+  // que e o fuso da VPS — e onde os bugs de fuso aparecem.
+  console.log('\n=== Data-ancora e aritmetica de horario naive ===');
+  {
+    // A ancora vai pro prompt em TEXTO do escritorio, nunca em ISO. Se ela parecer com o formato que o
+    // modelo tem que devolver, ele copia — foi o que colocou 3 reunioes reais no horario errado.
+    const ancora = descreverAncora('2026-08-10T18:54:58.000Z');
+    checar(`ancora nao tem forma de ISO: "${ancora}"`, !/\d{4}-\d{2}-\d{2}T/.test(ancora));
+    checar('   e esta na hora do escritorio (15:54, nao 18:54)', ancora.includes('15:54'), ancora);
+    checar('   com o dia da semana pra resolver dia relativo', ancora.includes('segunda-feira'), ancora);
+    igual('   ancora invalida nao inventa data', descreverAncora('xxx'), '(desconhecida — nao resolva dias relativos)');
+    // Uma mensagem de 22h no escritorio cai no dia SEGUINTE em UTC: e o erro de dia que a tabela de
+    // referencia do prompt herdava quando a ancora ia crua.
+    checar('   01:00Z vira 06/08 22:00 no escritorio, nao 07/08',
+      descreverAncora('2026-08-07T01:00:00.000Z').startsWith('06/08/2026'),
+      descreverAncora('2026-08-07T01:00:00.000Z'));
+
+    // somarMinutosNaive define o FIM do evento. A virada de dia nunca tinha sido exercitada.
+    igual('somarMinutosNaive: 17:30 + 60min', somarMinutosNaive('2026-08-05T17:30:00', 60), '2026-08-05T18:30:00');
+    igual('somarMinutosNaive: 23:30 + 60min vira o dia', somarMinutosNaive('2026-08-05T23:30:00', 60), '2026-08-06T00:30:00');
+    igual('somarMinutosNaive: vira o mes', somarMinutosNaive('2026-08-31T23:30:00', 60), '2026-09-01T00:30:00');
+    igual('somarMinutosNaive: vira o ano', somarMinutosNaive('2026-12-31T23:30:00', 60), '2027-01-01T00:30:00');
+
+
+    // formatarHorarioEscritorio e o que aparece na nota do CRM e no Telegram: trata a string naive
+    // como UTC de proposito ("nao girar de novo"), entao 17:30 tem que sair 17:30 em qualquer fuso.
+    checar('formatarHorarioEscritorio nao gira a hora', formatarHorarioEscritorio('2026-08-05T17:30:00').includes('17:30'), formatarHorarioEscritorio('2026-08-05T17:30:00'));
+    igual('   e devolve null sem horario', formatarHorarioEscritorio(null), null);
   }
 
   db.close();
