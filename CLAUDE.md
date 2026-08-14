@@ -284,10 +284,35 @@ risco de evento duplicado.
   que cria E remarca no mesmo ciclo).
 - **Auditoria.** `GET /auditoria-agenda` (só leitura, atrás de `exigeAdmin`) cruza as três fontes de
   horário de cada consulta — `conversations.evento_calendar_data`, o evento no Google e a Atividade no
-  Moskit — e lista divergências, incluindo esse caso de atividade sem vínculo com o negócio. `?todas=1`
-  inclui consulta passada. Separa `problemas` (a consulta pode estar no horário errado agora, ou a
-  atividade não aparece pro negócio) de `observacoes` (contexto): um alerta que dispara em toda linha
-  afoga justamente os casos que importam.
+  Moskit — e lista divergências, incluindo esse caso de atividade sem vínculo com o negócio e a
+  divergência de perna validada x banco (bullet abaixo). `?todas=1` inclui consulta passada. Separa
+  `problemas` (a consulta pode estar no horário errado agora, ou a atividade não aparece pro negócio)
+  de `observacoes` (contexto): um alerta que dispara em toda linha afoga justamente os casos que
+  importam.
+- **Remarcação perdida quando a equipe propõe horário 2x em sequência, e por que o aviso agora escala
+  por PROXIMIDADE em vez de só por conteúdo.** MEDIDO em 14/08/2026 nos deals 48292471 (Lia) e 48287898
+  (Solange): a equipe propôs um horário novo (a Lia, inclusive duas vezes em sequência rápida, com uma
+  mensagem `[edit]` do WhatsApp entre as duas) e o cliente aceitou claramente — mas o modelo não gerou
+  NENHUMA observação (`equipe_propos_horario`/`cliente_aceitou_horario`) para essas mensagens na
+  rodada que rodou de verdade; só enxergou a confirmação antiga. `validarObservacoes`/
+  `apurarDuplaConfirmacao` processaram corretamente o que receberam — o problema é que receberam menos
+  do que deviam (falha de extração do modelo, não bug de validação). A dupla confirmação corretamente
+  registrou a pendência (`motivo: falta_cliente`) e `registrarAgendamentoPendente` já manda Telegram
+  incondicional quando `remarcacao=true` — mas o dedup por hash (que só olha `horario relatado|motivo`)
+  não tinha como saber que a urgência estava crescendo: a reunião ficou horas presa no horário velho,
+  perto da hora do cliente aparecer, sem nenhum aviso NOVO. `registrarAgendamentoPendente` agora recebe
+  `row` e reforça em duas frentes: (1) **escalada por proximidade** — reenvia o Telegram mesmo com hash
+  igual quando `evento_calendar_data` está dentro de `AGENDAMENTO_URGENCIA_HORAS` (padrão 48h), a
+  garantia que não depende do modelo acertar nada; (2) **enriquecimento por conteúdo** — quando a perna
+  validada (`apuracao.equipe/cliente.horario_iso`) diverge do que já está na agenda (padrão Solange,
+  cuja equipe confirmou "18/08" com trecho limpo mas o banco seguia em "16/08"), cita os dois horários
+  explicitamente e entra no hash de dedup. Camada extra (defesa teórica, não confirmada em incidente
+  real): `handleAgendamentoCalendar` monta `dadosEvento` substituindo `data_hora_consulta` por
+  `apuracao.horarioIso` quando a confirmação fecha — se ela fechar com um par velho mas autoconsistente
+  (já igual ao banco), isso registra a divergência entre o que o modelo entendeu e o que a apuração
+  manteve (`agendamento_divergencia_hash`), mesmo sem Telegram (não é incidente confirmado). Regressão
+  em `test-pipeline.js` (proximidade, divergência de conteúdo e o dedup normal quando nenhum dos dois
+  se aplica).
 - **Responsável.** A atividade sai no nome da Layla (`LAYLA_USER_ID`), como todo contato, deal e nota
   criados pelo bot. Não confundir com `advogado_responsavel`, que é campo personalizado do deal.
 - **Botão de emergência.** `AGENDA_MOSKIT_DRY_RUN=true` desliga a escrita na agenda do CRM sem
