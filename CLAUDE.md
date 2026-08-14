@@ -272,6 +272,16 @@ risco de evento duplicado.
   (GET + PUT com `deals` corrigido, mesmo padrão de `atualizarAtividadeMoskit`) e
   `reconciliarVinculoAtividades`/`rodarReconciliacaoVinculoAtividades` rodam na mesma cadência de
   `RECONCILIACAO_INTERVAL_MS` como rede de segurança para o que escapar da conferência imediata.
+- **Remarcação tem que mover a Atividade também, mesmo quando ela acabou de nascer no mesmo ciclo.**
+  `handleAgendamentoCalendar` recebe `row` como um snapshot lido ANTES do ciclo. Quando o ramo "evento
+  já existia" roda a auto-cura (cria a Atividade que faltava) e, na MESMA rodada, a dupla confirmação
+  também remarca o horário, `atualizarEventoSeRemarcado` — chamado logo em seguida com o mesmo `row`
+  — não enxergava o `atividade_moskit_id` que acabou de ser gravado no banco (o objeto em memória
+  continuava com o valor antigo, nulo), então nunca movia o `dueDate` da Atividade recém-criada: ela
+  ficava presa no horário velho enquanto o Google Agenda já ia para o novo. Por isso, logo após a
+  auto-cura criar a Atividade, o código relê `atividade_moskit_id` do banco e atualiza o `row` em
+  memória antes de chamar `atualizarEventoSeRemarcado`. Regressão em `test-pipeline.js` (o cenário
+  que cria E remarca no mesmo ciclo).
 - **Auditoria.** `GET /auditoria-agenda` (só leitura, atrás de `exigeAdmin`) cruza as três fontes de
   horário de cada consulta — `conversations.evento_calendar_data`, o evento no Google e a Atividade no
   Moskit — e lista divergências, incluindo esse caso de atividade sem vínculo com o negócio. `?todas=1`

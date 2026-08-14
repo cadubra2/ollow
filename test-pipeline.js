@@ -646,17 +646,27 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
       deal_id: 20, evento_calendar_criado: 1, evento_calendar_id: 'ev1',
       evento_calendar_data: '2026-08-05T17:30:00',
     });
+    // Este cenario tambem remarca NO MESMO CICLO em que a auto-cura cria a atividade (evento ja
+    // existia em 2026-08-05, a dupla confirmacao desta rodada fecha em 2026-08-06T10:00:00) — a RACE
+    // medida ao investigar este mesmo fix: `row` e o snapshot lido ANTES do ciclo, entao sem
+    // atualizar row.atividade_moskit_id logo apos a auto-cura criar, atualizarEventoSeRemarcado (que
+    // usa o MESMO `row`) nunca via a atividade recem-nascida e a deixava presa no dia 05, mesmo com o
+    // Google Agenda ja no dia 06.
     await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, true, row, { ...CONFIRMADO, horarioIso: '2026-08-06T10:00:00' });
-    igual('conversa legada sem atividade → nenhum PUT de REMARCACAO em /activities (nao ha dueDate a mover)',
-      atividadesRemarcadas().filter((p) => p.corpo?.dueDate).length, 0);
-    igual('   mas TENTA CRIAR a atividade que falta (auto-cura)', atividadesCriadas().length, 1);
+    igual('   TENTA CRIAR a atividade que falta (auto-cura)', atividadesCriadas().length, 1);
     // A atividade acabou de nascer (deal + atividade quase no mesmo instante) — exatamente o cenario
     // medido em 14/08/2026 (deals 48474073/48464876) em que o Moskit as vezes nao persiste o vinculo
-    // `deals` do POST. garantirVinculoAtividadeDeal confere e religa: 1 GET + 1 PUT (sem dueDate,
-    // so com `deals`), distinto de um PUT de remarcacao.
-    igual('   e confere/religa o vinculo com o deal (GET)', de('GET', `/activities/${ID_ATIVIDADE}`).length, 1);
-    igual('   e (PUT) so com `deals`, sem dueDate', atividadesRemarcadas().length, 1);
-    igual('   o PUT vincula ao deal certo', atividadesRemarcadas()[0]?.corpo?.deals?.[0]?.id, 20);
+    // `deals` do POST. garantirVinculoAtividadeDeal confere e religa: 1o GET + 1o PUT (sem dueDate,
+    // so com `deals`).
+    const putsVinculo = atividadesRemarcadas().filter((p) => !p.corpo?.dueDate);
+    const putsRemarcacao = atividadesRemarcadas().filter((p) => p.corpo?.dueDate);
+    igual('   confere/religa o vinculo com o deal: 1 PUT so com `deals`', putsVinculo.length, 1);
+    igual('     no deal certo', putsVinculo[0]?.corpo?.deals?.[0]?.id, 20);
+    // E, por causa da remarcacao no mesmo ciclo, um 2o PUT move o dueDate da atividade que acabou de
+    // nascer — sem o refresh de row.atividade_moskit_id apos a auto-cura, este PUT nao acontecia e a
+    // atividade ficava presa no horario antigo (05/08) enquanto o Google Agenda ja ia pro dia 06.
+    igual('   E remarca a atividade recem-criada pro novo horario: 1 PUT com dueDate', putsRemarcacao.length, 1);
+    igual('     10:00 em Fortaleza = 13:00Z', putsRemarcacao[0]?.corpo?.dueDate, '2026-08-06T13:00:00.000Z');
     igual('   banco: atividade_moskit_id passa a existir', linha(CHAT).atividade_moskit_id, ID_ATIVIDADE);
     checar('   e entra na trava anti-duplicado', !!sincronizada(ID_ATIVIDADE));
     checar('   com uma nota avisando que a atividade foi criada agora',
