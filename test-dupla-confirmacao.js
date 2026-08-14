@@ -76,6 +76,25 @@ const CENARIOS = [
     ],
     esperaAgendar: false,
   },
+  {
+    // MEDIDO em 14/08/2026 (deal 48292471, Lia): a equipe propos 09:30, depois quase imediatamente
+    // propos 17h no lugar (com uma mensagem de edicao do WhatsApp — "[edit]" — entre as duas), e a
+    // cliente aceitou claramente a segunda. Em producao o modelo nao gerou observacao NENHUMA pra essa
+    // troca — so enxergou a confirmacao antiga. Este cenario e o teste-sinal do ajuste de prompt (ver
+    // "REGRA CRITICA" em PROMPT_EXTRAIR): informativo, nao gate obrigatorio — a garantia de verdade e
+    // o backstop deterministico em registrarAgendamentoPendente (escalada por proximidade), que nao
+    // depende do modelo acertar isto.
+    nome: 'equipe propoe 2x em sequencia rapida (edicao no meio) — cliente aceita a mais recente',
+    mensagens: [
+      msg('cliente', 'Preciso reagendar minha consulta de hoje', 0),
+      msg('equipe', 'Voce consegue participar agora as 09:30?', 5),
+      msg('equipe', '[edit]', 6),
+      msg('equipe', 'Verifiquei com o advogado, podemos ajustar o horario da sua consulta para as 17h?', 8),
+      msg('cliente', 'Sim 17 hs, acho ate melhor', 12),
+      msg('equipe', 'Otimo! Ficou confirmado para as 17h', 15),
+    ],
+    esperaAgendar: true,
+  },
 ];
 
 // Cenarios de cobranca — nao dependem do modelo, sao deterministicos.

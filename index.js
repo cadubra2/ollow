@@ -78,6 +78,14 @@ const FUNIL_FECHAMENTO_DRY_RUN = process.env.FUNIL_FECHAMENTO_DRY_RUN !== 'false
 // aparecer na agenda. Nao "conserte" esta linha para `!== 'false'`: isso desligaria a funcionalidade
 // em producao em silencio (ha teste cobrindo os dois caminhos).
 const AGENDA_MOSKIT_DRY_RUN = process.env.AGENDA_MOSKIT_DRY_RUN === 'true'; // default FALSE
+// Janela de urgencia para reenviar Telegram de pendencia de agendamento MESMO com o hash de dedup
+// repetido — ver registrarAgendamentoPendente. Medido em 14/08/2026 (deals 48292471/48287898): a
+// dupla confirmacao corretamente identificou a pendencia (motivo falta_cliente), mas nenhum campo do
+// modelo carregava o horario novo naquela rodada, entao nao havia CONTEUDO novo pra furar o dedup — a
+// reuniao ja marcada ficou horas presa no horario velho, perto da hora do cliente aparecer, sem
+// nenhum aviso novo. Perto o bastante da reuniao, o aviso tem que repetir mesmo sem conteudo novo:
+// a PROXIMIDADE e o sinal de urgencia, nao depende do modelo acertar nada.
+const AGENDAMENTO_URGENCIA_HORAS = Number(process.env.AGENDAMENTO_URGENCIA_HORAS) || 48;
 // Cria evento/Meet sem comprovante quando o deal esta marcado como "consulta gratis" no Moskit.
 // Default DESLIGADO de proposito: sobe o codigo, roda GET /auditoria-consulta-gratis pra ver o que
 // seria liberado, e so entao liga no .env.
@@ -285,6 +293,12 @@ try { db.exec("ALTER TABLE conversations ADD COLUMN agendamento_apuracao TEXT");
 // campo apenas nao era enviado e ninguem no escritorio ficava sabendo — e um valor recorrente ("Direito
 // Civil") continuava caindo no vazio indefinidamente em vez de virar apelido em src/moskit-ids.js.
 try { db.exec("ALTER TABLE conversations ADD COLUMN opcao_invalida_hash TEXT"); } catch {}
+// Hash da ultima divergencia (bruta, nao aplicada) entre o `data_hora_consulta` que o modelo devolveu
+// nesta rodada e o `dadosEvento.data_hora_consulta` que a apuracao efetivamente manteve — sinal de que
+// a apuracao fechou com um valor diferente do que o proprio modelo entendeu. Coluna PROPOSITALMENTE
+// separada de agendamento_pendente_hash/agendamento_erro_hash: sao avisos com ciclo de vida diferente
+// (aquelas zeram quando o evento e criado/remarcado; esta e so um log de auditoria, nao depende disso).
+try { db.exec("ALTER TABLE conversations ADD COLUMN agendamento_divergencia_hash TEXT"); } catch {}
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_contrato_zapsign_doc_token ON conversations(contrato_zapsign_doc_token)"); } catch {}
 
 db.exec(`
@@ -1895,6 +1909,27 @@ async function handleAgendamentoCalendar(dealId, dados, chatId, pagamentoVerific
     ? { ...dados, data_hora_consulta: apuracao.horarioIso }
     : dados;
 
+  // Camada de defesa teorica (nao confirmada em incidente real, achada revisando o codigo em
+  // 14/08/2026): quando podeAgendar e true, o override acima DESCARTA o `data_hora_consulta` bruto
+  // que o modelo devolveu nesta rodada em favor de `apuracao.horarioIso` — se a apuracao fechar com
+  // um par ANTIGO mas autoconsistente (ja igual ao que esta no banco), `atualizarEventoSeRemarcado`
+  // faz um `return` silencioso (`row.evento_calendar_data === novoInicioNaive`) sem instrumentacao
+  // nenhuma. So registra (nota + hash proprio, sem Telegram — e defesa, nao incidente confirmado)
+  // quando ja existe reuniao marcada e os dois valores discordam.
+  if (row?.evento_calendar_criado && podeAgendar) {
+    const brutoNaive = normalizarHorarioNaive(dados?.data_hora_consulta);
+    const efetivoNaive = normalizarHorarioNaive(dadosEvento?.data_hora_consulta);
+    if (brutoNaive && efetivoNaive && brutoNaive !== efetivoNaive) {
+      const hash = `${brutoNaive}|${efetivoNaive}`;
+      const atual = db.prepare('SELECT agendamento_divergencia_hash FROM conversations WHERE chat_id = ?').get(chatId);
+      if (atual?.agendamento_divergencia_hash !== hash) {
+        console.log(`  ⚠️ deal ${dealId}: apuracao fechou em ${efetivoNaive} mas o modelo devolveu ${brutoNaive} nesta rodada — divergencia registrada`);
+        await criarNotaMoskit(dealId, `⚠️ A dupla confirmação fechou em ${formatarHorarioEscritorio(efetivoNaive)}, mas a IA havia entendido ${formatarHorarioEscritorio(brutoNaive)} nesta rodada — vale conferir a conversa manualmente.`).catch(() => {});
+        db.prepare('UPDATE conversations SET agendamento_divergencia_hash = ? WHERE chat_id = ?').run(hash, chatId);
+      }
+    }
+  }
+
   if (row?.evento_calendar_criado) {
     if (!row?.evento_calendar_id) {
       console.log(`  ⚠️ Chat ${chatId} ja tem evento_calendar_criado=1 mas sem evento_calendar_id salvo (conversa anterior a essa correcao) — nao da pra atualizar automaticamente, revisar manualmente se precisar remarcar`);
@@ -1941,7 +1976,7 @@ async function handleAgendamentoCalendar(dealId, dados, chatId, pagamentoVerific
       // "nao remarcada" a cada ciclo, mesmo quando ninguem falou de horario nenhum.
       if (apuracao?.cliente || apuracao?.equipe) {
         console.log(`  ⏭️ deal ${dealId}: reuniao NAO remarcada — ${descreverPendencia(apuracao)}`);
-        await registrarAgendamentoPendente(dealId, chatId, apuracao, true);
+        await registrarAgendamentoPendente(dealId, chatId, apuracao, true, row);
       }
       return;
     }
@@ -1963,7 +1998,7 @@ async function handleAgendamentoCalendar(dealId, dados, chatId, pagamentoVerific
     // nao e "pendencia", e so uma conversa em andamento.
     if (apuracao?.cliente || apuracao?.equipe || dados.data_hora_consulta) {
       console.log(`  ⏭️ deal ${dealId}: evento NAO criado — ${descreverPendencia(apuracao || { motivo: 'falta_ambos' })}`);
-      await registrarAgendamentoPendente(dealId, chatId, apuracao, false);
+      await registrarAgendamentoPendente(dealId, chatId, apuracao, false, row);
     }
     return;
   }
@@ -2118,17 +2153,45 @@ async function registrarErroContrato(dealId, chatId, mensagemErro) {
 
 // Nota no deal quando ha horario em jogo mas o agendamento esta travado. O hash evita repetir a mesma
 // nota a cada ciclo de 5 min enquanto a situacao nao muda.
-async function registrarAgendamentoPendente(dealId, chatId, apuracao, remarcacao) {
+//
+// MEDIDO em 14/08/2026 (deals 48292471/48287898): a apuracao ja identificava a pendencia certa
+// (motivo falta_cliente) e o Telegram ja e incondicional quando remarcacao=true — mas em pelo menos
+// um caso (Lia) NENHUM campo que o modelo devolveu naquela rodada carregava o horario novo, entao o
+// hash de dedup (que so olha pra motivo/horario relatado) nunca mudou enquanto a reuniao ficava mais
+// perto, e o aviso nao insistiu. `row` (novo parametro) traz o que ESTA na agenda pra dois reforcos:
+// (1) uma divergencia de CONTEUDO explicita quando a perna validada discorda do banco (pega o caso da
+// Solange, cuja equipe confirmou "18/08" com trecho limpo mas o banco seguia em "16/08"); (2) uma
+// escalada por PROXIMIDADE que reenvia o Telegram mesmo com hash igual, quando a reuniao ja marcada
+// esta perto (`AGENDAMENTO_URGENCIA_HORAS`) — essa e a garantia que nao depende do modelo acertar
+// nada, porque nem sempre ele acerta.
+async function registrarAgendamentoPendente(dealId, chatId, apuracao, remarcacao, row) {
   if (!dealId) return;
   const motivo = apuracao?.motivo || 'falta_ambos';
-  const horario = apuracao?.equipe?.horario_iso || apuracao?.cliente?.horario_iso || null;
+  const horarioRelatado = apuracao?.equipe?.horario_iso || apuracao?.cliente?.horario_iso || null;
   const descartados = apuracao?.horariosDescartados || [];
-  const hash = `${horario}|${motivo}|${remarcacao ? 'R' : 'C'}|${descartados.length}`;
+  const bancoNaive = row?.evento_calendar_data || null;
+
+  // Divergencia de CONTEUDO: a perna validada (quando existe) discorda do horario ja marcado. So faz
+  // sentido comparar quando ja existe reuniao (bancoNaive truthy) — sem isso e so uma proposta nova,
+  // nao uma divergencia.
+  const divergeDoConteudo = !!(bancoNaive && horarioRelatado && bancoNaive !== horarioRelatado);
+  const hash = `${horarioRelatado}|${motivo}|${remarcacao ? 'R' : 'C'}|${descartados.length}|${divergeDoConteudo ? bancoNaive : ''}`;
+
+  // Urgencia por PROXIMIDADE — funciona mesmo sem nenhum sinal de conteudo (ver comentario da funcao).
+  let urgente = false;
+  if (remarcacao && bancoNaive) {
+    const instante = horarioNaiveParaInstante(bancoNaive, TZ_ESCRITORIO);
+    if (instante) {
+      const horasAteReuniao = (new Date(instante).getTime() - Date.now()) / 3_600_000;
+      urgente = Math.abs(horasAteReuniao) <= AGENDAMENTO_URGENCIA_HORAS;
+    }
+  }
 
   const atual = db.prepare('SELECT agendamento_pendente_hash FROM conversations WHERE chat_id = ?').get(chatId);
-  if (atual?.agendamento_pendente_hash === hash) return;
+  const hashMudou = atual?.agendamento_pendente_hash !== hash;
+  if (!hashMudou && !urgente) return; // nada novo, e a reuniao (se existir) nao esta perto o bastante
 
-  const quando = formatarHorarioEscritorio(horario) || 'horário ainda não definido';
+  const quando = formatarHorarioEscritorio(horarioRelatado) || 'horário ainda não definido';
   const acao = remarcacao ? 'Reunião NÃO remarcada' : 'Consulta NÃO lançada na agenda';
   // Horario que o modelo devolveu e a rede deterministica recusou (eco da data-ancora, formato com
   // fuso, madrugada). Vale na nota porque muda o diagnostico: nao e "o cliente ainda nao respondeu",
@@ -2136,30 +2199,42 @@ async function registrarAgendamentoPendente(dealId, chatId, apuracao, remarcacao
   const detalheDescartado = descartados.length
     ? `\nHorário extraído e recusado pela validação: ${descartados.map((d) => `"${d.valor}" (${d.motivo})`).join('; ')}`
     : '';
+  // O que ESTA na agenda agora — faltava na nota antiga, que so falava do que a IA extraiu nesta
+  // rodada (que pode nao ter extraido nada de novo, como no caso da Lia).
+  const detalheBanco = bancoNaive
+    ? `\nAgenda atual mostra: ${formatarHorarioEscritorio(bancoNaive)}${divergeDoConteudo ? ' (diferente do que foi comunicado na conversa)' : ''}`
+    : '';
+
   try {
-    await criarNotaMoskit(dealId, `⏳ ${acao}: ${quando} — ${descreverPendencia({ motivo })}.${detalheDescartado}\nO evento é criado quando as duas confirmações aparecerem na conversa.`);
+    if (hashMudou) {
+      await criarNotaMoskit(dealId, `⏳ ${acao}: ${quando} — ${descreverPendencia({ motivo })}.${detalheDescartado}${detalheBanco}\nO evento é criado/movido quando as duas confirmações aparecerem na conversa.`);
+    }
 
     // Telegram so no que e acionavel e surpreendente. Uma REMARCACAO travada e o caso grave: ja existe
     // reuniao na agenda e ela agora esta no horario errado — foi o que fez o cliente do deal 47543238
     // esperar sozinho ("Estou aguardando aqui para o horario agendado") com o evento parado no dia
     // velho. Horario recusado pela validacao tambem avisa, porque indica extracao quebrada. O que NAO
-    // avisa e a pendencia de rotina (falta a confirmacao de um dos lados num agendamento novo): isso e
-    // o fluxo normal do atendimento e viraria ruido diario no Telegram.
-    if (remarcacao || descartados.length) {
+    // avisa por hash novo e a pendencia de rotina (falta a confirmacao de um dos lados num agendamento
+    // novo): isso e o fluxo normal do atendimento e viraria ruido diario no Telegram. Mas se a
+    // pendencia e de remarcacao E a reuniao esta perto (`urgente`), reenvia mesmo com hash igual — a
+    // proximidade sozinha ja justifica.
+    if (hashMudou ? (remarcacao || descartados.length) : urgente) {
       await enviarTelegram([
         remarcacao ? `⚠️ *Reunião NÃO remarcada — agenda com horário velho*` : `⚠️ *Horário da consulta recusado pela validação*`,
         `Chat: \`${chatId}\``,
         dealId ? `Negócio: https://app.ollow.com.br/?/deal/${dealId}` : '',
-        `Horário em jogo: ${quando}`,
+        `Horário relatado na conversa: ${quando}`,
+        bancoNaive ? `Agenda atual: ${formatarHorarioEscritorio(bancoNaive)}` : '',
         `Situação: ${descreverPendencia({ motivo })}`,
         descartados.length ? `Recusado: ${descartados.map((d) => `"${d.valor}" — ${d.motivo}`).join('; ')}` : '',
+        urgente && !hashMudou ? '⏰ Reenviando: a reunião está próxima e a pendência continua sem resolver.' : '',
         '',
         remarcacao
-          ? 'A reunião que já está na agenda continua no horário ANTIGO. Conferir a conversa e remarcar na mão.'
+          ? 'A reunião que já está na agenda pode estar no horário ANTIGO. Conferir a conversa e remarcar na mão.'
           : 'Conferir na conversa qual horário foi combinado e marcar na mão se já estiver fechado.',
       ].filter(Boolean).join('\n'));
     }
-    db.prepare('UPDATE conversations SET agendamento_pendente_hash = ? WHERE chat_id = ?').run(hash, chatId);
+    if (hashMudou) db.prepare('UPDATE conversations SET agendamento_pendente_hash = ? WHERE chat_id = ?').run(hash, chatId);
   } catch (e) {
     console.error(`  ❌ Erro ao anotar pendencia de agendamento no deal ${dealId}: ${e.message}`);
   }
@@ -2432,7 +2507,7 @@ Regras de horario nas observacoes:
 - Resolva o horario_iso com a mesma tabela CALENDARIO DE REFERENCIA usada em data_hora_consulta, e com as mesmas regras de dia da semana, de ano, de FORMATO OBRIGATORIO ("AAAA-MM-DDTHH:MM:00", segundos sempre 00) e a proibicao de usar a data-ancora como resposta.
 - Se o cliente aceitou uma proposta sem repetir o dia/hora ("pode ser"), use o horario da proposta a que ele respondeu.
 - Relate TODAS as ocorrencias, inclusive as antigas e as que se contradizem. O sistema usa a mais recente de cada tipo e sabe detectar sozinho que uma proposta nova reabriu a negociacao — nao tente filtrar nem resumir isso voce.
-- REGRA CRITICA: percorra a conversa DE TRAS PRA FRENTE e garanta que a ULTIMA mensagem que menciona dia/hora esteja na lista, seja ela do cliente ou da equipe. Vale mesmo que ela desmarque, adie ou troque um horario que ja estava confirmado antes ("surgiu um imprevisto, consegue na sexta as 16h?"). Omitir essa mensagem faz o sistema agendar num horario que ja foi abandonado — e o pior erro possivel aqui.
+- REGRA CRITICA: percorra a conversa DE TRAS PRA FRENTE e garanta que a ULTIMA mensagem que menciona dia/hora esteja na lista, seja ela do cliente ou da equipe. Vale mesmo que ela desmarque, adie ou troque um horario que ja estava confirmado antes ("surgiu um imprevisto, consegue na sexta as 16h?"). Omitir essa mensagem faz o sistema agendar num horario que ja foi abandonado — e o pior erro possivel aqui. Se a EQUIPE propuser mais de um horario em sequencia (mesmo com uma mensagem de sistema/edicao entre elas), cada proposta e uma observacao "equipe_propos_horario" propria — nao descarte a anterior nem assuma que a mensagem seguinte repete o mesmo horario. A resposta do cliente vale para a proposta MAIS RECENTE que a precede, mesmo que a resposta nao repita o horario.
 - So agendamos na agenda quando o CLIENTE aceitou E a EQUIPE confirmou o MESMO horario. Se so um dos dois falou, relate so o que existe; nao complete o que falta.
 
 INSTRUCOES PARA resumo_atendimento (briefing pre-consulta do advogado):
@@ -3351,6 +3426,15 @@ app.get('/auditoria-agenda', exigeAdmin, rota(async (req, res) => {
     }
     if (apuracao?.horarioIso && bancoMinuto && apuracao.horarioIso.slice(0, 16) !== bancoMinuto) {
       problemas.push(`ultima decisao do bot (${apuracao.horarioIso}) nao chegou na agenda (banco em ${bancoMinuto}) — remarcacao travada?`);
+    }
+    // apurarDuplaConfirmacao sempre grava horarioIso:null quando confirmado e false (falta_cliente/
+    // falta_equipe/falta_ambos) — exatamente o caso que este audit precisa enxergar (MEDIDO em
+    // 14/08/2026, deals 48292471/48287898: a perna validada da equipe as vezes tem o horario CERTO,
+    // mesmo com confirmado:false por a perna do cliente ter sido descartada). Ver perna isolada, nao
+    // so horarioIso, pra nao ficar cego nesse caso.
+    const pernaValidada = apuracao?.equipe?.horario_iso || apuracao?.cliente?.horario_iso || null;
+    if (!apuracao?.horarioIso && pernaValidada && bancoMinuto && pernaValidada.slice(0, 16) !== bancoMinuto) {
+      problemas.push(`equipe/cliente comunicou ${pernaValidada} na conversa mas a agenda mostra ${bancoMinuto} — confirmacao nao fechou (${apuracao?.motivo || 'motivo desconhecido'})`);
     }
     if (row.atividade_moskit_id && !noMoskit) {
       problemas.push(`atividade ${row.atividade_moskit_id} nao pode ser lida na agenda do Moskit${statusMoskit ? ` (${statusMoskit})` : ''}`);

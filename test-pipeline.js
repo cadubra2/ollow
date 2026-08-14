@@ -321,6 +321,20 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
   const SO_CLIENTE = { confirmado: false, horarioIso: null, cliente: ACEITE, equipe: null, motivo: 'falta_equipe' };
   const NADA = { confirmado: false, horarioIso: null, cliente: null, equipe: null, motivo: 'falta_ambos' };
 
+  // Naive local (fuso do escritorio) a partir de agora + N horas — usado pelos testes de escalada por
+  // proximidade em registrarAgendamentoPendente, que precisam de um horario de fato perto (ou longe)
+  // do momento em que o teste roda (mesmo padrao Intl usado em test-moskit-atividade-real.js).
+  function naiveDaquiA(horas) {
+    const alvo = new Date(Date.now() + horas * 3600000);
+    const p = Object.fromEntries(
+      new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'America/Fortaleza', year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+      }).formatToParts(alvo).map((x) => [x.type, x.value])
+    );
+    return `${p.year}-${p.month}-${p.day}T${p.hour}:${p.minute}:${p.second}`;
+  }
+
   {
     limpar();
     const row = semear(CHAT, { deal_id: 20 });
@@ -375,6 +389,80 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     igual('   2 notas: atividade criada agora + "nao remarcada"', notas().length, 2);
     checar('   uma delas com o texto certo de "nao remarcada"', notas().some((n) => n.corpo.description.includes('NÃO remarcada')));
     checar('   titulo/descricao ainda podem ser corrigidos (nao movem nada)', agenda.get.length >= 1);
+  }
+
+  // ============================================================
+  // registrarAgendamentoPendente: escalada por proximidade + enriquecimento por conteudo.
+  // MEDIDO em 14/08/2026 nos deals 48292471 (Lia) e 48287898 (Solange): a apuracao ja identificava a
+  // pendencia certa (motivo falta_cliente), mas em pelo menos um caso (Lia) NENHUM campo do modelo
+  // carregava informacao nova naquela rodada — so a PROXIMIDADE da reuniao ja marcada justificava
+  // insistir no aviso, nao o conteudo.
+  console.log('\n=== registrarAgendamentoPendente: proximidade e divergencia de conteudo ===');
+  {
+    // Cenario A: reuniao marcada para daqui a 2h (dentro da janela de urgencia), pendencia sem NENHUM
+    // valor divergente no modelo (a perna relatada ja bate com o banco) — so a proximidade justifica
+    // reenviar o Telegram mesmo com o MESMO hash de conteudo.
+    limpar();
+    const bancoPerto = naiveDaquiA(2);
+    const apuracaoPerto = { confirmado: false, horarioIso: null, cliente: null, equipe: { ...CONFIRMA, horario_iso: bancoPerto }, motivo: 'falta_cliente' };
+    const row = semear(CHAT, {
+      deal_id: 20, evento_calendar_criado: 1, evento_calendar_id: 'ev1', evento_calendar_data: bancoPerto,
+      atividade_moskit_id: ID_ATIVIDADE,
+    });
+    await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, false, row, apuracaoPerto);
+    igual('reuniao perto (2h) + pendencia → 1a rodada: 1 nota + 1 Telegram', notas().length, 1);
+    igual('   Telegram disparado', telegrams().length, 1);
+
+    // Rodada seguinte, EXATAMENTE a mesma apuracao (mesmo hash de conteudo) — sem a escalada por
+    // proximidade isso seria deduplicado em silencio, igual ao comportamento de antes desta mudanca.
+    await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, false, linha(CHAT), apuracaoPerto);
+    igual('   2a rodada, mesmo conteudo → NENHUMA nota nova (dedup de nota continua)', notas().length, 1);
+    igual('   MAS o Telegram repete (bypass por proximidade)', telegrams().length, 2);
+  }
+  {
+    // Cenario B: mesma pendencia, mas a reuniao esta longe (10 dias, fora da janela de urgencia) — o
+    // dedup por hash tem que continuar funcionando normalmente (sem a escalada), senão vira ruido
+    // diario pra toda pendencia de rotina.
+    limpar();
+    const bancoLonge = naiveDaquiA(24 * 10);
+    const apuracaoLonge = { confirmado: false, horarioIso: null, cliente: null, equipe: { ...CONFIRMA, horario_iso: bancoLonge }, motivo: 'falta_cliente' };
+    const row = semear(CHAT, {
+      deal_id: 20, evento_calendar_criado: 1, evento_calendar_id: 'ev1', evento_calendar_data: bancoLonge,
+      atividade_moskit_id: ID_ATIVIDADE,
+    });
+    await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, false, row, apuracaoLonge);
+    igual('reuniao longe (10 dias) → 1a rodada: 1 nota + 1 Telegram', notas().length, 1);
+    igual('   Telegram disparado', telegrams().length, 1);
+
+    await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, false, linha(CHAT), apuracaoLonge);
+    igual('   2a rodada, mesmo conteudo, longe → dedup normal (nenhuma nota nova)', notas().length, 1);
+    igual('   e NENHUM Telegram novo (sem escalada por proximidade)', telegrams().length, 1);
+  }
+  {
+    // Cenario C (padrao Solange): a perna validada da equipe tem um horario CERTO mas DIFERENTE do
+    // que esta na agenda — divergencia de conteudo, independente de proximidade (reuniao longe, sem
+    // janela de urgencia). Nota/Telegram tem que citar os dois horarios explicitamente.
+    limpar();
+    // Ambos relativos a "agora" (nao datas fixas) e bem alem da janela de urgencia (48h) — o sistema
+    // roda com o relogio em 2026, entao uma data fixa tipo "2026-08-16" podia cair PERTO o bastante
+    // de "agora" pra disparar a escalada por proximidade sem querer, contaminando este teste.
+    const bancoAntigo = naiveDaquiA(24 * 15);
+    const horarioComunicado = naiveDaquiA(24 * 20); // longe, so pra isolar do teste de proximidade
+    const apuracaoDivergente = { confirmado: false, horarioIso: null, cliente: null, equipe: { ...CONFIRMA, horario_iso: horarioComunicado }, motivo: 'falta_cliente' };
+    const row = semear(CHAT, {
+      deal_id: 20, evento_calendar_criado: 1, evento_calendar_id: 'ev1', evento_calendar_data: bancoAntigo,
+      atividade_moskit_id: ID_ATIVIDADE,
+    });
+    await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, false, row, apuracaoDivergente);
+    igual('divergencia de conteudo → 1 nota + 1 Telegram', notas().length, 1);
+    checar('   a nota cita o que esta na agenda', notas()[0].corpo.description.includes('Agenda atual mostra'));
+    checar('   e sinaliza a divergencia', notas()[0].corpo.description.includes('diferente do que foi comunicado'));
+    checar('   o Telegram cita os dois horarios', telegrams()[0]?.corpo?.text?.includes('Agenda atual') && telegrams()[0]?.corpo?.text?.includes('Horário relatado'));
+
+    // Mesma divergencia de novo → dedup por conteudo continua valendo (nao esta na janela de urgencia).
+    await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, false, linha(CHAT), apuracaoDivergente);
+    igual('   repetir a MESMA divergencia → nenhuma nota nova', notas().length, 1);
+    igual('   nenhum Telegram novo', telegrams().length, 1);
   }
   {
     // O horario que vale e o das observacoes, nao o dados.data_hora_consulta — que pode ter sido
