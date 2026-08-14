@@ -313,6 +313,26 @@ risco de evento duplicado.
   manteve (`agendamento_divergencia_hash`), mesmo sem Telegram (não é incidente confirmado). Regressão
   em `test-pipeline.js` (proximidade, divergência de conteúdo e o dedup normal quando nenhum dos dois
   se aplica).
+- **A escalada por proximidade só roda se a conversa for reprocessada — conversa muda nunca é.**
+  MEDIDO em 14/08/2026 no deal 48466404 (Teresinha): ela propôs um dia AMBÍGUO ("quarta ou quinta,
+  15:30?"), deixou a escolha pra equipe, a equipe escolheu 19/08 e avisou, ela **pagou** e até pediu o
+  endereço do escritório — claramente acha que está confirmado. Mas a dupla confirmação nunca fechou
+  (ela nunca reafirmou a data específica escolhida — aqui a ambiguidade é real, diferente do bullet
+  acima) e a conversa parou de receber mensagem no dia seguinte. A escalada por proximidade de
+  `registrarAgendamentoPendente` **só roda dentro de um ciclo de `handleAgendamentoCalendar`**, chamado
+  só quando a conversa é reprocessada — e nada neste código reprocessa uma conversa só porque o tempo
+  passou (só mensagem nova via webhook, ou `sincronizarConversas` achando `updatedTime` mais recente no
+  Zernio). Uma varredura achou **17 negócios** com `agendamento_pendente_hash` gravado, vários parados
+  há mais de uma semana. `reconciliarPendenciasAgendamento` (mesmo padrão de `reconciliarClassificacao`,
+  `RECONCILIACAO_INTERVAL_MS`) é a rede de segurança: relê `agendamento_pendente_hash` direto do banco
+  (formato `horario|motivo|...` desde a criação da função — não depende de `agendamento_apuracao`, que
+  fica `NULL` em conversa que nunca rodou um ciclo completo desde que essa coluna existe), com janela
+  própria e maior (`AGENDAMENTO_PENDENCIA_SILENCIOSA_DIAS`, padrão 7 dias — a única chance de avisar
+  sobre conversa muda, então precisa de mais antecedência que a escalada de conversa ativa). Comprovante
+  já verificado (`comprovantes.match=1`) pro deal escala **incondicionalmente**, mesmo com horário fora
+  da janela — é sinal de compromisso real, não hipótese. NÃO chama a OpenAI. Dedup por linha, coluna
+  nova `agendamento_pendencia_avisada` (guarda o hash já avisado, separada de
+  `agendamento_pendente_hash`/`agendamento_erro_hash`, que têm ciclo de vida diferente).
 - **Responsável.** A atividade sai no nome da Layla (`LAYLA_USER_ID`), como todo contato, deal e nota
   criados pelo bot. Não confundir com `advogado_responsavel`, que é campo personalizado do deal.
 - **Botão de emergência.** `AGENDA_MOSKIT_DRY_RUN=true` desliga a escrita na agenda do CRM sem
