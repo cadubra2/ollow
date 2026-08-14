@@ -263,10 +263,20 @@ risco de evento duplicado.
   dele é respeitada ("sexta" e "sexta que vem" são as duas sextas, e a conversa pode ter dito qual com
   palavras que o código não lê). Cuidado ao mexer: em português o nome do dia também é ordinal, e
   `"segunda via"` já foi lido como segunda-feira (tem teste).
+- **Atividade criada sem vínculo com o negócio.** MEDIDO em 14/08/2026 nos deals 48474073 e 48464876:
+  o `POST /activities` com `deals: [{id: dealId}]` volta 2xx com `id` (passa como sucesso em
+  `criarAtividadeMoskit`), mas quando o negócio tinha acabado de ser criado/escrito quase ao MESMO
+  tempo (segundos a poucas horas antes), o Moskit às vezes não persiste esse vínculo — a atividade
+  fica só ligada ao contato, some da tela do negócio, e o aviso "nenhuma atividade agendada" aparece
+  mesmo com a consulta marcada. `garantirVinculoAtividadeDeal` (`index.js`) confere logo após criar
+  (GET + PUT com `deals` corrigido, mesmo padrão de `atualizarAtividadeMoskit`) e
+  `reconciliarVinculoAtividades`/`rodarReconciliacaoVinculoAtividades` rodam na mesma cadência de
+  `RECONCILIACAO_INTERVAL_MS` como rede de segurança para o que escapar da conferência imediata.
 - **Auditoria.** `GET /auditoria-agenda` (só leitura, atrás de `exigeAdmin`) cruza as três fontes de
   horário de cada consulta — `conversations.evento_calendar_data`, o evento no Google e a Atividade no
-  Moskit — e lista divergências. `?todas=1` inclui consulta passada. Separa `problemas` (a consulta
-  pode estar no horário errado agora) de `observacoes` (contexto): um alerta que dispara em toda linha
+  Moskit — e lista divergências, incluindo esse caso de atividade sem vínculo com o negócio. `?todas=1`
+  inclui consulta passada. Separa `problemas` (a consulta pode estar no horário errado agora, ou a
+  atividade não aparece pro negócio) de `observacoes` (contexto): um alerta que dispara em toda linha
   afoga justamente os casos que importam.
 - **Responsável.** A atividade sai no nome da Layla (`LAYLA_USER_ID`), como todo contato, deal e nota
   criados pelo bot. Não confundir com `advogado_responsavel`, que é campo personalizado do deal.
