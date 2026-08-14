@@ -1383,6 +1383,44 @@ async function atualizarAtividadeMoskit(atividadeId, dueDate, dealId) {
   }
 }
 
+// MEDIDO em 14/08/2026 contra a API real, nos deals 48474073 e 48464876: o Moskit aceita o
+// `POST /activities` com `deals: [{id: dealId}]` (HTTP 2xx, id devolvido) mas, quando o negocio foi
+// criado/escrito quase ao MESMO tempo que a atividade (segundos a poucas horas de diferenca), o
+// vinculo com o negocio nao gruda — a atividade fica so vinculada ao contato. Os dois casos que
+// funcionaram nasceram contra um negocio que ja estava parado ha dias (rodada tardia de auto-cura).
+// Nada nisso e visivel em criarAtividadeMoskit: a resposta do POST e 2xx com id, entao passa como
+// sucesso. Esta funcao confere e corrige, reaproveitando o padrao GET-then-PUT de
+// atualizarAtividadeMoskit (PUT minimo e rejeitado com 422). Devolve true se ficou (ou ja estava) ok.
+async function garantirVinculoAtividadeDeal(atividadeId, dealId) {
+  if (!atividadeId || !dealId) return false;
+  try {
+    const atualRes = await axios.get(`${MOSKIT_BASE}/activities/${atividadeId}`, {
+      headers: { ...apiHeaders, 'X-Ollow-Origin': 'BOT_WHATSAPP' },
+      validateStatus: (s) => s < 500,
+    });
+    if (atualRes.status >= 300) {
+      console.error(`  ❌ Atividade ${atividadeId} nao pode ser lida para conferir vinculo com o deal (HTTP ${atualRes.status})`);
+      return false;
+    }
+    const jaVinculada = (atualRes.data?.deals || []).some((d) => Number(d?.id) === Number(dealId));
+    if (jaVinculada) return true;
+
+    const res = await axios.put(`${MOSKIT_BASE}/activities/${atividadeId}`, { ...atualRes.data, deals: [{ id: dealId }] }, {
+      headers: { ...apiHeaders, 'X-Ollow-Origin': 'BOT_WHATSAPP' },
+      validateStatus: (s) => s < 500,
+    });
+    if (res.status >= 300) {
+      console.error(`  ❌ Atividade ${atividadeId} nao pode ser religada ao deal ${dealId} (HTTP ${res.status})`);
+      return false;
+    }
+    console.log(`  🔗 Atividade ${atividadeId} religada ao deal ${dealId} (o Moskit tinha criado sem o vinculo)`);
+    return true;
+  } catch (e) {
+    console.error(`  ❌ Erro ao conferir/religar vinculo da atividade ${atividadeId} com o deal ${dealId}: ${e.message}`);
+    return false;
+  }
+}
+
 // Varre as atividades do Moskit paginando por OFFSET (`?start=`).
 //
 // MEDIDO em 12/08/2026 contra a API real, testando um parametro de cada vez. Em `/activities`:
@@ -1748,6 +1786,15 @@ async function registrarConsultaNaAgendaMoskit({ dealId, dados, chatId, horarioI
 
   const atividadeId = await criarAtividadeMoskit(dealId, payload);
   if (!atividadeId) return false;
+
+  // Confere se o POST realmente vinculou a atividade ao negocio — ver o comentario de
+  // garantirVinculoAtividadeDeal, o 2xx do POST acima nao garante isso.
+  const vinculada = await garantirVinculoAtividadeDeal(atividadeId, dealId);
+  if (!vinculada) {
+    const texto = `⚠️ A atividade ${atividadeId} foi criada na agenda do Moskit mas NAO ficou vinculada ao negócio (o Moskit as vezes perde esse vínculo quando o negócio acabou de ser escrito) — vincule na mão para ela aparecer na tela do negócio.`;
+    await criarNotaMoskit(dealId, texto).catch(() => {});
+    await enviarTelegram(`❌ *Atividade criada sem vínculo com o negócio*\nDeal: \`${dealId}\`\n${texto}`).catch(() => {});
+  }
 
   db.prepare('UPDATE conversations SET atividade_moskit_id = ? WHERE chat_id = ?').run(atividadeId, chatId);
   stmtAtividadeMarcarSincronizada.run(atividadeId, eventoId, dealId); // <- trava anti-evento-duplicado
@@ -3254,14 +3301,21 @@ app.get('/auditoria-agenda', exigeAdmin, rota(async (req, res) => {
     // CLAUDE.md), entao volta pro naive local pela MESMA conversao usada na comparacao acima.
     let noMoskit = null;
     let statusMoskit = null;
+    let semVinculoComDeal = false;
     if (row.atividade_moskit_id) {
       try {
         const r = await axios.get(`${MOSKIT_BASE}/activities/${row.atividade_moskit_id}`, {
           headers: apiHeaders,
           validateStatus: (s) => s < 500,
         });
-        if (r.status >= 200 && r.status < 300) noMoskit = r.data?.dueDate ? instanteParaNaiveLocal(r.data.dueDate) : null;
-        else statusMoskit = `HTTP ${r.status}`;
+        if (r.status >= 200 && r.status < 300) {
+          noMoskit = r.data?.dueDate ? instanteParaNaiveLocal(r.data.dueDate) : null;
+          // MEDIDO em 14/08/2026 (deals 48474073, 48464876): o POST as vezes cria a atividade sem
+          // vincular ao negocio (so ao contato) — ver garantirVinculoAtividadeDeal.
+          semVinculoComDeal = !(r.data?.deals || []).some((d) => Number(d?.id) === Number(row.deal_id));
+        } else {
+          statusMoskit = `HTTP ${r.status}`;
+        }
       } catch (e) {
         statusMoskit = `erro: ${e.message}`;
       }
@@ -3294,6 +3348,9 @@ app.get('/auditoria-agenda', exigeAdmin, rota(async (req, res) => {
     }
     if (row.atividade_moskit_id && !noMoskit) {
       problemas.push(`atividade ${row.atividade_moskit_id} nao pode ser lida na agenda do Moskit${statusMoskit ? ` (${statusMoskit})` : ''}`);
+    }
+    if (row.atividade_moskit_id && noMoskit && semVinculoComDeal) {
+      problemas.push(`atividade ${row.atividade_moskit_id} existe mas nao esta vinculada ao negocio (so ao contato) — some da tela do negocio no Moskit`);
     }
     if (apuracao?.horariosDescartados?.length) {
       problemas.push(`horario recusado pela validacao: ${apuracao.horariosDescartados.map((d) => `"${d.valor}" (${d.motivo})`).join('; ')}`);
@@ -4175,6 +4232,8 @@ const RECONCILIACAO_PAUSA_MS = Number(process.env.RECONCILIACAO_PAUSA_MS) || 300
 // seria reenviada a cada rodada. Memoria de processo de proposito: um restart avisa de novo, o que e
 // barato e melhor do que perder o aviso.
 let ultimoResumoReconciliacao = null;
+// Mesma ideia, para a reconciliacao de vinculo de Atividade x negocio (ver reconciliarVinculoAtividades).
+let ultimoResumoReconciliacaoAtividades = null;
 
 // Nome canonico da area a partir do ID da opcao — o caminho inverso de buscarIdOpcao, usado pela
 // reconciliacao para adotar a area que esta no CRM como fonte da verdade.
@@ -4372,6 +4431,77 @@ async function rodarReconciliacaoPeriodica() {
   ultimoResumoReconciliacao = resumo;
   if (pendencias.length) {
     await enviarTelegram(`${resumo}\n\nEsses o bot não toca (correção manual, deal fechado ou negócio anterior ao registro de autoria).`);
+  }
+  return r;
+}
+
+// Rede de seguranca para o quirk medido em 14/08/2026 (ver garantirVinculoAtividadeDeal): mesmo com a
+// conferencia logo apos criar, uma atividade pode ficar sem o vinculo com o negocio (ex.: a conferencia
+// falhou por rede no mesmo ciclo). Varre toda conversa com atividade_moskit_id gravado e religa a que
+// estiver solta — mesmo espirito de reconciliarClassificacao, rodando na mesma cadencia.
+async function reconciliarVinculoAtividades({ aplicar = false } = {}) {
+  const linhas = db.prepare(`
+    SELECT chat_id, deal_id, atividade_moskit_id FROM conversations WHERE atividade_moskit_id IS NOT NULL
+  `).all();
+
+  const relatorio = { aplicar, analisados: 0, corrigidos: [], erros: [] };
+
+  let primeira = true;
+  for (const linha of linhas) {
+    relatorio.analisados++;
+    try {
+      if (!primeira) await new Promise((r) => setTimeout(r, RECONCILIACAO_PAUSA_MS));
+      primeira = false;
+
+      const res = await axios.get(`${MOSKIT_BASE}/activities/${linha.atividade_moskit_id}`, {
+        headers: { ...apiHeaders, 'X-Ollow-Origin': 'BOT_WHATSAPP' },
+        validateStatus: (s) => s < 500,
+      });
+      if (res.status >= 300) {
+        relatorio.erros.push({ chat_id: linha.chat_id, deal_id: linha.deal_id, atividade_moskit_id: linha.atividade_moskit_id, erro: `HTTP ${res.status}` });
+        continue;
+      }
+      const vinculada = (res.data?.deals || []).some((d) => Number(d?.id) === Number(linha.deal_id));
+      if (vinculada) continue;
+
+      if (!aplicar) {
+        relatorio.corrigidos.push({ chat_id: linha.chat_id, deal_id: linha.deal_id, atividade_moskit_id: linha.atividade_moskit_id });
+        continue;
+      }
+      const religou = await garantirVinculoAtividadeDeal(linha.atividade_moskit_id, linha.deal_id);
+      if (!religou) {
+        relatorio.erros.push({ chat_id: linha.chat_id, deal_id: linha.deal_id, atividade_moskit_id: linha.atividade_moskit_id, erro: 'PUT de religacao falhou' });
+        continue;
+      }
+      relatorio.corrigidos.push({ chat_id: linha.chat_id, deal_id: linha.deal_id, atividade_moskit_id: linha.atividade_moskit_id });
+      await criarNotaMoskit(linha.deal_id, '🔁 Atividade da agenda religada automaticamente ao negócio (o Moskit tinha criado sem esse vínculo).').catch(() => {});
+      console.log(`  🔁 Deal ${linha.deal_id}: atividade ${linha.atividade_moskit_id} religada ao negocio`);
+    } catch (e) {
+      relatorio.erros.push({ chat_id: linha.chat_id, deal_id: linha.deal_id, atividade_moskit_id: linha.atividade_moskit_id, erro: e.message });
+      console.error(`  ❌ Reconciliacao de vinculo da atividade ${linha.atividade_moskit_id} (deal ${linha.deal_id}): ${e.message}`);
+    }
+  }
+
+  return relatorio;
+}
+
+async function rodarReconciliacaoVinculoAtividades() {
+  const r = await reconciliarVinculoAtividades({ aplicar: true });
+  if (!r.corrigidos.length && !r.erros.length) return r;
+
+  console.log(`  🔁 Reconciliacao de vinculo de atividade: ${r.analisados} conferida(s), ${r.corrigidos.length} religada(s), ${r.erros.length} erro(s)`);
+
+  const linhasResumo = [
+    r.corrigidos.length ? `✅ ${r.corrigidos.length} atividade(s) religada(s) ao negócio automaticamente` : '',
+    ...r.erros.slice(0, 10).map((e) => `• Deal \`${e.deal_id}\` — atividade \`${e.atividade_moskit_id}\`: ${e.erro}`),
+    r.erros.length > 10 ? `… e mais ${r.erros.length - 10}` : '',
+  ].filter(Boolean);
+
+  const resumo = `🔁 *Reconciliação de vínculo de atividade*\n${linhasResumo.join('\n')}`;
+  if (resumo === ultimoResumoReconciliacaoAtividades) return r; // nada novo desde a ultima rodada
+  ultimoResumoReconciliacaoAtividades = resumo;
+  if (r.erros.length) {
+    await enviarTelegram(`${resumo}\n\nErro precisa de conferência manual (a atividade continua sem aparecer na tela do negócio).`);
   }
   return r;
 }
@@ -4828,6 +4958,13 @@ app.listen(PORT, () => {
     console.log(`   Reconciliacao de classificacao: a cada ${Math.round(RECONCILIACAO_INTERVAL_MS / 60000)} min (janela de ${RECONCILIACAO_DIAS} dias)`);
     setInterval(() => {
       rodarReconciliacaoPeriodica().catch((e) => console.error(`  ❌ Erro na reconciliacao periodica: ${e.message}`));
+    }, RECONCILIACAO_INTERVAL_MS);
+
+    // Mesma cadencia e mesma flag: religa sozinha a Atividade que o Moskit criou sem vincular ao
+    // negocio (ver garantirVinculoAtividadeDeal/reconciliarVinculoAtividades).
+    console.log(`   Reconciliacao de vinculo de atividade: a cada ${Math.round(RECONCILIACAO_INTERVAL_MS / 60000)} min`);
+    setInterval(() => {
+      rodarReconciliacaoVinculoAtividades().catch((e) => console.error(`  ❌ Erro na reconciliacao de vinculo de atividade: ${e.message}`));
     }, RECONCILIACAO_INTERVAL_MS);
   } else {
     console.log('   Reconciliacao de classificacao: DESLIGADA (RECONCILIACAO_ATIVA=false)');

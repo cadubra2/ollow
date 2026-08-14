@@ -540,6 +540,45 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
       notas()[0]?.corpo.description.includes('agenda do Moskit'));
   }
   {
+    // MEDIDO em 14/08/2026 contra a API real (deals 48474073 e 48464876): o Moskit devolveu 2xx com id
+    // no POST /activities, mas a atividade criada nunca ficou vinculada ao negocio (so ao contato) —
+    // exatamente quando o negocio tinha acabado de ser escrito. Isso era 100% silencioso: o 2xx com id
+    // passava como sucesso e ninguem no escritorio saberia que a atividade sumiu da tela do negocio.
+    limpar();
+    rede.get = (url) => ({
+      status: 200,
+      data: url.includes('/activities/') ? { id: ID_ATIVIDADE, deals: [], contacts: [{ id: 999 }] } : { stage: { id: 179388 } },
+    });
+    const row = semear(CHAT, { deal_id: 20 });
+    await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, true, row, CONFIRMADO);
+
+    igual('atividade criada mas o Moskit nao vinculou ao deal → confere com 1 GET', de('GET', `/activities/${ID_ATIVIDADE}`).length, 1);
+    igual('   e religa com 1 PUT', atividadesRemarcadas().length, 1);
+    igual('   o PUT manda deals com o deal certo', atividadesRemarcadas()[0]?.corpo?.deals?.[0]?.id, 20);
+    checar('   e preserva o que ja estava na atividade (ex.: contacts do GET)', atividadesRemarcadas()[0]?.corpo?.contacts?.[0]?.id === 999);
+    igual('   banco: atividade_moskit_id guardado mesmo assim (a cura funcionou)', linha(CHAT).atividade_moskit_id, ID_ATIVIDADE);
+    checar('   NENHUMA nota de "sem vinculo" (a cura silenciosa resolveu antes de avisar)',
+      !notas().some((n) => n.corpo.description.includes('NAO ficou vinculada')));
+  }
+  {
+    // Mesmo cenario, mas agora a religacao TAMBEM falha (Moskit fora do ar no PUT) — isso nao pode
+    // ficar silencioso: nota no deal + Telegram, igual ao padrao ja usado para falha de criacao.
+    limpar();
+    rede.get = (url) => ({
+      status: 200,
+      data: url.includes('/activities/') ? { id: ID_ATIVIDADE, deals: [] } : { stage: { id: 179388 } },
+    });
+    rede.put = (url) => (url.includes('/activities/') ? { status: 500, data: {} } : { status: 200, data: {} });
+    const row = semear(CHAT, { deal_id: 20 });
+    await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, true, row, CONFIRMADO);
+
+    igual('religacao tambem falha → banco AINDA guarda o atividade_moskit_id (existe, so nao vinculada)', linha(CHAT).atividade_moskit_id, ID_ATIVIDADE);
+    checar('   nota avisa que a atividade NAO ficou vinculada ao negocio',
+      notas().some((n) => n.corpo.description.includes('NAO ficou vinculada')));
+    checar('   e o Telegram tambem avisa (nao pode depender so da nota)',
+      telegrams().some((t) => JSON.stringify(t.corpo).includes('vínculo com o negócio')));
+  }
+  {
     limpar();
     const row = semear(CHAT, { deal_id: 20 });
     await handleAgendamentoCalendar(20, { ...DADOS, modalidade_consulta: 'presencial' }, CHAT, true, row, CONFIRMADO);
@@ -608,8 +647,16 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
       evento_calendar_data: '2026-08-05T17:30:00',
     });
     await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, true, row, { ...CONFIRMADO, horarioIso: '2026-08-06T10:00:00' });
-    igual('conversa legada sem atividade → nenhum PUT em /activities (nao ha o que remarcar)', atividadesRemarcadas().length, 0);
+    igual('conversa legada sem atividade → nenhum PUT de REMARCACAO em /activities (nao ha dueDate a mover)',
+      atividadesRemarcadas().filter((p) => p.corpo?.dueDate).length, 0);
     igual('   mas TENTA CRIAR a atividade que falta (auto-cura)', atividadesCriadas().length, 1);
+    // A atividade acabou de nascer (deal + atividade quase no mesmo instante) — exatamente o cenario
+    // medido em 14/08/2026 (deals 48474073/48464876) em que o Moskit as vezes nao persiste o vinculo
+    // `deals` do POST. garantirVinculoAtividadeDeal confere e religa: 1 GET + 1 PUT (sem dueDate,
+    // so com `deals`), distinto de um PUT de remarcacao.
+    igual('   e confere/religa o vinculo com o deal (GET)', de('GET', `/activities/${ID_ATIVIDADE}`).length, 1);
+    igual('   e (PUT) so com `deals`, sem dueDate', atividadesRemarcadas().length, 1);
+    igual('   o PUT vincula ao deal certo', atividadesRemarcadas()[0]?.corpo?.deals?.[0]?.id, 20);
     igual('   banco: atividade_moskit_id passa a existir', linha(CHAT).atividade_moskit_id, ID_ATIVIDADE);
     checar('   e entra na trava anti-duplicado', !!sincronizada(ID_ATIVIDADE));
     checar('   com uma nota avisando que a atividade foi criada agora',
