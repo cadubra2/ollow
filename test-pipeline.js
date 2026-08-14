@@ -592,16 +592,37 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
       notas()[0]?.corpo.description.includes('Agenda do Moskit'));
   }
   {
-    // Conversa agendada antes desta versao: tem evento no Google mas nunca teve atividade. Nao ha o
-    // que remarcar no CRM, e isso nao pode impedir a remarcacao no Google.
+    // Conversa com evento no Google mas sem Atividade no Moskit — o caso real achado em 14/08/2026
+    // (deals 48447661, 48287898): 21 de 27 consultas tinham esse gap porque este ramo (evento JA
+    // existia) nunca tentava criar a Atividade que falta, so remarcava a que ja existisse. Auto-cura:
+    // agora tenta criar (idempotente via registrarConsultaNaAgendaMoskit), e isso nao pode impedir a
+    // remarcacao no Google.
     limpar();
     const row = semear(CHAT, {
       deal_id: 20, evento_calendar_criado: 1, evento_calendar_id: 'ev1',
       evento_calendar_data: '2026-08-05T17:30:00',
     });
     await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, true, row, { ...CONFIRMADO, horarioIso: '2026-08-06T10:00:00' });
-    igual('conversa legada sem atividade → nenhum PUT em /activities', atividadesRemarcadas().length, 0);
-    igual('   mas o evento do Google e remarcado normalmente', agenda.patch.filter((p) => p.requestBody?.start).length, 1);
+    igual('conversa legada sem atividade → nenhum PUT em /activities (nao ha o que remarcar)', atividadesRemarcadas().length, 0);
+    igual('   mas TENTA CRIAR a atividade que falta (auto-cura)', atividadesCriadas().length, 1);
+    igual('   banco: atividade_moskit_id passa a existir', linha(CHAT).atividade_moskit_id, ID_ATIVIDADE);
+    checar('   e entra na trava anti-duplicado', !!sincronizada(ID_ATIVIDADE));
+    checar('   com uma nota avisando que a atividade foi criada agora',
+      notas().some((n) => n.corpo.description.includes('foi criada agora')));
+    igual('   e o evento do Google e remarcado normalmente', agenda.patch.filter((p) => p.requestBody?.start).length, 1);
+  }
+  {
+    // A auto-cura acima tem que ser idempotente: se a Atividade ja existe, nao tenta criar de novo
+    // nem posta a nota de "foi criada agora".
+    limpar();
+    const row = semear(CHAT, {
+      deal_id: 20, evento_calendar_criado: 1, evento_calendar_id: 'ev1',
+      evento_calendar_data: '2026-08-05T17:30:00', atividade_moskit_id: ID_ATIVIDADE,
+    });
+    await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, true, row, CONFIRMADO);
+    igual('atividade ja existe → auto-cura nao cria outra', atividadesCriadas().length, 0);
+    checar('   e nao posta a nota de "foi criada agora"',
+      !notas().some((n) => n.corpo.description.includes('foi criada agora')));
   }
   {
     // Falha na agenda do CRM nao pode derrubar o resto do agendamento: o evento no Google ja existe e
