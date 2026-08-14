@@ -118,6 +118,10 @@ const APELIDOS = {
     'trafego pago': 'vsl - trafego pago',
     'nao informado': 'nao identificado',
     'site do escritorio': 'site',
+    // "Link na bio" (deal 48320992, 14/08/2026): a IA extrai isso quando o cliente cita o link da
+    // bio do Instagram, mas o valor nao existia nem como apelido — o campo ficava vazio em silencio.
+    'link na bio': 'instagram',
+    'link da bio': 'instagram',
   },
   TIPO_CONSULTA: {
     'consulta gratuita': 'consulta gratis',

@@ -1970,7 +1970,9 @@ async function registrarPendenciaContrato(dealId, chatId, faltantes) {
 
 // Nota no deal quando os dados estavam completos mas a CHAMADA a API do ZapSign falhou de verdade
 // (token/template invalido, rede, etc) — eixo diferente de registrarPendenciaContrato (dado
-// faltante). Mesmo padrao de registrarErroAgendamento.
+// faltante). Mesmo padrao de registrarErroAgendamento — inclusive o aviso no Telegram: uma falha de
+// API tende a afetar TODOS os contratos seguintes, nao so este deal, e sem Telegram ninguem percebe
+// ate abrir o deal na mao.
 async function registrarErroContrato(dealId, chatId, mensagemErro) {
   if (!dealId) return;
   const hash = String(mensagemErro || '').slice(0, 200);
@@ -1978,8 +1980,10 @@ async function registrarErroContrato(dealId, chatId, mensagemErro) {
   const atual = db.prepare('SELECT contrato_zapsign_erro_hash FROM conversations WHERE chat_id = ?').get(chatId);
   if (atual?.contrato_zapsign_erro_hash === hash) return;
 
+  const texto = `❌ Falha ao gerar contrato no ZapSign: ${mensagemErro}. Verificar manualmente (ZAPSIGN_API_KEY/ZAPSIGN_TEMPLATE_TOKEN configurados corretamente?).`;
   try {
-    await criarNotaMoskit(dealId, `❌ Falha ao gerar contrato no ZapSign: ${mensagemErro}. Verificar manualmente (ZAPSIGN_API_KEY/ZAPSIGN_TEMPLATE_TOKEN configurados corretamente?).`);
+    await criarNotaMoskit(dealId, texto);
+    await enviarTelegram(`❌ *Falha ao gerar contrato*\nDeal: \`${dealId}\`\nTelefone: \`${chatId}\`\n${texto}`);
     db.prepare('UPDATE conversations SET contrato_zapsign_erro_hash = ? WHERE chat_id = ?').run(hash, chatId);
   } catch (e) {
     console.error(`  ❌ Erro ao anotar FALHA de contrato no deal ${dealId}: ${e.message}`);
@@ -2239,6 +2243,7 @@ CAMPOS OBRIGATORIOS (nunca podem ser null em criar):
 2. origem — SEMPRE preencher. Extraia da mensagem inicial. Se nao encontrar, use "Nao identificado".
 3. tipo_consulta — "consulta paga" por padrao. Use "consulta gratis" APENAS se a equipe disser explicitamente que a consulta e cortesia/gratuita/sem custo/isenta. Use "sem consulta" so se o lead disser EXPLICITAMENTE que nao quer contratar.
 4. area_direito — Use seu conhecimento juridico para inferir a area A PARTIR DO QUE O CLIENTE CONTOU SOBRE O CASO, e de nada mais. Se ele so cumprimentou, so pediu consulta, so disse por qual canal chegou ou so citou o nome de um advogado ("quero falar com o Dr. Berto"), voce NAO sabe a area: devolva null. E PROIBIDO derivar a area de captacao, de origem, do advogado que o lead mencionou ou dos PERFIS DOS ADVOGADOS abaixo — o caminho e sempre area -> advogado, nunca advogado -> area. Deixar null e o resultado correto e esperado nessa situacao; a area entra numa rodada seguinte, quando o cliente descrever o caso.
+   CASO RECORRENTE NESTE ESCRITORIO — FIES: caso envolvendo financiamento estudantil (FIES) — negativa administrativa, transferencia de curso, renegociacao, aditamento, recurso — e SEMPRE "Direito Educacional", mesmo que o cliente nao diga isso com essas palavras (deals 48474073, 48466404, 48464876, 48320992 nasceram com area_direito null porque o modelo nao fez essa ligacao sozinho, apesar do caso estar descrito).
 5. advogado_responsavel — Determinado UNICAMENTE pela area_direito, pela TABELA AREA -> ADVOGADO abaixo. Se area_direito estiver null ou incerta, mantenha null. NAO derive do nome do lead ou de qual socio ele mencionou. (O sistema reaplica essa tabela em cima do que voce responder: se divergir, o valor da tabela vence.)
 6. captacao — Se mencionou rede social de Berto, Bruno ou Iury, ou foi indicado por um deles, preencha com o nome do socio (INDEPENDENTE de area_direito estar definida). CASO CONTRARIO, preencha com o MESMO valor de advogado_responsavel (que pode ser null se area_direito nao identificada).
 7. pagamento_confirmado — boolean. True APENAS se DISSE que pagou OU enviou comprovante. Senao false.
