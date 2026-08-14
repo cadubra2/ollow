@@ -1927,6 +1927,11 @@ async function registrarPendenciaContrato(dealId, chatId, faltantes) {
 // Nota no deal quando os dados estavam completos mas a CHAMADA a API do ZapSign falhou de verdade
 // (token/template invalido, rede, etc) — eixo diferente de registrarPendenciaContrato (dado
 // faltante). Mesmo padrao de registrarErroAgendamento.
+//
+// Avisa Telegram alem da nota no deal: uma falha de API (token/template invalido, rede) tende a
+// afetar TODOS os contratos seguintes, nao so este deal — sem o Telegram, ninguem percebe ate
+// alguem abrir o deal na mao (foi exatamente isso que aconteceu com o token do Google Calendar
+// expirado, ver registrarErroAgendamento).
 async function registrarErroContrato(dealId, chatId, mensagemErro) {
   if (!dealId) return;
   const hash = String(mensagemErro || '').slice(0, 200);
@@ -1934,8 +1939,10 @@ async function registrarErroContrato(dealId, chatId, mensagemErro) {
   const atual = db.prepare('SELECT contrato_zapsign_erro_hash FROM conversations WHERE chat_id = ?').get(chatId);
   if (atual?.contrato_zapsign_erro_hash === hash) return;
 
+  const texto = `❌ Falha ao gerar contrato no ZapSign: ${mensagemErro}. Verificar manualmente (ZAPSIGN_API_KEY/ZAPSIGN_TEMPLATE_TOKEN configurados corretamente?).`;
   try {
-    await criarNotaMoskit(dealId, `❌ Falha ao gerar contrato no ZapSign: ${mensagemErro}. Verificar manualmente (ZAPSIGN_API_KEY/ZAPSIGN_TEMPLATE_TOKEN configurados corretamente?).`);
+    await criarNotaMoskit(dealId, texto);
+    await enviarTelegram(`❌ *Falha ao gerar contrato*\nDeal: \`${dealId}\`\nTelefone: \`${chatId}\`\n${texto}`);
     db.prepare('UPDATE conversations SET contrato_zapsign_erro_hash = ? WHERE chat_id = ?').run(hash, chatId);
   } catch (e) {
     console.error(`  ❌ Erro ao anotar FALHA de contrato no deal ${dealId}: ${e.message}`);
@@ -1968,6 +1975,11 @@ async function registrarAgendamentoPendente(dealId, chatId, apuracao, remarcacao
 // esse caminho so gerava um console.error — a equipe nao tinha nenhum jeito de saber, pelo CRM, que
 // uma consulta ja confirmada pelas duas partes nao foi pra agenda. O hash evita repetir a mesma nota
 // de erro a cada ciclo de 5 min enquanto a causa nao for corrigida (ex: token continuar expirado).
+//
+// Avisa Telegram alem da nota no deal (visto no deal 48474073, 14/08/2026: token OAuth do Google
+// expirado/desatualizado na VPS gerou "invalid_grant", e como esta funcao so deixava nota no CRM,
+// ninguem percebeu ate a atendente abrir o deal na mao — o token quebrado bloqueia TODO agendamento
+// automatico seguinte, entao o aviso precisa chegar em tempo real, nao so quando alguem olhar o deal).
 async function registrarErroAgendamento(dealId, chatId, mensagemErro, remarcacao) {
   if (!dealId) return;
   const hash = `${mensagemErro}|${remarcacao ? 'R' : 'C'}`;
@@ -1976,11 +1988,10 @@ async function registrarErroAgendamento(dealId, chatId, mensagemErro, remarcacao
   if (atual?.agendamento_erro_hash === hash) return;
 
   const acao = remarcacao ? 'reunião NÃO remarcada' : 'evento NÃO criado';
+  const texto = `❌ Falha ao agendar: ${acao} — cliente e equipe já confirmaram o horário, mas a integração com o Google Calendar falhou (${mensagemErro}). Verificar manualmente e, se for token expirado, renovar com autorizar-google.js.`;
   try {
-    await criarNotaMoskit(
-      dealId,
-      `❌ Falha ao agendar: ${acao} — cliente e equipe já confirmaram o horário, mas a integração com o Google Calendar falhou (${mensagemErro}). Verificar manualmente e, se for token expirado, renovar com autorizar-google.js.`
-    );
+    await criarNotaMoskit(dealId, texto);
+    await enviarTelegram(`❌ *Falha ao agendar consulta*\nDeal: \`${dealId}\`\nTelefone: \`${chatId}\`\n${texto}`);
     db.prepare('UPDATE conversations SET agendamento_erro_hash = ? WHERE chat_id = ?').run(hash, chatId);
   } catch (e) {
     console.error(`  ❌ Erro ao anotar FALHA de agendamento no deal ${dealId}: ${e.message}`);
