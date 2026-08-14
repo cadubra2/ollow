@@ -1857,6 +1857,29 @@ async function handleAgendamentoCalendar(dealId, dados, chatId, pagamentoVerific
     // esta travada por falta de confirmacao.
     if (dados.data_hora_consulta) await sincronizarMetadadosEvento(dados, chatId, row);
 
+    // Auto-cura: achado em 14/08/2026 que 21 de 27 consultas com evento no Google NUNCA tiveram a
+    // Atividade criada no Moskit (falha silenciosa de POST /activities, sem log nem nota nem
+    // Telegram — ja corrigido em criarAtividadeMoskit). Esse ramo (evento JA existia) nunca tentava
+    // criar a Atividade que falta — so `atualizarAtividadeMoskit` quando ela ja existe.
+    //
+    // Roda ANTES do `if (!podeAgendar) return` de proposito: o evento no Google ja existe
+    // (`row.evento_calendar_criado`), entao a reuniao ja foi confirmada de verdade numa rodada
+    // anterior — a auto-cura nao depende de a IA reconfirmar a dupla confirmacao HOJE. Foi assim que
+    // a primeira versao deste fix (dentro do `if (podeAgendar)`) deixou o deal 48287898 sem cura: o
+    // eco-da-data-ancora corretamente rejeitou o horario extraido nessa rodada, `podeAgendar` deu
+    // false, e o `return` logo abaixo nunca deixava a auto-cura rodar.
+    // `registrarConsultaNaAgendaMoskit` ja e idempotente (`if (row?.atividade_moskit_id) return
+    // false`), entao chamar aqui e seguro tanto quando a Atividade ja existe quanto quando falta. Sem
+    // meetLink aqui de proposito — buscar o link do Meet exigiria reler o evento do Google; a
+    // Atividade nascer sem o link nas notas e aceitavel, o essencial e ela existir (ver "Limitacao
+    // aceita" no plano).
+    const naAgendaMoskit = await registrarConsultaNaAgendaMoskit({
+      dealId, dados: dadosEvento, chatId, horarioIso: row.evento_calendar_data, meetLink: null, eventoId: row.evento_calendar_id, row,
+    });
+    if (naAgendaMoskit) {
+      await criarNotaMoskit(dealId, '🗓️ Consulta marcada na agenda do Moskit (a atividade estava faltando e foi criada agora).');
+    }
+
     // Remarcar uma reuniao ja marcada exige o MESMO criterio de criar. Sem essa trava, qualquer
     // data extraida movia a reuniao de um cliente real — inclusive um horario que a equipe apenas
     // PROPOS e o cliente nunca respondeu.
@@ -1870,23 +1893,6 @@ async function handleAgendamentoCalendar(dealId, dados, chatId, pagamentoVerific
       return;
     }
     await atualizarEventoSeRemarcado(dealId, dadosEvento, chatId, row);
-
-    // Auto-cura: achado em 14/08/2026 que 21 de 27 consultas com evento no Google NUNCA tiveram a
-    // Atividade criada no Moskit (falha silenciosa de POST /activities, sem log nem nota nem
-    // Telegram — ja corrigido em criarAtividadeMoskit). Esse ramo (evento JA existia) nunca tentava
-    // criar a Atividade que falta — so `atualizarAtividadeMoskit` quando ela ja existe. Sem esta
-    // chamada, reprocessar uma conversa como essa nunca fecharia o gap sozinho: era exatamente esse
-    // o caso dos deals 48447661 e 48287898. `registrarConsultaNaAgendaMoskit` ja e idempotente
-    // (`if (row?.atividade_moskit_id) return false`), entao chamar aqui e seguro tanto quando a
-    // Atividade ja existe quanto quando falta. Sem meetLink aqui de proposito — buscar o link do
-    // Meet exigiria reler o evento do Google; a Atividade nascer sem o link nas notas e aceitavel,
-    // o essencial e ela existir (ver "Limitacao aceita" no plano).
-    const naAgendaMoskit = await registrarConsultaNaAgendaMoskit({
-      dealId, dados: dadosEvento, chatId, horarioIso: row.evento_calendar_data, meetLink: null, eventoId: row.evento_calendar_id, row,
-    });
-    if (naAgendaMoskit) {
-      await criarNotaMoskit(dealId, '🗓️ Consulta marcada na agenda do Moskit (a atividade estava faltando e foi criada agora).');
-    }
 
     // Evento ja existia e a dupla confirmacao continua valida — o deal tem consulta marcada de
     // verdade. "consulta_agendada" fica orfa desde que foi mapeada (MOSKIT_STAGE_MAP): a IA nunca
