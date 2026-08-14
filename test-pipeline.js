@@ -363,12 +363,17 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
   {
     // A trava que faltava: sem ela, qualquer data extraida movia a reuniao de um cliente real —
     // inclusive um horario que a equipe apenas PROPOS e o cliente nunca respondeu.
+    //
+    // Esta conversa tambem NAO tem atividade_moskit_id — a auto-cura roda de qualquer forma (ela
+    // nao depende de dupla confirmacao nesta rodada, so do evento no Google ja existir), entao
+    // aparece 1 nota a mais alem da de "nao remarcada".
     limpar();
     const row = semear(CHAT, { deal_id: 20, evento_calendar_criado: 1, evento_calendar_id: 'ev1', evento_calendar_data: '2026-08-05T17:30:00' });
     await handleAgendamentoCalendar(20, { ...DADOS, data_hora_consulta: '2026-08-09T09:00:00' }, CHAT, false, row, SO_CLIENTE);
     igual('reuniao existente sem dupla confirmacao → NAO remarca', agenda.patch.filter((p) => p.requestBody?.start).length, 0);
-    igual('   1 nota de "nao remarcada"', notas().length, 1);
-    checar('   com o texto certo', notas()[0].corpo.description.includes('NÃO remarcada'));
+    checar('   a auto-cura ainda cria a atividade que faltava', atividadesCriadas().length === 1);
+    igual('   2 notas: atividade criada agora + "nao remarcada"', notas().length, 2);
+    checar('   uma delas com o texto certo de "nao remarcada"', notas().some((n) => n.corpo.description.includes('NÃO remarcada')));
     checar('   titulo/descricao ainda podem ser corrigidos (nao movem nada)', agenda.get.length >= 1);
   }
   {
