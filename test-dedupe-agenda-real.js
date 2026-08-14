@@ -31,8 +31,12 @@ const APLICAR = process.argv.includes('--aplicar');
 
 process.env.WORKER_MODE = '1';
 process.env.DB_PATH = path.join(require('os').tmpdir(), `dedupe-agenda-${process.pid}.db`);
-delete process.env.TELEGRAM_BOT_TOKEN;
-delete process.env.TELEGRAM_CHAT_ID;
+// String vazia, NAO delete: index.js chama require('dotenv').config() de novo ao carregar, e o
+// dotenv so preserva uma env var que ja EXISTE em process.env (mesmo vazia) — uma chave deletada
+// e reposta a partir do .env, e a notificacao de teste vaza pro Telegram real do escritorio (visto
+// na pratica em 14/08/2026, rodando test-moskit-native-sync-real.js com este mesmo padrao).
+process.env.TELEGRAM_BOT_TOKEN = '';
+process.env.TELEGRAM_CHAT_ID = '';
 
 const axios = require('axios');
 const Database = require('better-sqlite3');
