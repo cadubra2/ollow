@@ -663,19 +663,49 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
   }
   {
     // Marcar como criado sem evento faria o bot achar que a consulta esta na agenda quando nao esta —
-    // e nunca mais tentar. Aqui o insert responde vazio e a montagem da nota de sucesso explode; o
-    // que importa e que o catch da funcao NAO deixa o banco mentir — e, com o gap de visibilidade
-    // fechado (deal 48346871), a equipe recebe uma nota de FALHA em vez de silencio total.
+    // e nunca mais tentar. Aqui o insert responde vazio (falha REAL da API do Google, nao formato de
+    // data invalido) — e desde a mudanca de 14/08/2026 (deal 48474073: as duas agendas ficaram vazias
+    // com essa unica falha) a Atividade do Moskit tem que nascer mesmo assim, e o estagio avanca,
+    // porque a consulta ESTA marcada em pelo menos uma agenda de verdade.
     limpar();
     agenda.respostaInsert = null;
     const row = semear(CHAT, { deal_id: 20 });
     await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, true, row, CONFIRMADO);
-    igual('insert respondeu vazio → banco NAO marca como criado', linha(CHAT).evento_calendar_criado, 0);
+    igual('Google falhou → banco NAO marca evento_calendar_criado', linha(CHAT).evento_calendar_criado, 0);
     igual('   sem evento_calendar_id', linha(CHAT).evento_calendar_id, null);
-    igual('   nenhuma nota de SUCESSO', notas().filter((n) => n.corpo.description.startsWith('📅')).length, 0);
-    igual('   mas 1 nota de FALHA (a equipe fica sabendo)', notas().filter((n) => n.corpo.description.startsWith('❌')).length, 1);
-    checar('   a nota de falha cita o motivo', notas()[0].corpo.description.includes("reading 'htmlLink'"));
-    igual('   e SEM avanco de estagio (o return no catch impede)', notas().length, 1);
+    igual('   MAS a Atividade do Moskit foi criada mesmo assim (desacoplado do Google)', linha(CHAT).atividade_moskit_id, ID_ATIVIDADE);
+    checar('   e entra na trava anti-duplicado (sem apontar pra nenhum evento)', !!sincronizada(ID_ATIVIDADE));
+    igual('   nenhuma nota de SUCESSO do Google (📅)', notas().filter((n) => n.corpo.description.startsWith('📅')).length, 0);
+    checar('   1 nota combinada: Moskit marcado + Google/Meet NAO criado',
+      notas().some((n) => n.corpo.description.startsWith('🗓️') && n.corpo.description.includes('NÃO foi criado')), notas());
+    checar('   1 nota de FALHA do agendamento (a mesma que dispara Telegram)',
+      notas().some((n) => n.corpo.description.startsWith('❌') && n.corpo.description.includes("reading 'htmlLink'")));
+    checar('   e o estagio AVANCA (a atividade do Moskit conta como consulta marcada)',
+      notas().some((n) => n.corpo.description.includes('consulta agendada')));
+  }
+  {
+    // Os DOIS falham: Google (falha real de API) e a Atividade do Moskit tambem. Nem estagio nem
+    // contrato podem disparar — a consulta nao esta marcada em agenda nenhuma de verdade — mas as
+    // duas falhas tem que gerar nota (criarAtividadeMoskit posta a dela, registrarErroAgendamento
+    // posta a do Google), sem crash.
+    limpar();
+    agenda.respostaInsert = null;
+    rede.post = (url) => {
+      if (url.includes('/activities')) throw new Error('Moskit fora do ar');
+      return { status: 200, data: {} };
+    };
+    const row = semear(CHAT, { deal_id: 20 });
+    await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, true, row, CONFIRMADO);
+    igual('os dois falharam → atividade_moskit_id continua nulo', linha(CHAT).atividade_moskit_id, null);
+    igual('   evento_calendar_criado continua 0', linha(CHAT).evento_calendar_criado, 0);
+    checar('   nota de falha da Atividade (criarAtividadeMoskit)',
+      notas().some((n) => n.corpo.description.includes('NAO entrou na agenda do Moskit')));
+    checar('   nota de falha do agendamento (Google)',
+      notas().some((n) => n.corpo.description.startsWith('❌') && n.corpo.description.includes("reading 'htmlLink'")));
+    checar('   sem nenhuma nota de sucesso (nem 📅 nem 🗓️ combinada)',
+      !notas().some((n) => n.corpo.description.startsWith('📅') || (n.corpo.description.startsWith('🗓️') && n.corpo.description.includes('NÃO foi criado'))));
+    checar('   e SEM avanco de estagio (nada foi marcado em agenda nenhuma)',
+      !notas().some((n) => n.corpo.description.includes('consulta agendada')));
   }
   {
     // Horario invalido com dupla confirmacao VALIDA nao pode ser silencioso. Antes era `return null`

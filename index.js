@@ -1789,7 +1789,12 @@ async function criarEventoGoogleCalendar(dados, chatId) {
   // ninguem marcou e ninguem soube", repetindo a cada ciclo de 5 min so no console.
   const inicioNaive = normalizarHorarioNaive(dados.data_hora_consulta);
   if (!inicioNaive) {
-    throw new Error(`horario da consulta invalido ("${dados.data_hora_consulta}") — esperado AAAA-MM-DDTHH:MM:00 em hora do escritorio`);
+    const erro = new Error(`horario da consulta invalido ("${dados.data_hora_consulta}") — esperado AAAA-MM-DDTHH:MM:00 em hora do escritorio`);
+    // Marca o erro pra handleAgendamentoCalendar distinguir "dado ruim" (sem data confiavel, aborta
+    // tudo) de falha real da API do Google (rede/OAuth/quota — nesse caso a Atividade do Moskit ainda
+    // pode e deve nascer, ver comentario la).
+    erro.horarioInvalido = true;
+    throw erro;
   }
   const fimNaive = somarMinutosNaive(inicioNaive, 60); // duracao media de 1h
   const presencial = dados.modalidade_consulta === 'presencial';
@@ -1878,18 +1883,45 @@ async function handleAgendamentoCalendar(dealId, dados, chatId, pagamentoVerific
     return;
   }
 
+  // Google e Moskit sao tentados de forma DESACOPLADA a partir daqui: uma falha real da API do
+  // Google (rede, token expirado, quota) nao pode impedir a Atividade de nascer na agenda do Moskit
+  // — foi exatamente essa dependencia (Moskit so era tentado DEPOIS do Google ter sucesso, dentro do
+  // mesmo try) que deixou as DUAS agendas vazias no deal 48474073 quando so o Google falhou.
+  //
+  // "Data invalida" (eco da data-ancora, formato estranho — `erro.horarioInvalido`) e um caso
+  // DIFERENTE e continua abortando tudo: sem uma data confiavel nao existe reuniao pra marcar em
+  // lugar nenhum, nem Google nem Moskit.
+  let evento = null;
+  let erroGoogle = null;
   try {
-    const evento = await criarEventoGoogleCalendar(dadosEvento, chatId);
-    if (!evento) return;
+    evento = await criarEventoGoogleCalendar(dadosEvento, chatId);
+  } catch (e) {
+    if (e.horarioInvalido) {
+      console.error(`  ❌ Erro ao criar evento no Google Calendar: ${e.message}`);
+      await registrarErroAgendamento(dealId, chatId, e.message, false);
+      return; // dado ruim: sem isso, o avanco de estagio abaixo rodaria com uma data que nao presta
+    }
+    erroGoogle = e; // falha real de API/rede/OAuth — a Atividade do Moskit ainda pode e deve nascer
+    console.error(`  ❌ Erro ao criar evento no Google Calendar: ${e.message}`);
+  }
+
+  if (evento) {
     db.prepare('UPDATE conversations SET evento_calendar_criado = 1, evento_calendar_id = ?, evento_calendar_data = ?, agendamento_pendente_hash = NULL, agendamento_erro_hash = NULL WHERE chat_id = ?').run(evento.id, apuracao.horarioIso, chatId);
-    const dataFormatada = formatarHorarioEscritorio(apuracao.horarioIso);
-    const meetLink = extrairMeetLink(evento);
-    const notaComprovante = pagamentoVerificado ? ' (comprovante verificado)' : ' ⚠️ SEM comprovante verificado';
-    const evidencia = `\nCliente aceitou: "${apuracao.cliente.trecho}" · Equipe confirmou: "${apuracao.equipe.trecho}"`;
-    // A mesma consulta na agenda do CRM. Antes da nota, para que ela ja diga se entrou ou nao.
-    const naAgendaMoskit = await registrarConsultaNaAgendaMoskit({
-      dealId, dados: dadosEvento, chatId, horarioIso: apuracao.horarioIso, meetLink, eventoId: evento.id, row,
-    });
+  }
+  const dataFormatada = formatarHorarioEscritorio(apuracao.horarioIso);
+  const meetLink = evento ? extrairMeetLink(evento) : null;
+  const notaComprovante = pagamentoVerificado ? ' (comprovante verificado)' : ' ⚠️ SEM comprovante verificado';
+  const evidencia = `\nCliente aceitou: "${apuracao.cliente.trecho}" · Equipe confirmou: "${apuracao.equipe.trecho}"`;
+
+  // Tenta a Atividade do Moskit INDEPENDENTE do Google ter dado certo — o que garante que o deal
+  // tenha a consulta marcada em pelo menos uma agenda mesmo com o Google fora do ar. Com eventoId
+  // nulo, `registrarConsultaNaAgendaMoskit` ainda grava `atividades_sincronizadas` (trava
+  // anti-duplicado), so sem apontar pra um evento que nao existe.
+  const naAgendaMoskit = await registrarConsultaNaAgendaMoskit({
+    dealId, dados: dadosEvento, chatId, horarioIso: apuracao.horarioIso, meetLink, eventoId: evento?.id || null, row,
+  });
+
+  if (evento) {
     await criarNotaMoskit(dealId, `📅 Reunião agendada no Google Calendar: ${dataFormatada}${notaComprovante}${evidencia}${meetLink ? `\nLink do Meet: ${meetLink}` : ''}${naAgendaMoskit ? '\n🗓️ Também marcada na agenda do Moskit.' : ''}`);
     await notificarTelegramMeet({
       nome: dados.nome,
@@ -1899,17 +1931,26 @@ async function handleAgendamentoCalendar(dealId, dados, chatId, pagamentoVerific
       meetLink,
       dealId,
     });
-  } catch (e) {
-    console.error(`  ❌ Erro ao criar evento no Google Calendar: ${e.message}`);
-    // Ate aqui, so o console sabia disso. A dupla confirmacao JA aconteceu (cliente + equipe) —
-    // sem essa nota, a falha (token expirado, rede, quota da API) fica invisivel pro escritorio.
-    await registrarErroAgendamento(dealId, chatId, e.message, false);
-    return; // sem isso, o avanco de estagio abaixo rodaria mesmo com o evento falhando
+  } else if (erroGoogle) {
+    // A dupla confirmacao e a data sao boas — so a chamada ao Google falhou de verdade. Uma nota
+    // otimista aqui seria mentira se a Atividade TAMBEM tiver falhado (criarAtividadeMoskit ja posta
+    // a propria nota de falha nesse caso); por isso o texto se ajusta conforme `naAgendaMoskit`.
+    await criarNotaMoskit(dealId, naAgendaMoskit
+      ? `🗓️ Consulta marcada na agenda do Moskit: ${dataFormatada}${evidencia}\n⚠️ Mas o evento no Google Calendar/Meet NÃO foi criado (${erroGoogle.message}). Será tentado de novo automaticamente no próximo reprocessamento.`
+      : `⚠️ A consulta foi confirmada (${dataFormatada})${evidencia}, mas NEM o Google Calendar NEM a agenda do Moskit foram atualizados (Google: ${erroGoogle.message}). Verificar manualmente.`);
+    await registrarErroAgendamento(dealId, chatId, erroGoogle.message, false);
   }
-  // Evento criado com sucesso agora — mesmo raciocinio do outro ramo (evento que ja existia):
-  // avanca pra "consulta_agendada" se ainda nao passou desse ponto.
-  await moverEstagioSeAvancar(dealId, 'consulta_agendada');
-  await handleContratoZapSign(dealId, dados, chatId, row);
+  // evento nulo sem erroGoogle = Google nao configurado (getGoogleAuthClient() devolveu null, tipico
+  // de ambiente sem as credenciais) — nao e falha de producao, so segue: a Atividade do Moskit ja foi
+  // tentada acima.
+
+  // Avanca de estagio e dispara o contrato sempre que a consulta esta marcada em QUALQUER UMA das
+  // duas agendas — e essa marcacao real, nao so a intencao do Google ter dado certo, que importa
+  // pro funil (e e exatamente isso que o usuario pediu: a Atividade aparecer no deal).
+  if (evento || naAgendaMoskit) {
+    await moverEstagioSeAvancar(dealId, 'consulta_agendada');
+    await handleContratoZapSign(dealId, dados, chatId, row);
+  }
 }
 
 // Gera automaticamente o contrato de Prestacao de Servico no ZapSign, preenchido com os dados que
