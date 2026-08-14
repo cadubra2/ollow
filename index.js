@@ -86,6 +86,15 @@ const AGENDA_MOSKIT_DRY_RUN = process.env.AGENDA_MOSKIT_DRY_RUN === 'true'; // d
 // nenhum aviso novo. Perto o bastante da reuniao, o aviso tem que repetir mesmo sem conteudo novo:
 // a PROXIMIDADE e o sinal de urgencia, nao depende do modelo acertar nada.
 const AGENDAMENTO_URGENCIA_HORAS = Number(process.env.AGENDAMENTO_URGENCIA_HORAS) || 48;
+// Janela (maior, em DIAS) usada so por reconciliarPendenciasAgendamento — a rede de seguranca pra
+// conversa que PAROU de vez (nenhuma mensagem nova de nenhum lado, entao nunca mais e reprocessada e
+// a escalada por proximidade acima nunca roda pra ela). Maior que AGENDAMENTO_URGENCIA_HORAS de
+// proposito: aquela e a escalada de uma conversa ATIVA (reage rodada a rodada, tanto faz avisar so na
+// vespera); esta e a unica chance de avisar sobre uma conversa muda, entao precisa de mais
+// antecedencia. Medido em 14/08/2026, deal 48466404 (Teresinha): pagou, perguntou o endereco do
+// escritorio, e a consulta ficaria descoberta ate a antecedencia de 48h se essa varredura usasse a
+// mesma janela da escalada ativa.
+const AGENDAMENTO_PENDENCIA_SILENCIOSA_DIAS = Number(process.env.AGENDAMENTO_PENDENCIA_SILENCIOSA_DIAS) || 7;
 // Cria evento/Meet sem comprovante quando o deal esta marcado como "consulta gratis" no Moskit.
 // Default DESLIGADO de proposito: sobe o codigo, roda GET /auditoria-consulta-gratis pra ver o que
 // seria liberado, e so entao liga no .env.
@@ -299,6 +308,15 @@ try { db.exec("ALTER TABLE conversations ADD COLUMN opcao_invalida_hash TEXT"); 
 // separada de agendamento_pendente_hash/agendamento_erro_hash: sao avisos com ciclo de vida diferente
 // (aquelas zeram quando o evento e criado/remarcado; esta e so um log de auditoria, nao depende disso).
 try { db.exec("ALTER TABLE conversations ADD COLUMN agendamento_divergencia_hash TEXT"); } catch {}
+// Ultimo agendamento_pendente_hash que ja gerou aviso da reconciliacao periodica
+// (reconciliarPendenciasAgendamento) — dedup PROPRIO, separado de agendamento_pendente_hash. Existe
+// porque uma conversa SILENCIOSA (sem mensagem nova de nenhum lado) nunca e reprocessada de novo —
+// medido em 14/08/2026 no deal 48466404 (Teresinha): ela pagou e perguntou o endereco do escritorio,
+// claramente achando que a consulta esta marcada, mas a dupla confirmacao nunca fechou (dia ambiguo,
+// "quarta ou quinta") e a conversa parou de receber mensagem. A escalada por proximidade dentro de
+// registrarAgendamentoPendente so roda quando a conversa E REPROCESSADA — uma conversa muda nunca
+// aciona isso. Levantamento em produção achou 17 negocios parados assim, alguns ha mais de uma semana.
+try { db.exec("ALTER TABLE conversations ADD COLUMN agendamento_pendencia_avisada TEXT"); } catch {}
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_contrato_zapsign_doc_token ON conversations(contrato_zapsign_doc_token)"); } catch {}
 
 db.exec(`
@@ -4324,6 +4342,10 @@ const RECONCILIACAO_PAUSA_MS = Number(process.env.RECONCILIACAO_PAUSA_MS) || 300
 let ultimoResumoReconciliacao = null;
 // Mesma ideia, para a reconciliacao de vinculo de Atividade x negocio (ver reconciliarVinculoAtividades).
 let ultimoResumoReconciliacaoAtividades = null;
+// Mesma ideia, para a reconciliacao de pendencias de agendamento em conversa silenciosa (ver
+// reconciliarPendenciasAgendamento) — so evita repetir o LOG de resumo; cada pendencia urgente ja
+// manda seu proprio Telegram individual, deduplicado por linha via agendamento_pendencia_avisada.
+let ultimoResumoReconciliacaoPendencias = null;
 
 // Nome canonico da area a partir do ID da opcao — o caminho inverso de buscarIdOpcao, usado pela
 // reconciliacao para adotar a area que esta no CRM como fonte da verdade.
@@ -4593,6 +4615,98 @@ async function rodarReconciliacaoVinculoAtividades() {
   if (r.erros.length) {
     await enviarTelegram(`${resumo}\n\nErro precisa de conferência manual (a atividade continua sem aparecer na tela do negócio).`);
   }
+  return r;
+}
+
+// Rede de seguranca pra pendencia de agendamento numa conversa que PAROU DE VEZ. A escalada por
+// proximidade dentro de registrarAgendamentoPendente (ver AGENDAMENTO_URGENCIA_HORAS) so roda quando a
+// conversa E REPROCESSADA — e nada neste codebase reprocessa uma conversa so porque o tempo passou
+// (so mensagem nova, via webhook ou sincronizarConversas achando algo novo no Zernio). Uma pendencia
+// sem nenhuma mensagem nova de nenhum lado fica congelada pra sempre. Medido em 14/08/2026, deal
+// 48466404 (Teresinha): pagou e perguntou o endereco do escritorio — claramente acha que a consulta
+// esta marcada — mas ninguem mais escreveu na conversa desde entao e a pendencia nunca escalou.
+//
+// NAO chama a OpenAI nem reprocessa a conversa — so lê o que ja esta gravado. `agendamento_pendente_hash`
+// tem o formato `${horarioRelatado}|${motivo}|...` desde a criacao da funcao (ver registrarAgendamentoPendente),
+// entao da pra reconstruir o horario em jogo mesmo quando `agendamento_apuracao` esta NULL (coluna
+// recente — conversas que nao rodam mais um ciclo completo desde 13/08 nunca a preenchem).
+async function reconciliarPendenciasAgendamento({ aplicar = false } = {}) {
+  const linhas = db.prepare(`
+    SELECT chat_id, deal_id, agendamento_pendente_hash, agendamento_pendencia_avisada
+      FROM conversations
+     WHERE agendamento_pendente_hash IS NOT NULL
+  `).all();
+
+  const relatorio = { aplicar, analisados: 0, avisados: [], erros: [] };
+  const janelaHoras = AGENDAMENTO_PENDENCIA_SILENCIOSA_DIAS * 24;
+
+  for (const linha of linhas) {
+    relatorio.analisados++;
+    if (linha.agendamento_pendente_hash === linha.agendamento_pendencia_avisada) continue; // ja avisado, nada mudou
+
+    try {
+      const [horarioRelatado, motivo] = String(linha.agendamento_pendente_hash).split('|');
+
+      // Sinal independente de proximidade: comprovante ja verificado pra esse deal e compromisso real,
+      // nao hipotese — avisa incondicionalmente, mesmo que o horario esteja fora da janela ou ausente.
+      const comprovante = linha.deal_id
+        ? db.prepare('SELECT 1 FROM comprovantes WHERE deal_id = ? AND match = 1 LIMIT 1').get(linha.deal_id)
+        : null;
+
+      let urgente = !!comprovante;
+      if (!urgente && horarioRelatado && horarioRelatado !== 'null') {
+        const instante = horarioNaiveParaInstante(horarioRelatado, TZ_ESCRITORIO);
+        if (instante) {
+          const horasAteReuniao = (new Date(instante).getTime() - Date.now()) / 3_600_000;
+          // Janela grande pra frente (a antecedencia que essa varredura existe pra dar) e um pouco
+          // pra tras (a reuniao pode ja ter passado sem ninguem notar — vale avisar tambem).
+          urgente = horasAteReuniao <= janelaHoras && horasAteReuniao >= -AGENDAMENTO_URGENCIA_HORAS;
+        }
+      }
+      if (!urgente) continue;
+
+      relatorio.avisados.push({ chat_id: linha.chat_id, deal_id: linha.deal_id, horarioRelatado, motivo, comprovante: !!comprovante });
+      if (!aplicar) continue;
+
+      await enviarTelegram([
+        '⏰ *Pendência de agendamento parada — conversa SILENCIOSA*',
+        `Chat: \`${linha.chat_id}\``,
+        linha.deal_id ? `Negócio: https://app.ollow.com.br/?/deal/${linha.deal_id}` : '',
+        horarioRelatado && horarioRelatado !== 'null' ? `Horário em jogo: ${formatarHorarioEscritorio(horarioRelatado)}` : 'Horário em jogo: nenhum ainda extraído',
+        `Situação: ${descreverPendencia({ motivo })}`,
+        comprovante ? '💳 Comprovante JÁ verificado para este negócio — compromisso real, não hipótese.' : '',
+        '',
+        'O bot NÃO reprocessa uma conversa sozinho quando ela para de receber mensagem — conferir manualmente e mandar mensagem pra retomar se precisar.',
+      ].filter(Boolean).join('\n'));
+      db.prepare('UPDATE conversations SET agendamento_pendencia_avisada = ? WHERE chat_id = ?').run(linha.agendamento_pendente_hash, linha.chat_id);
+      console.log(`  ⏰ Deal ${linha.deal_id}: pendencia de agendamento parada e urgente — Telegram enviado`);
+    } catch (e) {
+      relatorio.erros.push({ chat_id: linha.chat_id, deal_id: linha.deal_id, erro: e.message });
+      console.error(`  ❌ Reconciliacao de pendencia de agendamento (deal ${linha.deal_id}): ${e.message}`);
+    }
+  }
+
+  return relatorio;
+}
+
+async function rodarReconciliacaoPendenciasAgendamento() {
+  const r = await reconciliarPendenciasAgendamento({ aplicar: true });
+  if (!r.avisados.length && !r.erros.length) return r;
+
+  console.log(`  ⏰ Reconciliacao de pendencia de agendamento: ${r.analisados} conferida(s), ${r.avisados.length} avisada(s), ${r.erros.length} erro(s)`);
+
+  const linhasResumo = [
+    r.avisados.length ? `⏰ ${r.avisados.length} pendência(s) urgente(s) em conversa(s) silenciosa(s)` : '',
+    ...r.erros.slice(0, 10).map((e) => `• Deal \`${e.deal_id}\`: ${e.erro}`),
+    r.erros.length > 10 ? `… e mais ${r.erros.length - 10}` : '',
+  ].filter(Boolean);
+
+  const resumo = `⏰ *Reconciliação de pendências de agendamento*\n${linhasResumo.join('\n')}`;
+  if (resumo === ultimoResumoReconciliacaoPendencias) return r; // nada novo desde a ultima rodada
+  ultimoResumoReconciliacaoPendencias = resumo;
+  // Cada pendencia urgente ja manda o proprio Telegram individual (acima) — este resumo e so log,
+  // nao precisa duplicar no Telegram (a diferenca do padrao das outras 2 reconciliacoes, que so
+  // resumem no fim: aqui cada caso ja e um alerta acionavel por si so, avisar de novo seria eco).
   return r;
 }
 
@@ -5056,6 +5170,14 @@ app.listen(PORT, () => {
     setInterval(() => {
       rodarReconciliacaoVinculoAtividades().catch((e) => console.error(`  ❌ Erro na reconciliacao de vinculo de atividade: ${e.message}`));
     }, RECONCILIACAO_INTERVAL_MS);
+
+    // Mesma cadencia e mesma flag: avisa sobre pendencia de agendamento numa conversa que PAROU DE VEZ
+    // (ver reconciliarPendenciasAgendamento) — a escalada por proximidade so roda dentro de um ciclo
+    // de reprocessamento, e uma conversa muda nunca e reprocessada de novo.
+    console.log(`   Reconciliacao de pendencia de agendamento: a cada ${Math.round(RECONCILIACAO_INTERVAL_MS / 60000)} min (janela de ${AGENDAMENTO_PENDENCIA_SILENCIOSA_DIAS} dias)`);
+    setInterval(() => {
+      rodarReconciliacaoPendenciasAgendamento().catch((e) => console.error(`  ❌ Erro na reconciliacao de pendencia de agendamento: ${e.message}`));
+    }, RECONCILIACAO_INTERVAL_MS);
   } else {
     console.log('   Reconciliacao de classificacao: DESLIGADA (RECONCILIACAO_ATIVA=false)');
   }
@@ -5131,6 +5253,8 @@ module.exports = {
   registrarBriefing,
   filtrarCamposPorAutoria,
   reconciliarClassificacao,
+  reconciliarVinculoAtividades,
+  reconciliarPendenciasAgendamento,
   buscarIdOpcao,
   handleAgendamentoCalendar,
   // Exportadas para teste: a data-ancora em texto do escritorio (nao em ISO) e o que impede o modelo

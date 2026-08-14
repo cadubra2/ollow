@@ -59,7 +59,7 @@ const {
   handleAgendamentoCalendar, listarAtividadesMoskit, finalizarCiclo,
   aplicarGateCasoDescrito, deveEsperarCasoDescrito, registrarBriefing, mergeDados,
   mesclarParaCrm, derivarAdvogadoDaArea, detectarOpcoesInvalidas, registrarOpcoesInvalidas,
-  reconciliarClassificacao, montarPayloadMoskit,
+  reconciliarClassificacao, reconciliarPendenciasAgendamento, montarPayloadMoskit,
   descreverAncora, somarMinutosNaive, formatarHorarioEscritorio,
 } = require('./index');
 const moskitIds = require('./src/moskit-ids');
@@ -464,6 +464,66 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     igual('   repetir a MESMA divergencia → nenhuma nota nova', notas().length, 1);
     igual('   nenhum Telegram novo', telegrams().length, 1);
   }
+
+  // ============================================================
+  // reconciliarPendenciasAgendamento: rede de seguranca pra conversa que PAROU DE VEZ (sem mensagem
+  // nova, a escalada por proximidade dentro do ciclo normal nunca roda pra ela — ver deal 48466404,
+  // Teresinha, medido em 14/08/2026). NAO chama a OpenAI: so relê agendamento_pendente_hash.
+  console.log('\n=== reconciliarPendenciasAgendamento: conversa silenciosa ===');
+  {
+    limpar();
+    const hashPerto = `${naiveDaquiA(24 * 3)}|falta_cliente|C`; // 3 dias, dentro da janela (7 dias)
+    semear(CHAT, { deal_id: 20, agendamento_pendente_hash: hashPerto });
+    const r1 = await reconciliarPendenciasAgendamento({ aplicar: true });
+    igual('conversa silenciosa, horario dentro da janela → 1 Telegram', telegrams().length, 1);
+    igual('   1 pendencia avisada no relatorio', r1.avisados.length, 1);
+    igual('   banco: agendamento_pendencia_avisada grava o hash avisado', linha(CHAT).agendamento_pendencia_avisada, hashPerto);
+    checar('   Telegram avisa que a conversa esta silenciosa', telegrams()[0]?.corpo?.text?.includes('SILENCIOSA'));
+
+    // Mesmo hash, rodada seguinte → dedup (nada mudou desde o ultimo aviso).
+    const r2 = await reconciliarPendenciasAgendamento({ aplicar: true });
+    igual('   rodar de novo com o MESMO hash → nenhum Telegram novo', telegrams().length, 1);
+    igual('   0 pendencias no relatorio (ja avisado)', r2.avisados.length, 0);
+
+    // Hash mudou (uma rodada real aconteceu de novo e ainda nao fechou) → avisa de novo.
+    const hashNovo = `${naiveDaquiA(24 * 2)}|falta_cliente|C`;
+    db.prepare('UPDATE conversations SET agendamento_pendente_hash = ? WHERE chat_id = ?').run(hashNovo, CHAT);
+    await reconciliarPendenciasAgendamento({ aplicar: true });
+    igual('   hash mudou → avisa de novo', telegrams().length, 2);
+  }
+  {
+    // Horario fora da janela de 7 dias — nao e urgente ainda, nao avisa.
+    limpar();
+    const hashLonge = `${naiveDaquiA(24 * 30)}|falta_equipe|C`;
+    semear(CHAT, { deal_id: 20, agendamento_pendente_hash: hashLonge });
+    const r = await reconciliarPendenciasAgendamento({ aplicar: true });
+    igual('horario fora da janela (30 dias) → nenhum Telegram', telegrams().length, 0);
+    igual('   0 pendencias no relatorio', r.avisados.length, 0);
+  }
+  {
+    // falta_ambos grava "null" no lugar do horario (ver registrarAgendamentoPendente) — nada pra medir
+    // proximidade, tem que pular sem lancar erro.
+    limpar();
+    semear(CHAT, { deal_id: 20, agendamento_pendente_hash: 'null|falta_ambos|C' });
+    const r = await reconciliarPendenciasAgendamento({ aplicar: true });
+    igual('falta_ambos sem horario → nenhum Telegram, sem erro', telegrams().length, 0);
+    igual('   0 erros no relatorio', r.erros.length, 0);
+  }
+  {
+    // Comprovante ja verificado pro deal → urgente INCONDICIONALMENTE, mesmo com horario fora da
+    // janela (ou sem horario nenhum) — compromisso real, nao hipotese (padrao Teresinha: pagou e
+    // perguntou o endereco do escritorio).
+    limpar();
+    const hashLonge = `${naiveDaquiA(24 * 30)}|falta_cliente|C`;
+    semear(CHAT, { deal_id: 20, agendamento_pendente_hash: hashLonge });
+    db.prepare('INSERT INTO comprovantes (chat_id, phone, deal_id, match) VALUES (?, ?, ?, 1)').run(CHAT, CHAT, 20);
+    const r = await reconciliarPendenciasAgendamento({ aplicar: true });
+    igual('comprovante verificado + horario longe → avisa mesmo assim', telegrams().length, 1);
+    checar('   Telegram menciona o comprovante', telegrams()[0]?.corpo?.text?.includes('Comprovante JÁ verificado'));
+    igual('   1 pendencia avisada, marcada com comprovante', r.avisados[0]?.comprovante, true);
+    db.prepare('DELETE FROM comprovantes WHERE deal_id = 20').run(); // nao vazar pros testes seguintes
+  }
+
   {
     // O horario que vale e o das observacoes, nao o dados.data_hora_consulta — que pode ter sido
     // herdado de uma rodada anterior pelo mergeDados.
