@@ -8,7 +8,7 @@ const Database = require('better-sqlite3');
 const fs = require('fs');
 const path = require('path');
 const { google } = require('googleapis');
-const { validarObservacoes, ultimaObservacao } = require('./src/evidencia');
+const { validarObservacoes, ultimaObservacao, motivoHorarioImplausivel, normalizarHorarioNaive, instanteParaNaiveLocal } = require('./src/evidencia');
 const { detectarBlocoCondicoes, contarAnexosIlegiveisEquipe } = require('./src/bloco-condicoes');
 const { apurarDuplaConfirmacao, descreverPendencia } = require('./src/agendamento');
 const { enfileirar, TEMP_DIR } = require('./src/fila');
@@ -41,9 +41,11 @@ const TZ_ESCRITORIO = process.env.TZ_ESCRITORIO || 'America/Fortaleza';
 // so como TRUQUE DE CALCULO (Brasil nao tem horario de verao desde 2019, entao "+1h de relogio" ==
 // "+1h real" para TZ_ESCRITORIO) — nunca usar esse valor como o instante real enviado a uma API
 // externa sem o timeZone explicito ao lado.
-function horarioNaiveValido(isoNaive) {
-  return !isNaN(Date.parse(`${isoNaive}Z`));
-}
+// horarioNaiveValido (`!isNaN(Date.parse(iso + 'Z'))`) foi removido: aceitava qualquer coisa que o
+// Date parseasse, inclusive "2026-08-05T17:30:00.000" com milissegundos, que passava aqui e era
+// recusada pela regex de horarioNaiveParaInstante — evento no Google sem a atividade no Moskit. Quem
+// valida horario agora e normalizarHorarioNaive/motivoHorarioImplausivel (src/evidencia.js), que
+// exigem formato exato e devolvem MOTIVO nomeado em vez de um booleano.
 function somarMinutosNaive(isoNaive, minutos) {
   const d = new Date(`${isoNaive}Z`);
   d.setUTCMinutes(d.getUTCMinutes() + minutos);
@@ -272,6 +274,13 @@ try { db.exec("ALTER TABLE conversations ADD COLUMN campos_travados TEXT"); } ca
 // preenchidos (para nao repetir a MESMA nota a cada ciclo — o deal 48423360 acumulou 6 identicas).
 try { db.exec("ALTER TABLE conversations ADD COLUMN briefing_hash TEXT"); } catch {}
 try { db.exec("ALTER TABLE conversations ADD COLUMN campos_nota_hash TEXT"); } catch {}
+// Ultima apuracao de dupla confirmacao desta conversa (JSON): as observacoes de horario validadas,
+// as duas pernas escolhidas e o motivo, quando nao fechou. Existe porque essa decisao so vivia num
+// console.log: quando o cliente do deal 47543238 esperou sozinho na sala e o do 48226006 ficou com a
+// reuniao no dia velho, nao havia como saber, depois do fato, se a perna do cliente nao foi emitida
+// pelo modelo ou se foi descartada na validacao — as duas hipoteses levam a correcoes opostas.
+// Guarda o ESTADO ATUAL (uma linha por conversa), nao historico: e o espelho da ultima rodada.
+try { db.exec("ALTER TABLE conversations ADD COLUMN agendamento_apuracao TEXT"); } catch {}
 // Hash do ultimo conjunto de valores que a IA devolveu e que nao existem na lista do CRM. Sem isso o
 // campo apenas nao era enviado e ninguem no escritorio ficava sabendo — e um valor recorrente ("Direito
 // Civil") continuava caindo no vazio indefinidamente em vez de virar apelido em src/moskit-ids.js.
@@ -632,6 +641,25 @@ function diaSemanaLocal(d) {
   const partes = new Intl.DateTimeFormat('en-US', { timeZone: TZ_ESCRITORIO, weekday: 'short' }).format(d);
   const idx = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].indexOf(partes);
   return DIAS_SEMANA[idx >= 0 ? idx : d.getDay()];
+}
+
+// A data-ancora em texto do escritorio, NUNCA em ISO. Medido em producao (13/08/2026): entregar a
+// ancora como "2026-08-10T18:54:58.000Z" fazia o modelo COPIAR essa string quando nao conseguia
+// derivar o horario da conversa — e o valor copiado e uma data valida, entao passava por qualquer
+// checagem de parse. Deu 5 casos em 32 conversas com horario, 3 deles com reuniao real na agenda
+// (deals 48370184, 48407621, 48177138 — ver o comentario em src/evidencia.js).
+//
+// Duas defesas em uma: o formato aqui nao se parece com o que o modelo tem que devolver (se ele
+// copiar, o valor nem chega a lugar nenhum — motivoHorarioImplausivel rejeita de saida por formato),
+// e a hora fica na do escritorio, igual a todo o resto do pipeline, em vez de UTC.
+function descreverAncora(isoAncora) {
+  const d = new Date(isoAncora);
+  if (isNaN(d.getTime())) return '(desconhecida — nao resolva dias relativos)';
+  const hora = new Intl.DateTimeFormat('pt-BR', {
+    timeZone: TZ_ESCRITORIO, hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  }).format(d);
+  const [ano, mes, dia] = diaLocal(d).split('-');
+  return `${dia}/${mes}/${ano} (${diaSemanaLocal(d)}), ${hora} — hora do escritorio`;
 }
 
 // Lista os proximos 14 dias com o nome do dia da semana, pra que o modelo so precise CONSULTAR a
@@ -1303,7 +1331,18 @@ async function criarAtividadeMoskit(dealId, payload) {
 // no Google ja foi movido quando chegamos aqui, e o pior desfecho e a agenda do CRM ficar no horario
 // velho — o que precisa virar nota, nao excecao.
 async function atualizarAtividadeMoskit(atividadeId, dueDate, dealId) {
-  if (!atividadeId || !dueDate) return false;
+  if (!atividadeId) return false;
+  // dueDate nulo aqui significa que horarioNaiveParaInstante recusou o horario DEPOIS de o evento no
+  // Google ja ter sido movido: as duas agendas ficam divergentes, e a do CRM mostrando o horario
+  // antigo e pior que nao mostrar nada, porque parece certo. Era um `return false` mudo, o unico ramo
+  // de falha do agendamento sem nota nenhuma no deal.
+  if (!dueDate) {
+    console.error(`  ❌ Atividade ${atividadeId}: horario invalido pra remarcar — agenda do CRM continua no horario antigo`);
+    if (dealId) {
+      await criarNotaMoskit(dealId, `⚠️ A reunião foi remarcada no Google Agenda, mas a atividade ${atividadeId} na agenda do Moskit NÃO foi movida (horário inválido na conversão de fuso). A agenda do CRM está mostrando o horário ANTIGO — corrigir na mão.`).catch(() => {});
+    }
+    return false;
+  }
   try {
     // MEDIDO em 12/08/2026 com test-moskit-atividade-real.js contra a API real: `/activities` tem a
     // MESMA peculiaridade do PUT de deal — um payload minimo `{dueDate}` e rejeitado com 422, e so o
@@ -1742,10 +1781,15 @@ async function criarEventoGoogleCalendar(dados, chatId) {
     return null;
   }
 
-  const inicioNaive = dados.data_hora_consulta;
-  if (!horarioNaiveValido(inicioNaive)) {
-    console.log(`  ⚠️ data_hora_consulta invalida: "${dados.data_hora_consulta}" — pulando criacao do evento`);
-    return null;
+  // Chegar aqui com horario invalido significa que a dupla confirmacao JA aconteceu (cliente e equipe
+  // concordaram) e ainda assim nao vai existir reuniao. Isso tem que LANCAR, nao devolver null: o
+  // catch de quem chama vira nota no deal + Telegram. Antes era `return null` silencioso, e foi
+  // exatamente esse silencio que deixou o caso do Arthur (deal 48370184) invisivel — a partir do
+  // guard de formato, o sintoma deixou de ser "reuniao no horario errado" e passou a ser "reuniao que
+  // ninguem marcou e ninguem soube", repetindo a cada ciclo de 5 min so no console.
+  const inicioNaive = normalizarHorarioNaive(dados.data_hora_consulta);
+  if (!inicioNaive) {
+    throw new Error(`horario da consulta invalido ("${dados.data_hora_consulta}") — esperado AAAA-MM-DDTHH:MM:00 em hora do escritorio`);
   }
   const fimNaive = somarMinutosNaive(inicioNaive, 60); // duracao media de 1h
   const presencial = dados.modalidade_consulta === 'presencial';
@@ -1948,15 +1992,43 @@ async function registrarAgendamentoPendente(dealId, chatId, apuracao, remarcacao
   if (!dealId) return;
   const motivo = apuracao?.motivo || 'falta_ambos';
   const horario = apuracao?.equipe?.horario_iso || apuracao?.cliente?.horario_iso || null;
-  const hash = `${horario}|${motivo}|${remarcacao ? 'R' : 'C'}`;
+  const descartados = apuracao?.horariosDescartados || [];
+  const hash = `${horario}|${motivo}|${remarcacao ? 'R' : 'C'}|${descartados.length}`;
 
   const atual = db.prepare('SELECT agendamento_pendente_hash FROM conversations WHERE chat_id = ?').get(chatId);
   if (atual?.agendamento_pendente_hash === hash) return;
 
   const quando = formatarHorarioEscritorio(horario) || 'horário ainda não definido';
   const acao = remarcacao ? 'Reunião NÃO remarcada' : 'Consulta NÃO lançada na agenda';
+  // Horario que o modelo devolveu e a rede deterministica recusou (eco da data-ancora, formato com
+  // fuso, madrugada). Vale na nota porque muda o diagnostico: nao e "o cliente ainda nao respondeu",
+  // e "o horario extraido nao servia" — sem isso a equipe procura a confirmacao que ja existe.
+  const detalheDescartado = descartados.length
+    ? `\nHorário extraído e recusado pela validação: ${descartados.map((d) => `"${d.valor}" (${d.motivo})`).join('; ')}`
+    : '';
   try {
-    await criarNotaMoskit(dealId, `⏳ ${acao}: ${quando} — ${descreverPendencia({ motivo })}. O evento é criado quando as duas confirmações aparecerem na conversa.`);
+    await criarNotaMoskit(dealId, `⏳ ${acao}: ${quando} — ${descreverPendencia({ motivo })}.${detalheDescartado}\nO evento é criado quando as duas confirmações aparecerem na conversa.`);
+
+    // Telegram so no que e acionavel e surpreendente. Uma REMARCACAO travada e o caso grave: ja existe
+    // reuniao na agenda e ela agora esta no horario errado — foi o que fez o cliente do deal 47543238
+    // esperar sozinho ("Estou aguardando aqui para o horario agendado") com o evento parado no dia
+    // velho. Horario recusado pela validacao tambem avisa, porque indica extracao quebrada. O que NAO
+    // avisa e a pendencia de rotina (falta a confirmacao de um dos lados num agendamento novo): isso e
+    // o fluxo normal do atendimento e viraria ruido diario no Telegram.
+    if (remarcacao || descartados.length) {
+      await enviarTelegram([
+        remarcacao ? `⚠️ *Reunião NÃO remarcada — agenda com horário velho*` : `⚠️ *Horário da consulta recusado pela validação*`,
+        `Chat: \`${chatId}\``,
+        dealId ? `Negócio: https://app.ollow.com.br/?/deal/${dealId}` : '',
+        `Horário em jogo: ${quando}`,
+        `Situação: ${descreverPendencia({ motivo })}`,
+        descartados.length ? `Recusado: ${descartados.map((d) => `"${d.valor}" — ${d.motivo}`).join('; ')}` : '',
+        '',
+        remarcacao
+          ? 'A reunião que já está na agenda continua no horário ANTIGO. Conferir a conversa e remarcar na mão.'
+          : 'Conferir na conversa qual horário foi combinado e marcar na mão se já estiver fechado.',
+      ].filter(Boolean).join('\n'));
+    }
     db.prepare('UPDATE conversations SET agendamento_pendente_hash = ? WHERE chat_id = ?').run(hash, chatId);
   } catch (e) {
     console.error(`  ❌ Erro ao anotar pendencia de agendamento no deal ${dealId}: ${e.message}`);
@@ -1981,6 +2053,16 @@ async function registrarErroAgendamento(dealId, chatId, mensagemErro, remarcacao
       dealId,
       `❌ Falha ao agendar: ${acao} — cliente e equipe já confirmaram o horário, mas a integração com o Google Calendar falhou (${mensagemErro}). Verificar manualmente e, se for token expirado, renovar com autorizar-google.js.`
     );
+    // Nota no deal nao e suficiente: ninguem abre o deal a tempo. As duas partes ja combinaram um
+    // horario e nao existe reuniao — isso tem que chegar em quem pode marcar na mao, hoje.
+    await enviarTelegram([
+      `❌ *Consulta confirmada mas NÃO agendada*`,
+      `Chat: \`${chatId}\``,
+      dealId ? `Negócio: https://app.ollow.com.br/?/deal/${dealId}` : '',
+      `Motivo: ${mensagemErro}`,
+      '',
+      `Cliente e equipe já confirmaram o horário, mas ${acao}. Marcar na mão e verificar a integração.`,
+    ].filter(Boolean).join('\n'));
     db.prepare('UPDATE conversations SET agendamento_erro_hash = ? WHERE chat_id = ?').run(hash, chatId);
   } catch (e) {
     console.error(`  ❌ Erro ao anotar FALHA de agendamento no deal ${dealId}: ${e.message}`);
@@ -1993,8 +2075,19 @@ async function atualizarEventoSeRemarcado(dealId, dados, chatId, row) {
   const auth = getGoogleAuthClient();
   if (!auth) return;
 
-  const novoInicioNaive = dados.data_hora_consulta;
-  if (!horarioNaiveValido(novoInicioNaive)) return;
+  // Ja veio saneado de processarConversaDirect (normalizarHorarioNaive/motivoHorarioImplausivel), mas
+  // handleAgendamentoCalendar tambem e chamado direto pelos testes e pelo reprocessamento manual —
+  // aqui e a ultima linha antes de um PATCH em reuniao de cliente real. Nao pode ser `return` mudo:
+  // quem chega aqui tem evento na agenda E dupla confirmacao valida, entao o horario velho continuar
+  // no lugar e um erro que precisa aparecer.
+  const novoInicioNaive = normalizarHorarioNaive(dados.data_hora_consulta);
+  if (!novoInicioNaive) {
+    if (dados.data_hora_consulta) {
+      console.log(`  ⚠️ remarcacao ignorada: horario invalido ("${dados.data_hora_consulta}")`);
+      await registrarErroAgendamento(dealId, chatId, `horario da consulta invalido ("${dados.data_hora_consulta}") — a reuniao na agenda continua no horario anterior`, true);
+    }
+    return;
+  }
 
   // evento_calendar_data grava sempre a mesma string naive usada no payload (criacao: acima em
   // handleAgendamentoCalendar; atualizacao: mais abaixo) — comparar por igualdade de STRING e mais
@@ -2156,6 +2249,8 @@ CAMPOS OPCIONAIS (usados pra agendar a reuniao no Google Agenda — deixe null s
    ATENCAO AO DIA DA SEMANA: se a conversa citar um dia pelo NOME ("quarta-feira", "na sexta") sem dizer o numero do dia, procure esse dia na tabela CALENDARIO DE REFERENCIA e use a PRIMEIRA ocorrencia DEPOIS da data-ancora. NUNCA calcule de cabeca. Se o dia citado for o mesmo dia da semana da data-ancora, use a ocorrencia da semana seguinte, a nao ser que a mensagem diga "hoje". Exemplo: data-ancora 2026-07-30 (quinta-feira), mensagem diz "quarta-feira" -> a tabela mostra 2026-08-05 = quarta-feira -> use 2026-08-05, NUNCA 2026-08-03.
    ATENCAO A PROPOSTA SEM RESPOSTA: se a ultima mensagem sobre horario for uma PROPOSTA da equipe que o cliente ainda nao aceitou (ex: "Podemos marcar na quarta as 17:30?" e nenhuma resposta depois), NAO troque a data — mantenha o horario ANTERIOR ja confirmado, ou null se nunca houve um.
    ATENCAO AO ANO: o resultado tem que ser uma data no FUTURO em relacao a data-ancora. Se o cliente mencionar so dia e mes (ex: "dia 9 de janeiro", "15 de marco") sem dizer o ano, calcule: se essa data (dia+mes) no ANO da data-ancora ja passou ou eh igual a data-ancora, use o ANO SEGUINTE. Exemplo: data-ancora 2026-07-24, cliente diz "dia 9 de janeiro" → 09/01 no ano 2026 ja passou → use 2027-01-09, NUNCA 2026-01-09.
+   FORMATO OBRIGATORIO: exatamente "AAAA-MM-DDTHH:MM:00" — hora do ESCRITORIO, sem "Z" e sem offset, e os segundos SEMPRE "00". Consulta e marcada em minuto redondo e dentro do horario comercial. Se o horario que voce ia devolver tem segundos diferentes de 00, ou cai de madrugada, ele nao veio da conversa: devolva null.
+   NUNCA use a data-ancora como resposta. Ela e a hora em que a ULTIMA MENSAGEM foi enviada, nao a hora da consulta. Se a conversa nao diz um dia/horario que as duas partes trataram, o valor correto e null — null e uma resposta certa, a hora da mensagem e sempre errada.
 9. email_cliente — email do cliente, APENAS se ele literalmente escreveu um email na conversa. Nunca invente ou derive de outro campo.
 10. estagio_funil_sugerido — analise a conversa (incluindo mensagens "Equipe do escritório:") e identifique se houve avanco no funil de vendas alem da consulta paga/agendada. Use null se nao houver sinal claro. Valores possiveis:
    - "aguardando_condicao": a consulta ja aconteceu (equipe ou cliente mencionam que a reuniao/consulta ja ocorreu) e agora esta aguardando retorno/decisao do cliente.
@@ -2203,7 +2298,7 @@ Tipos permitidos:
 - "cliente_declarou_perdido" (mensagem do CLIENTE) — o cliente diz explicitamente que nao vai contratar/seguir ("vou contratar outro advogado", "desisti do processo", "nao quero mais fechar"). Sem horario_iso.
 
 Regras de horario nas observacoes:
-- Resolva o horario_iso com a mesma tabela CALENDARIO DE REFERENCIA usada em data_hora_consulta, e com as mesmas regras de dia da semana e de ano.
+- Resolva o horario_iso com a mesma tabela CALENDARIO DE REFERENCIA usada em data_hora_consulta, e com as mesmas regras de dia da semana, de ano, de FORMATO OBRIGATORIO ("AAAA-MM-DDTHH:MM:00", segundos sempre 00) e a proibicao de usar a data-ancora como resposta.
 - Se o cliente aceitou uma proposta sem repetir o dia/hora ("pode ser"), use o horario da proposta a que ele respondeu.
 - Relate TODAS as ocorrencias, inclusive as antigas e as que se contradizem. O sistema usa a mais recente de cada tipo e sabe detectar sozinho que uma proposta nova reabriu a negociacao — nao tente filtrar nem resumir isso voce.
 - REGRA CRITICA: percorra a conversa DE TRAS PRA FRENTE e garanta que a ULTIMA mensagem que menciona dia/hora esteja na lista, seja ela do cliente ou da equipe. Vale mesmo que ela desmarque, adie ou troque um horario que ja estava confirmado antes ("surgiu um imprevisto, consegue na sexta as 16h?"). Omitir essa mensagem faz o sistema agendar num horario que ja foi abandonado — e o pior erro possivel aqui.
@@ -2320,7 +2415,7 @@ async function extrairDadosAtendimento(historico, temDeal, dadosAnteriores, info
     .replace('{calendarioReferencia}', montarReferenciaDeDatas(dataAtual || new Date().toISOString()))
     .replace('{dadosAnteriores}', contextoAnteriores)
     .replace('{infoCliente}', infoCliente || 'Nao')
-    .replace('{dataAtual}', dataAtual || new Date().toISOString());
+    .replace('{dataAtual}', descreverAncora(dataAtual || new Date().toISOString()));
   const conteudo = await openaiChat([
     { role: 'system', content: 'Voce e um analista juridico especializado em extracao de dados de conversas de WhatsApp para leads de escritorio de advocacia. Extraia APENAS informacoes que voce tem CERTEZA. Nao invente. Se nao tiver certeza de um campo, deixe como null (a nao ser que a regra diga o contrario). Responda apenas JSON.' },
     { role: 'user', content: prompt },
@@ -2541,11 +2636,58 @@ async function processarConversaDirect(chatId) {
       if (o._dataCorrigida) {
         console.log(`  🗓️ horario_iso corrigido (dia relativo "hoje/amanha/depois de amanha" batido contra o timestamp da msg ${o.msg_idx}): "${o._dataCorrigida}" → "${o.horario_iso}"`);
       }
+      if (o._horarioImplausivel) {
+        console.log(`  🚫 horario_iso descartado na msg ${o.msg_idx} — ${o._horarioImplausivel.motivo}`);
+      }
     }
+
+    // A mesma rede deterministica das observacoes, agora no campo solto do modelo.
+    // data_hora_consulta NAO passa por validarObservacoes, e e por ele que o eco da data-ancora
+    // chegou na agenda do deal 48407621 (valor gravado: "2026-08-07T20:19:05.000Z", que e a hora de
+    // envio da ultima mensagem). Continua valendo pra remarcacao: atualizarEventoSeRemarcado le este
+    // campo, nao apuracao.horarioIso.
+    if (dados.data_hora_consulta) {
+      const motivo = motivoHorarioImplausivel(dados.data_hora_consulta, dataAtual, diaLocal(new Date(dataAtual)));
+      if (motivo) {
+        console.log(`  🚫 data_hora_consulta descartada ("${dados.data_hora_consulta}") — ${motivo}`);
+        dados.data_hora_consulta = null;
+      } else {
+        dados.data_hora_consulta = normalizarHorarioNaive(dados.data_hora_consulta);
+      }
+    }
+
     const apuracao = apurarDuplaConfirmacao(obsValidas);
+    // Viaja junto com a apuracao pra chegar em registrarAgendamentoPendente: e a diferenca entre
+    // "ninguem confirmou ainda" e "alguem confirmou mas o horario extraido nao servia".
+    apuracao.horariosDescartados = obsValidas
+      .filter((o) => o._horarioImplausivel)
+      .map((o) => ({ msg_idx: o.msg_idx, ...o._horarioImplausivel }));
     console.log(`  🔐 Dupla confirmacao: ${apuracao.confirmado
       ? `OK para ${apuracao.horarioIso} (cliente msg ${apuracao.cliente.msg_idx}, equipe msg ${apuracao.equipe.msg_idx})`
       : `NAO — ${descreverPendencia(apuracao)}`}`);
+
+    // Espelha a decisao no banco pra ela ser auditavel depois do fato (ver a coluna
+    // agendamento_apuracao no topo). So o que importa pra reconstruir o "por que": as observacoes de
+    // horario com o indice da mensagem que as sustenta, e as pernas que a apuracao escolheu.
+    try {
+      db.prepare('UPDATE conversations SET agendamento_apuracao = ? WHERE chat_id = ?').run(JSON.stringify({
+        em: new Date().toISOString(),
+        ancora: dataAtual,
+        confirmado: apuracao.confirmado,
+        motivo: apuracao.motivo,
+        horarioIso: apuracao.horarioIso,
+        cliente: apuracao.cliente ? { tipo: apuracao.cliente.tipo, msg_idx: apuracao.cliente.msg_idx, horario_iso: apuracao.cliente.horario_iso, trecho: apuracao.cliente.trecho } : null,
+        equipe: apuracao.equipe ? { tipo: apuracao.equipe.tipo, msg_idx: apuracao.equipe.msg_idx, horario_iso: apuracao.equipe.horario_iso, trecho: apuracao.equipe.trecho } : null,
+        horariosDescartados: apuracao.horariosDescartados,
+        data_hora_consulta: dados.data_hora_consulta || null,
+        observacoesHorario: obsValidas
+          .filter((o) => /_horario$/.test(o.tipo))
+          .map((o) => ({ tipo: o.tipo, msg_idx: o.msg_idx, horario_iso: o.horario_iso, trecho: o.trecho, ...(o._dataCorrigida ? { _dataCorrigida: o._dataCorrigida } : {}), ...(o._horarioImplausivel ? { _horarioImplausivel: o._horarioImplausivel } : {}) })),
+        observacoesRejeitadas: obsRejeitadas.map((r) => ({ motivo: r.motivo, tipo: r.obs?.tipo, msg_idx: r.obs?.msg_idx, horario_iso: r.obs?.horario_iso })),
+      }), chatId);
+    } catch (e) {
+      console.error(`  ❌ Erro ao gravar apuracao de agendamento: ${e.message}`);
+    }
     // Sanitizar nome: rejeitar placeholders genericos que a IA inventa
     if (dados.nome) {
       const nome = dados.nome.trim();
@@ -2981,6 +3123,147 @@ app.get('/auditoria-consulta-gratis', exigeAdmin, rota(async (req, res) => {
   const liberariaPorGratis = linhas.filter((l) => l.decisao === 'liberaria por consulta gratis').length;
   console.log(`  🔍 ${linhas.length} atividades futuras analisadas — ${liberariaPorGratis} seriam liberadas por consulta gratis`);
   res.json({ ok: true, flag_ativa: LIBERAR_CONSULTA_GRATIS, total: linhas.length, liberaria_por_consulta_gratis: liberariaPorGratis, atividades: linhas });
+}));
+
+// Auditoria SO-LEITURA das TRES fontes de horario de uma consulta: o espelho local
+// (conversations.evento_calendar_data), o evento no Google Agenda e a Atividade na agenda do Moskit.
+//
+// Existe porque nada no sistema cruzava essas fontes, e foi cruzando as tres na mao que os 5 casos de
+// horario errado apareceram (13/08/2026). Divergencia entre elas e invisivel no dia a dia: cada tela
+// mostra um horario e todas parecem certas. Os casos reais que esta rota pega:
+//   deal 48226006 (Priscilla) — banco/Google em 07/08 14:00, decisao do bot em 10/08 14:00
+//   deal 47543238 (Rafael)    — evento parado em 29/07 depois de remarcado pra 04/08
+//   deal 48370184 (Arthur)    — valor gravado = hora de envio da ultima mensagem
+//
+// ?todas=1 inclui consulta passada (o padrao e so futura). ?desde=AAAA-MM-DD limita a janela.
+app.get('/auditoria-agenda', exigeAdmin, rota(async (req, res) => {
+  console.log('\n🔍 Auditoria de agenda: banco x Google x Moskit (so leitura)...');
+  const incluirPassadas = req.query.todas === '1';
+  const desde = /^\d{4}-\d{2}-\d{2}$/.test(req.query.desde || '') ? req.query.desde : null;
+  const hojeLocal = diaLocal(new Date());
+
+  const auth = getGoogleAuthClient();
+  const calendar = auth ? google.calendar({ version: 'v3', auth }) : null;
+  const linhas = [];
+
+  const rows = db.prepare(`
+    SELECT chat_id, contact_name, deal_id, evento_calendar_id, evento_calendar_data,
+           atividade_moskit_id, agendamento_apuracao
+      FROM conversations
+     WHERE evento_calendar_id IS NOT NULL AND evento_calendar_id <> ''
+  `).all();
+
+  for (const row of rows) {
+    const noBanco = row.evento_calendar_data || null;
+    let apuracao = null;
+    try { apuracao = row.agendamento_apuracao ? JSON.parse(row.agendamento_apuracao) : null; } catch {}
+
+    // Horario do Google, trazido pra hora do escritorio. Evento cancelado conta como divergencia:
+    // "cancelled" com o banco achando que a consulta existe e o pior estado possivel.
+    let noGoogle = null;
+    let statusGoogle = null;
+    if (calendar) {
+      try {
+        const { data } = await calendar.events.get({ calendarId: GOOGLE_CALENDAR_ID, eventId: row.evento_calendar_id });
+        statusGoogle = data.status;
+        noGoogle = data.start?.dateTime ? instanteParaNaiveLocal(data.start.dateTime) : null;
+      } catch (e) {
+        statusGoogle = `erro: ${e.code || e.message}`;
+      }
+    }
+
+    // Horario da Atividade no Moskit. dueDate e instante absoluto (ver "As duas agendas" no
+    // CLAUDE.md), entao volta pro naive local pela MESMA conversao usada na comparacao acima.
+    let noMoskit = null;
+    let statusMoskit = null;
+    if (row.atividade_moskit_id) {
+      try {
+        const r = await axios.get(`${MOSKIT_BASE}/activities/${row.atividade_moskit_id}`, {
+          headers: apiHeaders,
+          validateStatus: (s) => s < 500,
+        });
+        if (r.status >= 200 && r.status < 300) noMoskit = r.data?.dueDate ? instanteParaNaiveLocal(r.data.dueDate) : null;
+        else statusMoskit = `HTTP ${r.status}`;
+      } catch (e) {
+        statusMoskit = `erro: ${e.message}`;
+      }
+    }
+
+    const referencia = (noBanco || '').slice(0, 16) || noGoogle || noMoskit;
+    const diaReferencia = (referencia || '').slice(0, 10);
+    if (!incluirPassadas && diaReferencia && diaReferencia < hojeLocal) continue;
+    if (desde && diaReferencia && diaReferencia < desde) continue;
+
+    // `problemas` e so o que significa "a consulta pode estar no horario errado AGORA" — e a lista que
+    // alguem vai ler pra corrigir na mao. Tudo que e contexto vai pra `observacoes`: um item que
+    // dispara em toda linha nao e problema, e ruido, e afoga justamente os 3 casos que importam.
+    const problemas = [];
+    const observacoes = [];
+    const bancoMinuto = noBanco ? noBanco.slice(0, 16) : null;
+    const futura = diaReferencia && diaReferencia >= hojeLocal;
+
+    if (noBanco && !normalizarHorarioNaive(noBanco)) {
+      problemas.push(`espelho local em formato invalido ("${noBanco}") — nao e hora naive do escritorio, provavel timestamp copiado`);
+    }
+    if (bancoMinuto && noGoogle && bancoMinuto !== noGoogle) {
+      problemas.push(`banco (${bancoMinuto}) e Google (${noGoogle}) divergem`);
+    }
+    if (noGoogle && noMoskit && noGoogle !== noMoskit) {
+      problemas.push(`Google (${noGoogle}) e agenda do Moskit (${noMoskit}) divergem`);
+    }
+    if (apuracao?.horarioIso && bancoMinuto && apuracao.horarioIso.slice(0, 16) !== bancoMinuto) {
+      problemas.push(`ultima decisao do bot (${apuracao.horarioIso}) nao chegou na agenda (banco em ${bancoMinuto}) — remarcacao travada?`);
+    }
+    if (row.atividade_moskit_id && !noMoskit) {
+      problemas.push(`atividade ${row.atividade_moskit_id} nao pode ser lida na agenda do Moskit${statusMoskit ? ` (${statusMoskit})` : ''}`);
+    }
+    if (apuracao?.horariosDescartados?.length) {
+      problemas.push(`horario recusado pela validacao: ${apuracao.horariosDescartados.map((d) => `"${d.valor}" (${d.motivo})`).join('; ')}`);
+    }
+
+    if (statusGoogle && statusGoogle !== 'confirmed') {
+      // Cancelado nao e defeito por si: a equipe cancela consulta o tempo todo. Vira problema so se o
+      // bot ainda acha que ela vai acontecer.
+      (futura ? problemas : observacoes).push(`evento no Google com status "${statusGoogle}"`);
+    }
+    if (!row.atividade_moskit_id) {
+      // atividade_moskit_id nasceu em 12/08/2026; consulta anterior a isso nunca teve Atividade no CRM
+      // e nao ha o que corrigir numa consulta que ja passou.
+      (futura ? problemas : observacoes).push('consulta sem Atividade na agenda do Moskit (so existe no Google)');
+    }
+    if (!apuracao) {
+      observacoes.push('sem apuracao gravada (conversa nao reprocessada depois da coluna agendamento_apuracao existir)');
+    }
+
+    linhas.push({
+      chat_id: row.chat_id,
+      cliente: row.contact_name,
+      deal_id: row.deal_id,
+      evento_calendar_id: row.evento_calendar_id,
+      horario_no_banco: noBanco,
+      horario_no_google: noGoogle,
+      horario_na_agenda_moskit: noMoskit,
+      status_google: statusGoogle,
+      decisao_do_bot: apuracao?.horarioIso || null,
+      motivo_pendencia: apuracao?.confirmado === false ? apuracao?.motivo : null,
+      problemas,
+      observacoes,
+    });
+  }
+
+  const comProblema = linhas.filter((l) => l.problemas.length);
+  console.log(`  🔍 ${linhas.length} consultas conferidas — ${comProblema.length} com divergencia`);
+  for (const l of comProblema) {
+    console.log(`  ⚠️ deal ${l.deal_id} (${l.cliente}): ${l.problemas.join(' | ')}`);
+  }
+  res.json({
+    ok: true,
+    google_configurado: !!calendar,
+    escopo: incluirPassadas ? 'todas as consultas' : `consultas de ${hojeLocal} em diante`,
+    total: linhas.length,
+    com_divergencia: comProblema.length,
+    consultas: linhas,
+  });
 }));
 
 // Auditoria SO-LEITURA: lista estagios do funil (pipeline "Funil de Vendas", id 40631) com priority
@@ -3485,7 +3768,10 @@ async function sincronizarAtividadesMoskit() {
 
         stmtAtividadeMarcarSincronizada.run(atv.id, evento.data.id, dealId);
         relatorio.eventos_criados++;
-        console.log(`  ✅ Evento criado pra atividade "${atv.title}" (${inicio.toLocaleString('pt-BR')})`);
+        // Com timeZone explicito: sem ele este log sai na hora do SISTEMA (a VPS roda em UTC, 3h
+        // adiantado) enquanto a nota do mesmo deal, tres linhas abaixo, sai na hora do escritorio —
+        // o mesmo compromisso aparecia em dois horarios diferentes dependendo de onde se olhava.
+        console.log(`  ✅ Evento criado pra atividade "${atv.title}" (${inicio.toLocaleString('pt-BR', { timeZone: TZ_ESCRITORIO })})`);
 
         const meetLink = extrairMeetLink(evento.data);
         const dataFormatada = inicio.toLocaleString('pt-BR', { timeZone: TZ_ESCRITORIO });
@@ -4542,6 +4828,12 @@ module.exports = {
   reconciliarClassificacao,
   buscarIdOpcao,
   handleAgendamentoCalendar,
+  // Exportadas para teste: a data-ancora em texto do escritorio (nao em ISO) e o que impede o modelo
+  // de copiar a hora da ultima mensagem como horario da consulta, e a formatacao naive-como-UTC de
+  // somarMinutosNaive nunca teve teste direto — a virada de dia (23:30 + 60min) passava no escuro.
+  descreverAncora,
+  somarMinutosNaive,
+  formatarHorarioEscritorio,
   // Exportada para teste: a paginacao por pageToken (e NAO por ?page=) e o tipo de detalhe que passa
   // despercebido — o codigo antigo "paginava" e lia sempre os mesmos 10 registros sem erro nenhum.
   listarAtividadesMoskit,

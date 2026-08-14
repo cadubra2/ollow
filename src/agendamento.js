@@ -81,11 +81,16 @@ function pernaDoCliente(validas) {
 // "a partir do dia 10 nos podemos" vira "2026-08-10T00:00:00": o modelo resolveu o DIA e nao a HORA.
 // Meia-noite nunca e horario real de consulta, entao esse valor nao serve como perna de confirmacao —
 // senao a reuniao ia parar na agenda a 00:00. Visto em conversa real no replay.
+//
+// Le a hora da PROPRIA STRING, sem passar por Date: getHours() devolve a hora do fuso do PROCESSO, e
+// a VPS roda em UTC. Enquanto o valor e naive isso dava no mesmo, mas com um ISO que traga "Z" o
+// resultado mudava conforme o servidor — "2026-08-10T00:00:00Z" e meia-noite numa VPS em UTC (recusa)
+// e 21:00 do dia anterior em America/Fortaleza (aceita). Mesmo motivo de diaDoIsoNaive em
+// src/evidencia.js: horario naive nunca deve passar por Date.
 function horarioTemHoraDefinida(iso) {
-  if (!iso) return false;
-  const d = new Date(iso);
-  if (isNaN(d.getTime())) return false;
-  return !(d.getHours() === 0 && d.getMinutes() === 0);
+  const m = /^\d{4}-\d{2}-\d{2}T(\d{2}):(\d{2})/.exec(String(iso || ''));
+  if (!m) return false;
+  return !(m[1] === '00' && m[2] === '00');
 }
 
 function mesmoInstante(isoA, isoB) {

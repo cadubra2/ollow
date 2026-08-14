@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "node test-telefone.js && node test-moskit-ids.js && node test-atividade-moskit.js && node test-evidencia.js && node test-fila.js && node test-payload.js && node test-rotas.js && node test-pipeline.js && node test-agenda-dry-run.js && node test-guards-internos.js && node test-agendamento-bloco-mensagens.js && node test-transcricao.js && node test-zapsign.js",
+    "test": "node rodar-testes.js",
     "test:ia": "node test-dupla-confirmacao.js"
   },
   "keywords": [
