@@ -1925,6 +1925,12 @@ async function handleAgendamentoCalendar(dealId, dados, chatId, pagamentoVerific
     });
     if (naAgendaMoskit) {
       await criarNotaMoskit(dealId, '🗓️ Consulta marcada na agenda do Moskit (a atividade estava faltando e foi criada agora).');
+      // `row` e o snapshot lido ANTES deste ciclo — registrarConsultaNaAgendaMoskit acabou de gravar
+      // atividade_moskit_id no banco, mas o objeto em memoria continua com o valor antigo (nulo).
+      // Sem atualiza-lo aqui, atualizarEventoSeRemarcado (logo abaixo) nao acha a atividade que acabou
+      // de nascer e nao move o dueDate dela quando a remarcacao acontece NO MESMO ciclo da auto-cura —
+      // a atividade fica presa na data antiga (row.evento_calendar_data) pra sempre, sem nenhum sinal.
+      row = { ...row, atividade_moskit_id: db.prepare('SELECT atividade_moskit_id FROM conversations WHERE chat_id = ?').get(chatId)?.atividade_moskit_id };
     }
 
     // Remarcar uma reuniao ja marcada exige o MESMO criterio de criar. Sem essa trava, qualquer
