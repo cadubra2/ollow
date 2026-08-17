@@ -4810,8 +4810,10 @@ async function reconciliarVinculoAtividades({ aplicar = false } = {}) {
       await criarNotaMoskit(linha.deal_id, '🔁 Atividade da agenda religada automaticamente ao negócio (o Moskit tinha criado sem esse vínculo).').catch(() => {});
       console.log(`  🔁 Deal ${linha.deal_id}: atividade ${linha.atividade_moskit_id} religada ao negocio`);
     } catch (e) {
-      relatorio.erros_transitorios++;
       console.error(`  ❌ Reconciliacao de vinculo da atividade ${linha.atividade_moskit_id} (deal ${linha.deal_id}): ${e.message}`);
+      // A contagem de erros_transitorios acontece DENTRO de registrarFalhaVinculo (ramo de cooldown),
+      // mesma fonte para os tres caminhos de falha (status>=300, PUT que falhou e excecao) — sem isso
+      // uma excecao era contada duas vezes (aqui e la dentro).
       await registrarFalhaVinculo(linha, e.message, aplicar, relatorio, stmtFalhaVinculo, stmtAvisoVinculo, agora).catch(() => {});
     }
   }
