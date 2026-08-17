@@ -19,6 +19,7 @@ const { montarPayloadAtividade, horarioNaiveParaInstante } = require('./src/ativ
 const MOSKIT_IDS = require('./src/moskit-ids');
 const zapsign = require('./src/zapsign');
 const notasReuniao = require('./src/notas-reuniao');
+const briefing = require('./src/briefing');
 
 // ------------------------------------------------------------
 // Config
@@ -96,6 +97,14 @@ const AGENDAMENTO_URGENCIA_HORAS = Number(process.env.AGENDAMENTO_URGENCIA_HORAS
 // escritorio, e a consulta ficaria descoberta ate a antecedencia de 48h se essa varredura usasse a
 // mesma janela da escalada ativa.
 const AGENDAMENTO_PENDENCIA_SILENCIOSA_DIAS = Number(process.env.AGENDAMENTO_PENDENCIA_SILENCIOSA_DIAS) || 7;
+// Briefing pre-consulta: reprocessar a conversa algumas horas antes da consulta agendada para que a
+// nota reflita o que houve de ultimo (comprovante, dado novo, remarcacao). Conversa que recebe
+// mensagem nova ja e reprocessada sozinha; a consulta que NAO recebe mais nada e o caso que esta
+// rotina cobre (mesmo espirito de reconciliarPendenciasAgendamento). Custa ~2 chamadas OpenAI por
+// reprocessamento, por isso nasce ligado mas conservador: janela curta + teto por ciclo.
+const BRIEFING_REFRESH_ATIVO = process.env.BRIEFING_REFRESH_ATIVO !== 'false'; // default true
+const BRIEFING_REFRESH_ANTECEDENCIA_HORAS = Number(process.env.BRIEFING_REFRESH_ANTECEDENCIA_HORAS) || 4;
+const BRIEFING_REFRESH_MAX_POR_CICLO = Number(process.env.BRIEFING_REFRESH_MAX_POR_CICLO) || 5;
 // Cria evento/Meet sem comprovante quando o deal esta marcado como "consulta gratis" no Moskit.
 // Default DESLIGADO de proposito: sobe o codigo, roda GET /auditoria-consulta-gratis pra ver o que
 // seria liberado, e so entao liga no .env.
@@ -338,6 +347,14 @@ try { db.exec("ALTER TABLE conversations ADD COLUMN campos_travados TEXT"); } ca
 // Hashes de nota: briefing (para repostar quando o resumo do caso mudar de verdade) e nota de campos
 // preenchidos (para nao repetir a MESMA nota a cada ciclo — o deal 48423360 acumulou 6 identicas).
 try { db.exec("ALTER TABLE conversations ADD COLUMN briefing_hash TEXT"); } catch {}
+// Versao do ultimo briefing postado (titulo "📋 Briefing · v{n} · ..."). O historico de verdade e a
+// trilha de notas no deal; esta coluna so da o numero do proximo titulo (se uma nota for apagada na
+// mao o numero continua, e so cosmetica).
+try { db.exec("ALTER TABLE conversations ADD COLUMN briefing_versao INTEGER DEFAULT 0"); } catch {}
+// Horario de consulta (evento_calendar_data) para o qual o briefing ja foi "refrescado" pela rotina
+// refrescarBriefingsPertoDaConsulta. Dedup por horario: consulta nova (ou remarcada) volta a ser
+// processada; a mesma consulta nao gera reprocessamento repetido a cada ciclo.
+try { db.exec("ALTER TABLE conversations ADD COLUMN briefing_refresh_para TEXT"); } catch {}
 try { db.exec("ALTER TABLE conversations ADD COLUMN campos_nota_hash TEXT"); } catch {}
 // Ultima apuracao de dupla confirmacao desta conversa (JSON): as observacoes de horario validadas,
 // as duas pernas escolhidas e o motivo, quando nao fechou. Existe porque essa decisao so vivia num
@@ -1427,12 +1444,28 @@ async function registrarOpcoesInvalidas(dealId, chatId, invalidas) {
 //
 // Agora quem decide e o HASH do resumo: mudou de verdade => posta a versao nova. Texto igual nao gera
 // nota nenhuma, e o mesmo criterio dos outros hashes de nota (agendamento_pendente_hash etc).
-async function registrarBriefing(dealId, chatId, resumo, tituloInicial) {
-  if (!dealId || !resumo) return false;
+//
+// O texto da nota tem duas partes (ver src/briefing.js): um CABECALHO montado em codigo a partir dos
+// dados ja validados (nome, telefone, area, advogado, modalidade, horario) e a NARRATIVA que a IA
+// escreve (resumo_atendimento). O hash e sobre o texto final, entao remarcacao ou valor novo no
+// cabecalho repostam a nota mesmo que a narrativa nao tenha mudado.
+//
+// A trilha de notas e o historico de verdade: cada mudanca real posta uma nota NOVA com titulo
+// versionado ("📋 Briefing · v3 · 17/08/2026 15:30") e o historico nativo do Moskit mostra a evolucao.
+// O marcador [ollow-briefing] no fim identifica a nota como briefing. Versao vem de uma coluna do
+// banco (briefing_versao) — se uma nota for apagada na mao o numero continua, e so cosmetica.
+async function registrarBriefing(dealId, chatId, contexto) {
+  if (!dealId) return false;
 
-  const hash = crypto.createHash('sha1').update(String(resumo).replace(/\s+/g, ' ').trim()).digest('hex');
+  const texto = briefing.montarTextoBriefing(contexto || {});
+  if (!texto.trim()) {
+    console.log(`  ⏭️ briefing sem conteudo — nao postado`);
+    return false;
+  }
+
+  const hash = briefing.hashTextoBriefing(texto);
   const atual = chatId
-    ? db.prepare('SELECT briefing_hash, briefing_added FROM conversations WHERE chat_id = ?').get(chatId)
+    ? db.prepare('SELECT briefing_hash, briefing_added, briefing_versao FROM conversations WHERE chat_id = ?').get(chatId)
     : null;
 
   if (atual?.briefing_hash === hash) {
@@ -1449,10 +1482,14 @@ async function registrarBriefing(dealId, chatId, resumo, tituloInicial) {
     return false;
   }
 
-  const titulo = atual?.briefing_added ? '📋 Briefing atualizado' : tituloInicial;
-  await criarNotaMoskit(dealId, `${titulo}\n\n${resumo}`);
+  const versao = (atual?.briefing_versao || 0) + 1;
+  const data = new Intl.DateTimeFormat('pt-BR', {
+    timeZone: TZ_ESCRITORIO, day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  }).format(new Date());
+  const titulo = `📋 Briefing · v${versao} · ${data}`;
+  await criarNotaMoskit(dealId, `${titulo}\n\n${texto}\n\n${briefing.MARCADOR_BRIEFING}`);
   if (chatId) {
-    db.prepare('UPDATE conversations SET briefing_added = 1, briefing_hash = ? WHERE chat_id = ?').run(hash, chatId);
+    db.prepare('UPDATE conversations SET briefing_added = 1, briefing_hash = ?, briefing_versao = ? WHERE chat_id = ?').run(hash, versao, chatId);
   }
   console.log(`  ✅ ${titulo} registrado no deal ${dealId}`);
   return true;
@@ -2700,13 +2737,15 @@ Regras de horario nas observacoes:
 - So agendamos na agenda quando o CLIENTE aceitou E a EQUIPE confirmou o MESMO horario. Se so um dos dois falou, relate so o que existe; nao complete o que falta.
 
 INSTRUCOES PARA resumo_atendimento (briefing pre-consulta do advogado):
-Escreva um resumo ESPECIFICO e ACIONAVEL, nao generico. Use os fatos concretos que aparecem na conversa: nomes de pessoas ou empresas envolvidas, datas, valores, numero de processo, tipo de documento, prazos. Evite frases vagas tipo "cliente quer analise do caso" — prefira algo como "cliente foi notificado pela ANPD em 15/03 sobre vazamento de dados de clientes e quer saber se pode ser responsabilizado".
-Estruture em 4 linhas (uma por topico, com quebra de linha \n entre elas — NAO use "|"):
+Escreva um resumo ESPECIFICO e ACIONAVEL, nao generico. Use os fatos concretos que aparecem na conversa: nomes de pessoas ou empresas envolvidas, datas, valores, numero de processo, tipo de documento, prazos, providencias ja tomadas. Evite frases vagas tipo "cliente quer analise do caso" — prefira algo como "cliente foi notificado pela ANPD em 15/03 sobre vazamento de dados de clientes e quer saber se pode ser responsabilizado".
+Estruture em 6 linhas (uma por topico, com quebra de linha \n entre elas — NAO use "|"):
 📌 Caso: [o que aconteceu, com os detalhes concretos disponiveis — partes envolvidas, datas, valores, documentos]
 📌 Objetivo do cliente: [o que especificamente ele quer resolver, saber ou contratar]
 📌 Urgencia/prazo: [prazo, audiencia, notificacao ou data mencionada — se nao houver, escreva "Nao mencionado"]
 📌 Ja tentou: [acoes anteriores mencionadas pelo cliente — se nao houver, escreva "Nada mencionado"]
-Se a conversa nao tiver detalhe suficiente pra algum topico, escreva "Nao mencionado" em vez de inventar ou generalizar.
+📌 Pendencias: [o que ainda falta resolver ou o que o advogado deve preparar para a consulta — documentos a pedir, situacao a investigar; se nao houver, escreva "Nao mencionado"]
+📌 Documentos citados: [documentos, contratos, processos, comprovantes que o cliente citou na conversa — se nao houver, escreva "Nao mencionado"]
+Regra de ouro: NUNCA invente detalhe que nao esteja na conversa. Leia o que escreveu pensando "com isso o advogado prepara a reuniao?" — cada topico tem que ser util antes da consulta, nao um resumo administrativo do atendimento.
 
 EXEMPLOS REAIS DE CAPTACAO (captacao = quem TROUXE o lead; adv_resp = quem CUIDA da area — podem ser pessoas diferentes):
 - "Instagram do Bruno" + area=Familia → origem: Instagram, captacao: Bruno, adv_resp: Bruno
@@ -2747,7 +2786,7 @@ Formato de resposta (use dados reais extraidos, nao descricoes):
     "modalidade_consulta": "online",
     "status_negocio_sugerido": null,
     "motivo_perda_sugerido": null,
-    "resumo_atendimento": "📌 Caso: pai do cliente faleceu ha 3 meses e deixou uma casa; os dois irmaos querem vender o imovel sem repassar a parte do cliente na heranca.\n📌 Objetivo do cliente: entender seus direitos no inventario e formalizar a partilha antes que os irmaos vendam a casa.\n📌 Urgencia/prazo: Nao mencionado.\n📌 Ja tentou: Nada mencionado.",
+    "resumo_atendimento": "📌 Caso: pai do cliente faleceu ha 3 meses e deixou uma casa; os dois irmaos querem vender o imovel sem repassar a parte do cliente na heranca.\n📌 Objetivo do cliente: entender seus direitos no inventario e formalizar a partilha antes que os irmaos vendam a casa.\n📌 Urgencia/prazo: Nao mencionado.\n📌 Ja tentou: Nada mencionado.\n📌 Pendencias: pedir a certidao de obito e a matricula do imovel para a consulta.\n📌 Documentos citados: Nao mencionado.",
     "cpf": null,
     "profissao": null,
     "estado_civil": null,
@@ -3196,7 +3235,12 @@ async function processarConversaDirect(chatId) {
         row.briefing_added = 0;
       }
 
-      await registrarBriefing(dealId, chatId, dados.resumo_atendimento, '📋 Briefing pré-reunião');
+      await registrarBriefing(dealId, chatId, {
+        dados: dadosMesclados,
+        contato: row.contact_name,
+        telefone: chatId,
+        horarioConsulta: formatarHorarioEscritorio(apuracao?.horarioIso || row.evento_calendar_data),
+      });
 
       await finalizarCiclo({ dealId, dados, dadosMesclados, chatId, row, apuracao, acao, obsValidas,
         resumo: `Processamento de ${chatId} concluido` });
@@ -3224,7 +3268,12 @@ async function processarConversaDirect(chatId) {
       if (!dados.resumo_atendimento) {
         console.log(`  ⏭️ acao "nota" sem resumo — ignorando`);
       } else {
-        await registrarBriefing(dealId, chatId, dados.resumo_atendimento, '📋 Briefing pré-reunião');
+        await registrarBriefing(dealId, chatId, {
+          dados: mesclarParaCrm(dadosAnteriores, dados, obsValidas),
+          contato: row.contact_name,
+          telefone: chatId,
+          horarioConsulta: formatarHorarioEscritorio(apuracao?.horarioIso || row.evento_calendar_data),
+        });
       }
 
       await finalizarCiclo({
@@ -3290,7 +3339,12 @@ async function processarConversaDirect(chatId) {
 
       if (pendentes.length === 0) {
         console.log('  🎯 Todos os campos obrigatorios preenchidos!');
-        await registrarBriefing(dealId, chatId, dadosMesclados.resumo_atendimento, '📋 Briefing completo');
+        await registrarBriefing(dealId, chatId, {
+          dados: dadosMesclados,
+          contato: row.contact_name,
+          telefone: chatId,
+          horarioConsulta: formatarHorarioEscritorio(apuracao?.horarioIso || row.evento_calendar_data),
+        });
       }
 
       await finalizarCiclo({ dealId, dados, dadosMesclados, chatId, row, apuracao, acao, obsValidas,
@@ -4972,6 +5026,63 @@ async function rodarReconciliacaoPendenciasAgendamento() {
 }
 
 // ------------------------------------------------------------
+// Refresh do briefing perto da consulta agendada
+// ------------------------------------------------------------
+// O briefing so atualiza quando a conversa e reprocessada, e reprocessamento depende de mensagem nova
+// (webhook ou polling do Zernio). Uma consulta marcada sem mais conversa nenhuma deixaria o briefing
+// congelado no estado de quando a conversa parou — mesmo que o cliente tenha pagado, enviado dado
+// novo ou a consulta tenha sido remarcada depois. Medido no mesmo padrao de reconciliarPendenciasAgendamento
+// (deal 48466404, Teresinha: pagou e pediu o endereco depois da ultima reprocessao).
+//
+// Esta rotina reprocessa (uma vez por horario de consulta) as conversas com consulta marcada nas
+// proximas BRIEFING_REFRESH_ANTECEDENCIA_HORAS horas. O reprocessamento inteiro roda na fila/worker
+// normal (processarConversa) — a rotina so enfileira; o briefing vira nota nova se o texto mudou de
+// verdade (hash). Custa ~2 chamadas OpenAI por reprocessamento, por isso o teto por ciclo e a dedup
+// por horario (briefing_refresh_para): consulta nova/remarcada volta a ser processada, a MESMA nao.
+async function refrescarBriefingsPertoDaConsulta({ aplicar = false, maxPorCiclo = BRIEFING_REFRESH_MAX_POR_CICLO } = {}) {
+  const agora = new Date();
+  const janelaMs = BRIEFING_REFRESH_ANTECEDENCIA_HORAS * 3600000;
+
+  const linhas = db.prepare(`
+    SELECT chat_id, deal_id, contact_name, evento_calendar_data, briefing_refresh_para
+      FROM conversations
+     WHERE evento_calendar_criado = 1
+       AND deal_id IS NOT NULL
+       AND evento_calendar_data IS NOT NULL
+  `).all();
+
+  const relatorio = { aplicar, analisados: 0, enfileirados: [], erros: [] };
+
+  for (const linha of linhas) {
+    if (relatorio.enfileirados.length >= maxPorCiclo) break;
+    relatorio.analisados++;
+    if (linha.briefing_refresh_para === linha.evento_calendar_data) continue; // ja refrescado pra esse horario
+    const instante = horarioNaiveParaInstante(linha.evento_calendar_data, TZ_ESCRITORIO);
+    if (!instante) continue;
+    const horasAte = (new Date(instante).getTime() - agora.getTime()) / 3600000;
+    if (horasAte < 0 || horasAte > BRIEFING_REFRESH_ANTECEDENCIA_HORAS) continue;
+
+    relatorio.enfileirados.push({ chat_id: linha.chat_id, deal_id: linha.deal_id, evento_calendar_data: linha.evento_calendar_data });
+    if (!aplicar) continue;
+
+    try {
+      // Marca o horario ANTES de enfileirar: se a conversa ja estiver na fila, processarConversa so
+      // reagenda o timer — e o dedup evita que a MESMA consulta seja enfileirada a cada ciclo de
+      // 30 min enquanto o worker demora. Falha do processamento vai pelo caminho normal da fila
+      // (retry + desistencia + Telegram), nao por esta rotina.
+      db.prepare('UPDATE conversations SET briefing_refresh_para = ? WHERE chat_id = ?').run(linha.evento_calendar_data, linha.chat_id);
+      agendarProcessamento(linha.chat_id, 0);
+      console.log(`  🧷 Briefing: consulta de ${linha.chat_id} em ${formatarHorarioEscritorio(linha.evento_calendar_data)} — reprocessamento agendado`);
+    } catch (e) {
+      relatorio.erros.push({ chat_id: linha.chat_id, deal_id: linha.deal_id, erro: e.message });
+      console.error(`  ❌ Refresh de briefing (deal ${linha.deal_id}): ${e.message}`);
+    }
+  }
+
+  return relatorio;
+}
+
+// ------------------------------------------------------------
 // Backfill: criar deals pendentes
 // ------------------------------------------------------------
 async function backfillDeals() {
@@ -5069,7 +5180,12 @@ async function backfillDeals() {
           db.prepare("UPDATE conversations SET deal_id = ?, updated_at = datetime('now') WHERE chat_id = ?").run(deal.id, chatId);
 
           if (dados.resumo_atendimento) {
-            await criarNotaMoskit(deal.id, `📋 Briefing\n\n${dados.resumo_atendimento}`);
+            await registrarBriefing(deal.id, chatId, {
+              dados,
+              contato: row.contact_name || dados.nome,
+              telefone: phone || chatId,
+              horarioConsulta: null,
+            });
           }
 
           relatorio.deals_criados++;
@@ -6155,6 +6271,15 @@ app.listen(PORT, () => {
     console.log('   Reconciliacao de classificacao: DESLIGADA (RECONCILIACAO_ATIVA=false)');
   }
 
+  // Refresh do briefing antes da consulta. Independe de RECONCILIACAO_ATIVA (nao varre o Moskit —
+  // so le o banco local e enfileira); mesma cadencia e fase deslocada pra nao somar burst.
+  if (BRIEFING_REFRESH_ATIVO) {
+    console.log(`   Refresh de briefing pre-consulta: a cada ${Math.round(RECONCILIACAO_INTERVAL_MS / 60000)} min (ate ${BRIEFING_REFRESH_ANTECEDENCIA_HORAS}h antes, max ${BRIEFING_REFRESH_MAX_POR_CICLO}/ciclo)`);
+    agendarReconciliacao('refresco de briefing pre-consulta', () => refrescarBriefingsPertoDaConsulta({ aplicar: true }), 15);
+  } else {
+    console.log('   Refresh de briefing pre-consulta: DESLIGADO (BRIEFING_REFRESH_ATIVO=false)');
+  }
+
   // Expor via ngrok para receber webhooks do Zernio
   const { spawn } = require('child_process');
   const ngrokPath = process.platform === 'win32'
@@ -6228,6 +6353,7 @@ module.exports = {
   reconciliarClassificacao,
   reconciliarVinculoAtividades,
   reconciliarPendenciasAgendamento,
+  refrescarBriefingsPertoDaConsulta,
   garantirVinculoAtividadeDeal, // religar-atividade.js (script manual) religa e limpa o estado terminal
   buscarIdOpcao,
   handleAgendamentoCalendar,

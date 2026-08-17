@@ -69,11 +69,14 @@ const {
   aplicarGateCasoDescrito, deveEsperarCasoDescrito, registrarBriefing, mergeDados,
   mesclarParaCrm, derivarAdvogadoDaArea, detectarOpcoesInvalidas, registrarOpcoesInvalidas,
   reconciliarClassificacao, reconciliarPendenciasAgendamento, reconciliarVinculoAtividades, montarPayloadMoskit,
+  refrescarBriefingsPertoDaConsulta,
   descreverAncora, somarMinutosNaive, formatarHorarioEscritorio,
   stmtsNotas, registrarFalhaNota, conferirSilencioNotas, processarNotaReuniao,
 } = require('./index');
 const moskitIds = require('./src/moskit-ids');
 const notasReuniao = require('./src/notas-reuniao');
+const briefingModule = require('./src/briefing');
+const { instanteParaNaiveLocal } = require('./src/evidencia');
 const { BLOCO_CONDICOES_PAGA } = require('./src/bloco-condicoes');
 
 const db = new Database(process.env.DB_PATH);
@@ -1321,58 +1324,77 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
 
   // ============================================================
   // O briefing do deal 48423360 dizia "caso relacionado à LGPD" e ficou congelado: briefing_added era
-  // trava de uma vez so. Agora quem decide e o hash do resumo.
-  console.log('\n=== briefing: reposta quando o resumo muda de verdade ===');
+  // trava de uma vez so. Agora quem decide e o hash do TEXTO FINAL (cabeçalho em código + narrativa
+  // da IA), e cada mudança real posta uma nota NOVA com título versionado — a trilha é o histórico.
+  console.log('\n=== briefing: uma nota por mudanca real, com cabecalho deterministico ===');
   const CHAT_BRIEF = '5511988880000';
-  const RESUMO_A = '📌 Caso: cliente quer tratar de assunto relacionado à LGPD.';
-  const RESUMO_B = '📌 Caso: servidora exonerada quer remoção por motivo de saúde.';
+  const RESUMO_A = '📌 Caso: cliente quer tratar de assunto relacionado à LGPD.\n📌 Objetivo do cliente: entender a situação.\n📌 Urgencia/prazo: Nao mencionado.\n📌 Ja tentou: Nada mencionado.\n📌 Pendencias: Nao mencionado.\n📌 Documentos citados: Nao mencionado.';
+  const RESUMO_B = '📌 Caso: servidora exonerada quer remoção por motivo de saúde.\n📌 Objetivo do cliente: voltar ao cargo.\n📌 Urgencia/prazo: Nao mencionado.\n📌 Ja tentou: Nada mencionado.\n📌 Pendencias: Nao mencionado.\n📌 Documentos citados: Nao mencionado.';
+  const CTX_BRIEF = (dados, extra = {}) => ({ dados, contato: 'Fulano', telefone: CHAT_BRIEF, horarioConsulta: null, ...extra });
+  const corpo = () => notas()[0]?.corpo?.description || '';
   {
     limpar();
     semear(CHAT_BRIEF, { deal_id: 40 });
-    const postou = await registrarBriefing(40, CHAT_BRIEF, RESUMO_A, '📋 Briefing pré-reunião');
+    const postou = await registrarBriefing(40, CHAT_BRIEF, CTX_BRIEF({ nome: 'Fulano', resumo_atendimento: RESUMO_A }));
     igual('primeiro briefing → posta', postou, true);
-    checar('   com o titulo inicial', (notas()[0].corpo.description || '').includes('Briefing pré-reunião'), notas()[0]?.corpo?.description);
+    checar('   com titulo versionado v1', /📋 Briefing · v1 · /.test(corpo()), corpo());
+    checar('   com cabecalho deterministico', corpo().includes('Cliente: Fulano\nTelefone: 5511988880000'), corpo());
+    checar('   com a narrativa da IA', corpo().includes('assunto relacionado à LGPD'), corpo());
+    checar('   com o marcador no fim', corpo().includes(briefingModule.MARCADOR_BRIEFING), corpo());
     igual('   briefing_added marcado', linha(CHAT_BRIEF).briefing_added, 1);
     checar('   hash gravado', !!linha(CHAT_BRIEF).briefing_hash);
+    igual('   versao 1', linha(CHAT_BRIEF).briefing_versao, 1);
   }
   {
     limpar();
-    const postou = await registrarBriefing(40, CHAT_BRIEF, RESUMO_A, '📋 Briefing pré-reunião');
+    const postou = await registrarBriefing(40, CHAT_BRIEF, CTX_BRIEF({ nome: 'Fulano', resumo_atendimento: RESUMO_A }));
     igual('mesmo resumo → nao reposta', postou, false);
     igual('   nenhuma nota', notas().length, 0);
   }
   {
     limpar();
-    const postou = await registrarBriefing(40, CHAT_BRIEF, `  ${RESUMO_A}\n\n `, '📋 Briefing pré-reunião');
+    const postou = await registrarBriefing(40, CHAT_BRIEF, CTX_BRIEF({ nome: 'Fulano', resumo_atendimento: `  ${RESUMO_A}\n\n ` }));
     igual('so mudou espaco/quebra de linha → nao reposta', postou, false);
   }
   {
     limpar();
-    const postou = await registrarBriefing(40, CHAT_BRIEF, RESUMO_B, '📋 Briefing pré-reunião');
+    const postou = await registrarBriefing(40, CHAT_BRIEF, CTX_BRIEF({ nome: 'Fulano', resumo_atendimento: RESUMO_B }));
     igual('resumo mudou de verdade → reposta', postou, true);
-    checar('   agora como "Briefing atualizado"', (notas()[0].corpo.description || '').includes('Briefing atualizado'), notas()[0]?.corpo?.description);
-    checar('   com o texto novo', (notas()[0].corpo.description || '').includes('remoção por motivo de saúde'));
+    checar('   titulo v2', /📋 Briefing · v2 · /.test(corpo()), corpo());
+    checar('   com o texto novo', corpo().includes('remoção por motivo de saúde'), corpo());
+  }
+  {
+    // Mudanca so de CABEÇALHO (ex.: remarcacao) reposta mesmo com a narrativa igual — o hash e do
+    // texto final, nao so da prosa da IA.
+    limpar();
+    const postou = await registrarBriefing(40, CHAT_BRIEF, CTX_BRIEF(
+      { nome: 'Fulano', resumo_atendimento: RESUMO_B },
+      { horarioConsulta: '18/08/2026, 16:00' }
+    ));
+    igual('so o horario mudou → reposta', postou, true);
+    checar('   com o horario novo no cabecalho', corpo().includes('Consulta: 18/08/2026, 16:00'), corpo());
+    checar('   titulo v3', /📋 Briefing · v3 · /.test(corpo()), corpo());
   }
   {
     // Conversa anterior a esta mudanca (briefing_added=1, sem hash): adota o resumo atual como
     // referencia sem repostar, pra nao duplicar nota em todo deal ativo no primeiro ciclo apos deploy.
     limpar();
     semear(CHAT_BRIEF, { deal_id: 41, briefing_added: 1 });
-    const postou = await registrarBriefing(41, CHAT_BRIEF, RESUMO_A, '📋 Briefing pré-reunião');
+    const postou = await registrarBriefing(41, CHAT_BRIEF, CTX_BRIEF({ nome: 'Fulano', resumo_atendimento: RESUMO_A }));
     igual('linha antiga sem hash → nao reposta', postou, false);
     igual('   nenhuma nota escrita em deal existente', notas().length, 0);
     checar('   hash adotado como referencia', !!linha(CHAT_BRIEF).briefing_hash);
   }
   {
     limpar();
-    const postou = await registrarBriefing(41, CHAT_BRIEF, RESUMO_B, '📋 Briefing pré-reunião');
+    const postou = await registrarBriefing(41, CHAT_BRIEF, CTX_BRIEF({ nome: 'Fulano', resumo_atendimento: RESUMO_B }));
     igual('...e a proxima mudanca real ja reposta', postou, true);
-    checar('   como atualizado', (notas()[0].corpo.description || '').includes('Briefing atualizado'));
+    checar('   com titulo v1 (primeiro da linha migrada)', /📋 Briefing · v1 · /.test(corpo()), corpo());
   }
   {
     limpar();
-    igual('sem resumo → nao posta nada', await registrarBriefing(40, CHAT_BRIEF, null, '📋 Briefing pré-reunião'), false);
-    igual('sem dealId → nao posta nada', await registrarBriefing(null, CHAT_BRIEF, RESUMO_A, '📋 Briefing pré-reunião'), false);
+    igual('sem conteudo → nao posta nada', await registrarBriefing(40, CHAT_BRIEF, {}), false);
+    igual('sem dealId → nao posta nada', await registrarBriefing(null, CHAT_BRIEF, CTX_BRIEF({ nome: 'Fulano', resumo_atendimento: RESUMO_A })), false);
     igual('   nenhuma chamada de rede', rede.chamadas.length, 0);
   }
 
@@ -2016,6 +2038,67 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     igual('e-mail com "_" casa o deal certo, nao o vizinho', s.get.get('msg-email').deal_id, 70000002);
 
     db.prepare('DELETE FROM conversations WHERE deal_id IN (70000001, 70000002)').run();
+  }
+
+  // ============================================================
+  // Refresh do briefing antes da consulta: reprocessa (uma vez por horario de consulta) as conversas
+  // com consulta marcada nas proximas horas — o briefing de uma conversa que PAROU de receber
+  // mensagem nao atualiza sozinho, e e essa a janela em que o advogado vai ler a nota.
+  console.log('\n=== refresh de briefing perto da consulta ===');
+  const CHAT_CONS = '5511966660000';
+  const naive2h = instanteParaNaiveLocal(new Date(Date.now() + 2 * 3600000).toISOString());
+  const naive10h = instanteParaNaiveLocal(new Date(Date.now() + 10 * 3600000).toISOString());
+  const naivePassada = instanteParaNaiveLocal(new Date(Date.now() - 2 * 3600000).toISOString());
+  const semearConsulta = (chatId, data) => semear(chatId, { deal_id: 60, evento_calendar_criado: 1, evento_calendar_data: data });
+  // A rotina varre TODAS as conversas com consulta marcada — o bloco limpa o banco inteiro a cada
+  // cenario pra nenhum residuo de teste anterior contar no resultado.
+  const limparCons = () => { limpar(); db.prepare('DELETE FROM conversations').run(); };
+  {
+    limparCons();
+    semearConsulta(CHAT_CONS, naive2h);
+    const r = await refrescarBriefingsPertoDaConsulta({ aplicar: false });
+    igual('   consulta em 2h → enfileirada', r.enfileirados.length, 1);
+    igual('   com o chat certo', r.enfileirados[0]?.chat_id, CHAT_CONS);
+    igual('   sem aplicar → nada marcado', linha(CHAT_CONS).briefing_refresh_para, null);
+  }
+  {
+    limparCons();
+    semearConsulta(CHAT_CONS, naive2h);
+    db.prepare('UPDATE conversations SET briefing_refresh_para = ? WHERE chat_id = ?').run(naive2h, CHAT_CONS);
+    const r = await refrescarBriefingsPertoDaConsulta({ aplicar: true });
+    igual('   ja refrescada pro mesmo horario → nao enfileira', r.enfileirados.length, 0);
+  }
+  {
+    limparCons();
+    semearConsulta('5511966660000', naive10h);
+    semearConsulta('5511966660001', naive2h);
+    const r = await refrescarBriefingsPertoDaConsulta({ aplicar: false, maxPorCiclo: 1 });
+    igual('   10h (fora da janela) descartada; teto 1 → so a de 2h', r.enfileirados.length, 1);
+    igual('   a enfileirada', r.enfileirados[0]?.chat_id, '5511966660001');
+  }
+  {
+    limparCons();
+    semearConsulta(CHAT_CONS, naivePassada);
+    const r = await refrescarBriefingsPertoDaConsulta({ aplicar: false });
+    igual('   consulta ja passou → nao enfileira', r.enfileirados.length, 0);
+  }
+  {
+    limparCons();
+    semear(CHAT_CONS, { deal_id: 60, evento_calendar_criado: 0, evento_calendar_data: naive2h });
+    const r = await refrescarBriefingsPertoDaConsulta({ aplicar: false });
+    igual('   sem evento criado → nao enfileira', r.enfileirados.length, 0);
+  }
+  {
+    limparCons();
+    semearConsulta(CHAT_CONS, naive2h);
+    const r = await refrescarBriefingsPertoDaConsulta({ aplicar: true });
+    igual('   aplicar marca o horario', linha(CHAT_CONS).briefing_refresh_para, naive2h);
+    // Remarcacao muda o horario -> volta a enfileirar (dedup e por horario, nao por conversa).
+    const naive3h = instanteParaNaiveLocal(new Date(Date.now() + 3 * 3600000).toISOString());
+    db.prepare('UPDATE conversations SET evento_calendar_data = ? WHERE chat_id = ?').run(naive3h, CHAT_CONS);
+    const r2 = await refrescarBriefingsPertoDaConsulta({ aplicar: false });
+    igual('   remarcacao muda o horario → volta a enfileirar', r2.enfileirados.length, 1);
+    igual('   sem chamada de rede (so enfileira)', rede.chamadas.length, 0);
   }
 
   db.close();

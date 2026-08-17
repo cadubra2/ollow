@@ -21,6 +21,7 @@ const TESTES = [
   'test-moskit-ids.js',
   'test-atividade-moskit.js',
   'test-evidencia.js',
+  'test-briefing.js',
   'test-fila.js',
   'test-payload.js',
   'test-rotas.js',

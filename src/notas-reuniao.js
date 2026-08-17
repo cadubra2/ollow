@@ -324,6 +324,31 @@ const PADROES_ANCORA = [
 
 const soDigitos = (s) => String(s).replace(/\D/g, '');
 
+// Converte "3.500,00", "5000" ou "1.234,56" no numero que representam. Separador de milhar so e
+// removido quando ha exatamente tres digitos depois dele — assim "0301" de um numero de processo nao
+// vira parte de um valor.
+function comoNumero(bruto) {
+  const limpo = String(bruto).replace(/[^\d,.]/g, '').replace(/\.(?=\d{3}(\D|$))/g, '').replace(',', '.');
+  const n = Number(limpo);
+  return Number.isFinite(n) ? n : null;
+}
+
+// Todos os numeros que aparecem no texto-fonte, como VALORES e nao como cadeias de digitos.
+//
+// MEDIDO no e-mail real de 07/08/2026: o Gemini escreveu "precificada em 5000 reais para a primeira
+// instancia e 1500 reais para recursos de apelacao". Se o modelo devolver isso como "R$ 5.000,00" —
+// que e formatacao correta do MESMO valor — a comparacao por cadeia de digitos procuraria "500000"
+// num texto que tem "5000" e marcaria um valor CERTO como nao localizado. Falso alarme no campo de
+// honorarios e pior que nenhum aviso: ensina o advogado a ignorar o simbolo.
+function valoresDoTexto(texto) {
+  const valores = new Set();
+  for (const casado of String(texto || '').matchAll(/\d[\d.]*(?:,\d+)?/g)) {
+    const n = comoNumero(casado[0]);
+    if (n !== null) valores.add(n);
+  }
+  return valores;
+}
+
 // Confere cada numero da extracao contra o texto-fonte, comparando so os digitos — assim
 // "R$ 3.500,00" casa com "R$3.500,00" e "3500,00" sem depender de pontuacao.
 //
@@ -334,8 +359,9 @@ const soDigitos = (s) => String(s).replace(/\D/g, '');
 // que o advogado precisa. E o risco que se queria matar nao era a presenca do numero: era a
 // CONFIANCA que ele transmite. Marcado inline, o numero continua util e para de se passar por
 // verificado. Quem le decide.
-function conferirAncoragem(valor, digitosFonte) {
+function conferirAncoragem(valor, fonte) {
   if (typeof valor !== 'string' || !valor) return { valor, achados: [] };
+  const { digitosFonte, valoresFonte } = fonte;
 
   const achados = [];
   let saida = valor;
@@ -343,12 +369,21 @@ function conferirAncoragem(valor, digitosFonte) {
   for (const { nome, re } of PADROES_ANCORA) {
     for (const casado of valor.matchAll(re)) {
       const token = casado[0];
-      const digitos = soDigitos(token);
-      // Menos de 3 digitos nao identifica nada (um "1/2" da vida) e geraria ruido constante.
-      if (digitos.length < 3) continue;
-      if (digitosFonte.includes(digitos)) continue;
-      if (achados.some((a) => a.token === token)) continue;
 
+      // Dinheiro e comparado como NUMERO, nao como cadeia de digitos: "R$ 5.000,00" e "5000 reais"
+      // sao o mesmo valor e precisam casar. Documento, processo e data continuam por digitos, onde a
+      // identidade e a propria sequencia.
+      if (nome === 'valor') {
+        const n = comoNumero(token);
+        if (n === null || valoresFonte.has(n)) continue;
+      } else {
+        const digitos = soDigitos(token);
+        // Menos de 3 digitos nao identifica nada (um "1/2" da vida) e geraria ruido constante.
+        if (digitos.length < 3) continue;
+        if (digitosFonte.includes(digitos)) continue;
+      }
+
+      if (achados.some((a) => a.token === token)) continue;
       achados.push({ tipo: nome, token });
       saida = saida.split(token).join(`${token} [⚠ não localizado no texto]`);
     }
@@ -362,7 +397,7 @@ function conferirAncoragem(valor, digitosFonte) {
 function validarExtracao(bruto, textoFonte) {
   const avisos = [];
   const extracao = {};
-  const digitosFonte = soDigitos(textoFonte);
+  const fonte = { digitosFonte: soDigitos(textoFonte), valoresFonte: valoresDoTexto(textoFonte) };
 
   const entrada = bruto && typeof bruto === 'object' && !Array.isArray(bruto) ? bruto : {};
 
@@ -375,13 +410,13 @@ function validarExtracao(bruto, textoFonte) {
         .map((item) => (typeof item === 'string' ? item.trim() : ''))
         .filter(Boolean)
         .map((item) => {
-          const { valor: limpo, achados } = conferirAncoragem(item, digitosFonte);
+          const { valor: limpo, achados } = conferirAncoragem(item, fonte);
           for (const a of achados) avisos.push(`${chave}: ${a.tipo} "${a.token}" não aparece no texto da reunião`);
           return limpo;
         });
     } else {
       const texto = typeof valor === 'string' ? valor.trim() : '';
-      const { valor: limpo, achados } = conferirAncoragem(texto, digitosFonte);
+      const { valor: limpo, achados } = conferirAncoragem(texto, fonte);
       for (const a of achados) avisos.push(`${chave}: ${a.tipo} "${a.token}" não aparece no texto da reunião`);
       extracao[chave] = limpo;
     }

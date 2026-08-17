@@ -255,6 +255,13 @@
     <li>Contato buscado ou criado no Moskit</li>
     <li>Negócio criado ou atualizado com os campos personalizados</li>
     <li>Nota de briefing pré-consulta adicionada ao negócio</li>
+    <li>Briefing montado em duas camadas: cabeçalho (cliente, telefone, horário da consulta) em código + narrativa
+      da IA com as seções Caso / Objetivo / Urgência-prazo / Já tentou / Pendências / Documentos citados
+      (campo que não apareceu sai "Não mencionado.")</li>
+    <li>Cada mudança real posta nota NOVA com título versionado (📋 Briefing · vN · data) — o histórico do Moskit
+      é o histórico do briefing</li>
+    <li>Consulta marcada é reprocessada de propósito antes do horário (janela de 4h, 1x por horário), para a nota
+      não ficar congelada no estado em que a conversa parou</li>
   </ul>
 
   <div class="callout">ATENÇÃO. A busca por telefone exige no mínimo 8 dígitos coincidentes — evita reaproveitar

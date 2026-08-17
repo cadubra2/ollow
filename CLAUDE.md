@@ -370,6 +370,40 @@ risco de evento duplicado.
   o **inverso** de `FUNIL_DRY_RUN`: sem a variável, a agenda funciona. Aquelas flags seguram palpite
   de IA sobre funil; esta guarda uma regra determinística, então nasce ligada.
 
+### Briefing pré-consulta: a nota "📋 Briefing · vN · data" no deal
+
+O advogado abre o negócio no CRM minutos antes da consulta. Se a conversa parou no dia anterior, a
+nota que ele lê não pode ser a da hora em que o cliente sumiu. `registrarBriefing` (`index.js`) posta
+uma nota no deal com o estado atual da conversa, e o bot reprocessa de propósito antes do horário.
+
+- **Trilha de notas nativa, não edição in place.** Cada mudança real posta uma nota NOVA com título
+  versionado `📋 Briefing · v{n} · {dd/mm/aaaa hh:mm}` (data no fuso `TZ_ESCRITORIO`). A remarcação
+  conta como mudança real. O histórico do Moskit é o histórico do briefing — não existe "última nota
+  viva".
+- **Texto composto em duas camadas** ([src/briefing.js](src/briefing.js), módulo puro sem rede):
+  o **cabeçalho** é determinístico, montado em código (cliente, telefone, horário da consulta —
+  esvazia o campo se não houver); a **narrativa** é o `resumo_atendimento` que a IA produz. A saída
+  muda de formato sem depender de o modelo "aprender" o novo cabeçalho.
+- **O resumo do prompt ganhou 6 seções** (`Caso` / `Objetivo` / `Urgencia·prazo` / `Ja tentou` /
+  `Pendencias` / `Documentos citados`), com regra de ouro: campo que não apareceu na conversa sai
+  "Nao mencionado.", nunca "—" vazio nem chute.
+- **Hash sobre o texto final** (cabeçalho + narrativa, fora título/versão/data): valor novo,
+  narrativa nova ou mudança de horário repostam; só a data do título passando para a frente não.
+- **Aguardar mudança não basta.** O refresh da conversa depende de mensagem nova, e consulta marcada
+  não gera mensagem. `refrescarBriefingsPertoDaConsulta` roda no intervalo de
+  `RECONCILIACAO_INTERVAL_MS` (escalonado 15 min no boot) e reprocessa as conversas com consulta
+  marcada nas próximas `BRIEFING_REFRESH_ANTECEDENCIA_HORAS` horas (padrão 4) — janela conservadora
+  porque cada reprocessamento custa ~2 chamadas OpenAI. Dedup por linha com coluna
+  `briefing_refresh_para` (o horário para o qual já refrescou): remarcação volta a processar. Teto de
+  `BRIEFING_REFRESH_MAX_POR_CICLO` (padrão 5). `BRIEFING_REFRESH_ATIVO=false` desliga sem redeploy.
+- **Migração.** Linhas com `briefing_added=1` e sem `briefing_hash` adotam o hash sem repostar (a
+  nota já existe); linhas com hash do formato antigo (de 4 linhas) repostam naturalmente no próximo
+  reprocessamento — virada de formato sem script de backfill.
+- **`processar_pendentes.js` reposta no mesmo formato** (mesmo `src/briefing.js`), para a nota
+  religada nunca sair com cara diferente da rotina.
+- Regressões em `test-briefing.js` (módulo puro) e `test-pipeline.js` (call sites, versão, migração,
+  refresh perto da consulta).
+
 ### Notas de reunião do Gemini → nota no negócio
 
 O que acontece **dentro** da consulta não voltava para o CRM. `sincronizarNotasReuniao` (`index.js`,
@@ -485,6 +519,12 @@ em [src/notas-reuniao.js](src/notas-reuniao.js) (puro, sem rede); o `index.js` s
   propósito: o falso positivo é real (o valor pode ter sido dito por extenso) e apagar destruiria um
   dado que o advogado precisa — o risco a matar não era a presença do número, era a **confiança** que
   ele transmite.
+  **Dinheiro é comparado como NÚMERO, não como cadeia de dígitos.** MEDIDO no e-mail real de
+  07/08/2026: o Gemini escreve `"precificada em 5000 reais"`, sem formatação de moeda. Se o modelo
+  devolver isso como `R$ 5.000,00` — que é o mesmo valor, formatado — a comparação por dígitos
+  procuraria `500000` num texto que tem `5000` e marcaria um valor **certo** como não localizado.
+  Falso alarme no campo de honorários é pior que nenhum aviso: ensina o advogado a ignorar o símbolo.
+  Documento, processo e data continuam por dígitos, onde a identidade é a própria sequência.
 - **Credencial separada.** `google-oauth-token-notas.json`, cliente OAuth próprio, porta 8092
   (`autorizar-google-notas.js`). O token do bot tem escopo só de Calendar; somar Gmail/Drive a ele
   exigiria refazer o consentimento, e um consentimento refeito pode invalidar o refresh token em uso

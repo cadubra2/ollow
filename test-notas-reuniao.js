@@ -384,6 +384,49 @@ const FONTE = 'O advogado propos honorarios de R$ 3.500,00 divididos em 3x. '
 }
 
 {
+  // TEXTO REAL do e-mail do Gemini de 07/08/2026 (deal do Eric Ishibashi). Repare que o Gemini
+  // escreve valor SEM formatacao de moeda — "5000 reais", nao "R$ 5.000,00".
+  const REAL = 'A atuação jurídica foi precificada em 5000 reais para a primeira instância '
+    + 'e 1500 reais para recursos de apelação. Esta estrutura cobre petições iniciais, '
+    + 'acompanhamentos e eventuais agravos de instrumento.';
+
+  const { extracao, avisos } = validarExtracao({
+    resumo_caso: 'Transferência no programa Mais Médicos.',
+    // O prompt manda preservar o formato original, mas o modelo pode normalizar para moeda. Os dois
+    // sao o MESMO valor e nenhum pode virar alarme.
+    proposta_valores: 'R$ 5.000,00 para a primeira instância e R$ 1.500,00 para apelação.',
+  }, REAL);
+
+  checar('valor real escrito como "5000 reais" casa com "R$ 5.000,00"',
+    !extracao.proposta_valores.includes('⚠'), extracao.proposta_valores);
+  checar('   e nao gera aviso nenhum', avisos.length === 0, avisos);
+}
+
+{
+  // A contraprova: no MESMO texto real, um valor que nao foi dito continua sendo marcado. Sem isto a
+  // correcao acima teria simplesmente desligado o filtro de dinheiro.
+  const REAL = 'A atuação jurídica foi precificada em 5000 reais para a primeira instância.';
+  const { extracao, avisos } = validarExtracao({
+    resumo_caso: 'ok',
+    proposta_valores: 'Honorários de R$ 7.200,00 mais R$ 5.000,00 de entrada.',
+  }, REAL);
+
+  checar('valor inventado continua marcado', extracao.proposta_valores.includes('R$ 7.200,00 [⚠'), extracao.proposta_valores);
+  checar('   e o valor real ao lado NAO e marcado',
+    /R\$ 5\.000,00(?! \[⚠)/.test(extracao.proposta_valores), extracao.proposta_valores);
+  checar('   um unico aviso', avisos.length === 1, avisos);
+}
+
+{
+  // Centavos de verdade tambem precisam casar nos dois sentidos.
+  const { avisos: a1 } = validarExtracao({ resumo_caso: 'ok', proposta_valores: 'R$ 1.234,56' }, 'combinado 1234,56 no total');
+  checar('valor com centavos casa entre formatos', a1.length === 0, a1);
+
+  const { avisos: a2 } = validarExtracao({ resumo_caso: 'ok', proposta_valores: 'R$ 1.234,56' }, 'combinado 1234,65 no total');
+  checar('   mas digito trocado ainda e pego', a2.length === 1, a2);
+}
+
+{
   const { extracao, avisos, vazia } = validarExtracao({
     resumo_caso: '',
     documentos_solicitados: 'RG',            // string onde devia ser lista
