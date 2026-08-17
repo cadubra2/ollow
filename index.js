@@ -18,6 +18,7 @@ const { transcreverAudio } = require('./src/transcricao');
 const { montarPayloadAtividade, horarioNaiveParaInstante } = require('./src/atividade-moskit');
 const MOSKIT_IDS = require('./src/moskit-ids');
 const zapsign = require('./src/zapsign');
+const notasReuniao = require('./src/notas-reuniao');
 
 // ------------------------------------------------------------
 // Config
@@ -154,6 +155,53 @@ function getGoogleAuthClient() {
   client.setCredentials(JSON.parse(fs.readFileSync(caminhoToken, 'utf8')));
   googleOAuthClient = client;
   return googleOAuthClient;
+}
+
+// ------------------------------------------------------------
+// Notas de reuniao do Gemini (Google Meet) -> nota no negocio do Moskit
+// ------------------------------------------------------------
+// Credencial SEPARADA da de cima, de proposito. O token do bot tem escopo apenas de Calendar e e o
+// que faz o agendamento funcionar em producao; somar Gmail/Drive aquele consentimento exigiria
+// refaze-lo, e um consentimento refeito pode invalidar o refresh token em uso — ou seja, derrubar o
+// agendamento de consultas para ligar uma funcionalidade nova. Gerar com: node autorizar-google-notas.js
+const NOTAS_REUNIAO_ATIVO = process.env.NOTAS_REUNIAO_ATIVO === 'true';
+// Padrao DRY-RUN, no espirito de FUNIL_DRY_RUN: recurso novo nasce sem escrever no CRM. (O inverso
+// de AGENDA_MOSKIT_DRY_RUN, que guarda uma regra deterministica ja madura e nasce ligada.)
+const NOTAS_REUNIAO_DRY_RUN = process.env.NOTAS_REUNIAO_DRY_RUN !== 'false';
+const NOTAS_REMETENTE = process.env.NOTAS_REMETENTE || 'gemini-notes@google.com';
+const NOTAS_JANELA_DIAS = Number(process.env.NOTAS_JANELA_DIAS) || 30;
+const NOTAS_MAX_POR_CICLO = Number(process.env.NOTAS_MAX_POR_CICLO) || 20;
+const NOTAS_MAX_CHARS = Number(process.env.NOTAS_MAX_CHARS) || 120000;
+const NOTAS_SYNC_INTERVAL_MS = Number(process.env.NOTAS_SYNC_INTERVAL_MS) || 10 * 60 * 1000;
+// Teto de paginacao ao procurar o marcador nas notas de um deal. Medido em 16/08/2026: /deals/{id}/notes
+// devolve 10 por pagina (`limit` e ignorado, como em /activities) e pagina por `?start=`. O deal da
+// Lia ja tinha 40 notas — parar na primeira pagina responderia "nao achei" para uma nota existente,
+// que e justamente o caso em que o codigo postaria a segunda.
+const NOTAS_MAX_PAGINAS_BUSCA = Number(process.env.NOTAS_MAX_PAGINAS_BUSCA) || 20;
+// Mesmo numero e mesmo motivo do MAX_TENTATIVAS de src/fila.js: cada tentativa custa uma chamada a
+// OpenAI com o texto inteiro da reuniao, e falha permanente (deal apagado, Doc corrompido) nao pode
+// reprocessar para sempre. Sem esse teto, o e-mail voltava a cada ciclo, pagava IA de novo e nunca
+// avisava ninguem.
+const NOTAS_MAX_TENTATIVAS = Number(process.env.NOTAS_MAX_TENTATIVAS) || 3;
+// Dias sem NENHUM e-mail novo de notas antes de desconfiar. Nao e "ciclo vazio": a maioria dos ciclos
+// e vazia mesmo, porque o que ja foi processado sai da busca pelo rotulo. E silencio PROLONGADO —
+// que tem a mesma cara de "nao houve reuniao", "o token morreu" e "o Google mudou o formato do
+// assunto". Sem esse aviso, a falha mais provavel da rotina e tambem a unica invisivel.
+const NOTAS_SILENCIO_DIAS = Number(process.env.NOTAS_SILENCIO_DIAS) || 10;
+
+let googleOAuthClientNotas = null;
+function getGoogleAuthClientNotas() {
+  if (googleOAuthClientNotas) return googleOAuthClientNotas;
+  const caminhoClient = process.env.GOOGLE_OAUTH_CLIENT_NOTAS_JSON || './google-oauth-client-notas.json';
+  const caminhoToken = process.env.GOOGLE_OAUTH_TOKEN_NOTAS_JSON || './google-oauth-token-notas.json';
+  if (!fs.existsSync(caminhoClient) || !fs.existsSync(caminhoToken)) return null;
+  const arquivo = JSON.parse(fs.readFileSync(caminhoClient, 'utf8'));
+  const { client_id, client_secret, redirect_uris } = arquivo.installed || arquivo.web || {};
+  if (!client_id) return null;
+  const client = new google.auth.OAuth2(client_id, client_secret, redirect_uris?.[0]);
+  client.setCredentials(JSON.parse(fs.readFileSync(caminhoToken, 'utf8')));
+  googleOAuthClientNotas = client;
+  return googleOAuthClientNotas;
 }
 
 // HTTP agent compartilhado para evitar exaustao de conexoes
@@ -317,6 +365,18 @@ try { db.exec("ALTER TABLE conversations ADD COLUMN agendamento_divergencia_hash
 // registrarAgendamentoPendente so roda quando a conversa E REPROCESSADA — uma conversa muda nunca
 // aciona isso. Levantamento em produção achou 17 negocios parados assim, alguns ha mais de uma semana.
 try { db.exec("ALTER TABLE conversations ADD COLUMN agendamento_pendencia_avisada TEXT"); } catch {}
+// Estado da reconciliacao de vinculo de atividade (ver reconciliarVinculoAtividades). Medido
+// 14-17/08/2026 em 6 negocios (48287898, 48292471, 48441223, 48447661, 48464876, 48474073): a
+// atividade criada pelo bot ficou sem vinculo com o negocio e a rede de seguranca retentava a cada
+// 30 min contra o rate-limit do Moskit (HTTP 429 / timeout de 30s) SEMPRE, inundando o Telegram com
+// o mesmo "erro precisa de conferencia manual". vinculo_falhas conta tentativas consecutivas;
+// vinculo_backoff_ate segura a linha durante um cooldown (sem chamar rede); vinculo_desistiu e o
+// estado terminal (so o script religar-atividade.js desfaz); vinculo_aviso_hash deduplica o aviso
+// final do Telegram.
+try { db.exec("ALTER TABLE conversations ADD COLUMN vinculo_falhas INTEGER DEFAULT 0"); } catch {}
+try { db.exec("ALTER TABLE conversations ADD COLUMN vinculo_desistiu INTEGER DEFAULT 0"); } catch {}
+try { db.exec("ALTER TABLE conversations ADD COLUMN vinculo_backoff_ate INTEGER"); } catch {}
+try { db.exec("ALTER TABLE conversations ADD COLUMN vinculo_aviso_hash TEXT"); } catch {}
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_contrato_zapsign_doc_token ON conversations(contrato_zapsign_doc_token)"); } catch {}
 
 db.exec(`
@@ -413,6 +473,90 @@ const stmtAtividadeJaSincronizada = db.prepare('SELECT 1 FROM atividades_sincron
 const stmtAtividadeMarcarSincronizada = db.prepare(
   'INSERT OR IGNORE INTO atividades_sincronizadas (activity_id, evento_calendar_id, deal_id) VALUES (?, ?, ?)'
 );
+
+// ------------------------------------------------------------
+// Estado da rotina de notas de reuniao (Gemini -> nota no negocio)
+// ------------------------------------------------------------
+// Uma linha por e-mail. E a fonte da verdade da idempotencia — o rotulo do Gmail e so espelho para
+// humano, e o marcador dentro da nota e a reconciliacao de ultimo recurso.
+//
+// DUAS tabelas, real e dry-run, e isso NAO e detalhe. Se o dry-run gravasse na tabela real, a
+// primeira execucao de verdade encontraria tudo CONCLUIDO e nao faria nada — o teste teria consumido
+// silenciosamente o trabalho que ele deveria apenas simular.
+//
+// O indice unico em doc_id impede que o MESMO Doc, reenviado ou encaminhado por outra mensagem,
+// vire uma segunda nota no negocio.
+for (const tabela of ['notas_reuniao', 'notas_reuniao_dryrun']) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS ${tabela} (
+      gmail_message_id TEXT PRIMARY KEY,
+      doc_id           TEXT,
+      evento_id        TEXT,
+      assunto          TEXT,
+      deal_id          INTEGER,
+      metodo           TEXT,
+      diagnostico      TEXT,
+      extracao         TEXT,
+      marcador         TEXT,
+      estado           TEXT NOT NULL,
+      tentativas       INTEGER DEFAULT 0,
+      ultimo_erro      TEXT,
+      criado_em        TEXT DEFAULT (datetime('now')),
+      atualizado_em    TEXT DEFAULT (datetime('now'))
+    )
+  `);
+  try { db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_${tabela}_doc ON ${tabela}(doc_id) WHERE doc_id IS NOT NULL`); } catch {}
+}
+
+// Saude da rotina, uma linha so. Guarda a ultima vez que a busca no Gmail devolveu ALGUMA mensagem —
+// nao a ultima vez que rodou. A distincao e o ponto: ciclo vazio e o estado normal (o que ja foi
+// processado sai da busca pelo rotulo), entao "nao veio nada agora" nao significa nada. O que precisa
+// de aviso e silencio prolongado.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS notas_reuniao_saude (
+    id              INTEGER PRIMARY KEY CHECK (id = 1),
+    ultimo_email_em TEXT,
+    ultimo_aviso_em TEXT
+  )
+`);
+db.exec("INSERT OR IGNORE INTO notas_reuniao_saude (id, ultimo_email_em) VALUES (1, datetime('now'))");
+const stmtNotasSaude = db.prepare('SELECT * FROM notas_reuniao_saude WHERE id = 1');
+const stmtNotasViuEmail = db.prepare(
+  "UPDATE notas_reuniao_saude SET ultimo_email_em = datetime('now'), ultimo_aviso_em = NULL WHERE id = 1"
+);
+const stmtNotasAvisouSilencio = db.prepare(
+  "UPDATE notas_reuniao_saude SET ultimo_aviso_em = datetime('now') WHERE id = 1"
+);
+
+// Os statements sao montados por tabela para que o dry-run use exatamente o mesmo codigo do modo
+// real — um caminho de execucao separado para o dry-run so provaria que o caminho separado funciona.
+function stmtsNotas(dryRun) {
+  const t = dryRun ? 'notas_reuniao_dryrun' : 'notas_reuniao';
+  return {
+    get: db.prepare(`SELECT * FROM ${t} WHERE gmail_message_id = ?`),
+    porDoc: db.prepare(`SELECT * FROM ${t} WHERE doc_id = ?`),
+    inserir: db.prepare(`INSERT OR IGNORE INTO ${t} (gmail_message_id, assunto, estado) VALUES (?, ?, 'RESERVADO')`),
+    avancar: db.prepare(`
+      UPDATE ${t}
+         SET estado = @estado, doc_id = COALESCE(@doc_id, doc_id), evento_id = COALESCE(@evento_id, evento_id),
+             deal_id = COALESCE(@deal_id, deal_id), metodo = COALESCE(@metodo, metodo),
+             diagnostico = COALESCE(@diagnostico, diagnostico), extracao = COALESCE(@extracao, extracao),
+             marcador = COALESCE(@marcador, marcador), ultimo_erro = @ultimo_erro,
+             atualizado_em = datetime('now')
+       WHERE gmail_message_id = @gmail_message_id
+    `),
+    falhar: db.prepare(`
+      UPDATE ${t} SET tentativas = tentativas + 1, ultimo_erro = ?, atualizado_em = datetime('now')
+       WHERE gmail_message_id = ?
+    `),
+    pendentes: db.prepare(`
+      SELECT * FROM ${t}
+       WHERE estado NOT IN ('CONCLUIDO', 'ORFAO', 'ERRO_PERMANENTE', 'REVISAR_MANUAL')
+       ORDER BY criado_em
+    `),
+    contarPorEstado: db.prepare(`SELECT estado, COUNT(*) AS total FROM ${t} GROUP BY estado`),
+  };
+}
 
 // ------------------------------------------------------------
 // Mapeamentos de campos personalizados (Moskit)
@@ -1758,15 +1902,42 @@ async function autorizacaoParaAgendar(dealId) {
 
 // Titulo e descricao do evento ficam aqui pra que a criacao e a correcao posterior
 // (sincronizarMetadadosEvento) usem exatamente a mesma regra.
-function montarResumoEvento(dados) {
+// O `· #<dealId>` no fim serve a rotina de notas de reuniao: o assunto do e-mail do Gemini reproduz
+// o titulo do evento entre aspas (`Notas: "Consulta — Lia (Berto) · #48292471" de 14/08/2026`), entao
+// o numero do negocio chega DENTRO do assunto e o bot identifica o deal sem precisar achar o evento
+// na agenda. Tira o Google Calendar do caminho critico: evento apagado, renomeado ou movido de
+// calendario deixa de derrubar a identificacao.
+//
+// SUFIXO, NUNCA PREFIXO. A rota de backfill do Meet reconhece consulta na agenda com
+// `/^Consulta\s*—/.test(ev.summary)` (ver adicionarMeetEmEventos mais abaixo) — casamento por INICIO.
+// Com o numero na frente ela simplesmente pararia de enxergar qualquer consulta, sem erro nenhum.
+//
+// O `dealId` vem por parametro pelo mesmo motivo de montarDescricaoEvento: sincronizarMetadadosEvento
+// COMPARA este resumo com o que esta no Google, e duas fontes diferentes para o mesmo dado fariam o
+// evento ser repatchado a cada ciclo.
+function montarResumoEvento(dados, dealId) {
   const presencial = dados.modalidade_consulta === 'presencial';
-  return `Consulta${presencial ? ' (Presencial)' : ''} — ${dados.nome || 'Cliente'} (${dados.advogado_responsavel || 'a definir'})`;
+  const base = `Consulta${presencial ? ' (Presencial)' : ''} — ${dados.nome || 'Cliente'} (${dados.advogado_responsavel || 'a definir'})`;
+  return dealId ? `${base} · #${dealId}` : base;
 }
 
-function montarDescricaoEvento(dados, chatId) {
+// `dealId` vem SEMPRE por parametro, nunca lido do banco aqui dentro. Motivo: esta funcao roda na
+// criacao do evento e de novo em sincronizarMetadadosEvento, que COMPARA a descricao gerada com a
+// que ja esta no Google para decidir se precisa dar patch. Se as duas chamadas derivassem o dealId
+// de fontes diferentes, a comparacao daria "mudou" em todo ciclo e o evento seria repatchado para
+// sempre. E ler do banco seria exatamente esse caso: stmtFinalizarCiclo so grava conversations.deal_id
+// DEPOIS de handleAgendamentoCalendar, entao na criacao de um deal novo o banco ainda traz null.
+//
+// A linha `[deal:...]` e o que permite a rotina de notas de reuniao (sincronizarNotasReuniao) achar o
+// negocio de forma deterministica. Sem ela, a identificacao depende do "Telefone:" abaixo, que so
+// existe em evento criado pelo bot — a sondagem de 16/08/2026 mediu que 1/3 das reunioes com notas
+// nasceu de evento criado a mao, sem vinculo nenhum. Fica na DESCRICAO e nao no titulo porque o
+// titulo e o que o cliente ve no convite.
+function montarDescricaoEvento(dados, chatId, dealId) {
   return [
     `Assunto: ${dados.assunto || 'nao informado'}`,
     `Telefone: ${chatId}`,
+    dealId ? `[deal:${dealId}]` : '',
     dados.email_cliente ? `Email do cliente: ${dados.email_cliente}` : '',
     dados.resumo_atendimento || '',
   ].filter(Boolean).join('\n');
@@ -1809,7 +1980,7 @@ async function registrarConsultaNaAgendaMoskit({ dealId, dados, chatId, horarioI
   const payload = montarPayloadAtividade({
     dealId,
     contatoId,
-    titulo: montarResumoEvento(dados), // mesmo titulo do evento do Google: e o mesmo compromisso
+    titulo: montarResumoEvento(dados, dealId), // mesmo titulo do evento do Google: e o mesmo compromisso
     assunto: dados.assunto,
     dueDate,
     presencial: dados.modalidade_consulta === 'presencial',
@@ -1837,12 +2008,12 @@ async function registrarConsultaNaAgendaMoskit({ dealId, dados, chatId, horarioI
 // Corrige titulo/descricao de um evento ja criado quando os dados melhoraram depois — tipico do
 // evento que nasceu com "(a definir)" porque o ciclo que o criou nao tinha o advogado ainda.
 // Nao mexe em data/hora, entao nao exige confirmacao (diferente de remarcar).
-async function sincronizarMetadadosEvento(dados, chatId, row) {
+async function sincronizarMetadadosEvento(dados, chatId, row, dealId) {
   const auth = getGoogleAuthClient();
   if (!auth) return;
 
-  const novoResumo = montarResumoEvento(dados);
-  const novaDescricao = montarDescricaoEvento(dados, chatId);
+  const novoResumo = montarResumoEvento(dados, dealId);
+  const novaDescricao = montarDescricaoEvento(dados, chatId, dealId);
   if (novoResumo.includes('(a definir)')) return; // ainda nao sabemos o advogado — nao piora o que esta la
 
   try {
@@ -1861,7 +2032,7 @@ async function sincronizarMetadadosEvento(dados, chatId, row) {
   }
 }
 
-async function criarEventoGoogleCalendar(dados, chatId) {
+async function criarEventoGoogleCalendar(dados, chatId, dealId) {
   const auth = getGoogleAuthClient();
   if (!auth) {
     console.log('  ⏭️ Google Calendar nao configurado (faltam google-oauth-client.json/google-oauth-token.json/GOOGLE_CALENDAR_ID) — pulando');
@@ -1888,8 +2059,8 @@ async function criarEventoGoogleCalendar(dados, chatId) {
 
   const calendar = google.calendar({ version: 'v3', auth });
   const event = {
-    summary: montarResumoEvento(dados),
-    description: montarDescricaoEvento(dados, chatId),
+    summary: montarResumoEvento(dados, dealId),
+    description: montarDescricaoEvento(dados, chatId, dealId),
     start: { dateTime: inicioNaive, timeZone: TZ_ESCRITORIO },
     end: { dateTime: fimNaive, timeZone: TZ_ESCRITORIO },
     ...(presencial ? {} : {
@@ -1955,7 +2126,7 @@ async function handleAgendamentoCalendar(dealId, dados, chatId, pagamentoVerific
     }
     // Corrigir titulo/descricao nao move nada, entao roda sempre — inclusive quando a remarcacao
     // esta travada por falta de confirmacao.
-    if (dados.data_hora_consulta) await sincronizarMetadadosEvento(dados, chatId, row);
+    if (dados.data_hora_consulta) await sincronizarMetadadosEvento(dados, chatId, row, dealId);
 
     // Auto-cura: achado em 14/08/2026 que 21 de 27 consultas com evento no Google NUNCA tiveram a
     // Atividade criada no Moskit (falha silenciosa de POST /activities, sem log nem nota nem
@@ -2032,7 +2203,7 @@ async function handleAgendamentoCalendar(dealId, dados, chatId, pagamentoVerific
   let evento = null;
   let erroGoogle = null;
   try {
-    evento = await criarEventoGoogleCalendar(dadosEvento, chatId);
+    evento = await criarEventoGoogleCalendar(dadosEvento, chatId, dealId);
   } catch (e) {
     if (e.horarioInvalido) {
       console.error(`  ❌ Erro ao criar evento no Google Calendar: ${e.message}`);
@@ -4336,12 +4507,22 @@ const RECONCILIACAO_ATIVA = process.env.RECONCILIACAO_ATIVA !== 'false'; // defa
 const RECONCILIACAO_DIAS = Number(process.env.RECONCILIACAO_DIAS) || 30;
 // Pausa entre as leituras da varredura: uma passada por 64 deals ja levou 429 do Moskit.
 const RECONCILIACAO_PAUSA_MS = Number(process.env.RECONCILIACAO_PAUSA_MS) || 300;
+// Reconciliação de vínculo de atividade (ver reconciliarVinculoAtividades): o Moskit rate-limita
+// (HTTP 429) e o timeout global e de 30s — medido 14-17/08/2026, uma varredura retentada a cada
+// RECONCILIACAO_INTERVAL_MS contra um vinculo quebrado nunca religava e enchia o Telegram de erro.
+// VINCULO_MAX_TENTATIVAS: falhas consecutivas antes de desistir (estado terminal). Apos isso a linha
+// so volta a ser conferida quando o script religar-atividade.js limpar o estado.
+// VINCULO_BACKOFF_CICLOS: cooldown inicial em ciclos de RECONCILIACAO_INTERVAL_MS, dobrado a cada
+// falha (1, 2, 4...) — e o intervalo com que a varredura volta a bater no Moskit, nunca mais que isso.
+// VINCULO_PAUSA_MS: pausa entre as leituras da varredura, maior que a da classificacao porque aqui
+// cada linha nao-vinculada custa GET+PUT (nao so um GET).
+const VINCULO_MAX_TENTATIVAS = Number(process.env.VINCULO_MAX_TENTATIVAS) || 3;
+const VINCULO_BACKOFF_CICLOS = Number(process.env.VINCULO_BACKOFF_CICLOS) || 4;
+const VINCULO_PAUSA_MS = Number(process.env.VINCULO_PAUSA_MS) || 600;
 // Ultimo resumo enviado ao Telegram. Sem isso, uma pendencia que depende de acao humana (campo travado)
 // seria reenviada a cada rodada. Memoria de processo de proposito: um restart avisa de novo, o que e
 // barato e melhor do que perder o aviso.
 let ultimoResumoReconciliacao = null;
-// Mesma ideia, para a reconciliacao de vinculo de Atividade x negocio (ver reconciliarVinculoAtividades).
-let ultimoResumoReconciliacaoAtividades = null;
 // Mesma ideia, para a reconciliacao de pendencias de agendamento em conversa silenciosa (ver
 // reconciliarPendenciasAgendamento) — so evita repetir o LOG de resumo; cada pendencia urgente ja
 // manda seu proprio Telegram individual, deduplicado por linha via agendamento_pendencia_avisada.
@@ -4551,18 +4732,51 @@ async function rodarReconciliacaoPeriodica() {
 // conferencia logo apos criar, uma atividade pode ficar sem o vinculo com o negocio (ex.: a conferencia
 // falhou por rede no mesmo ciclo). Varre toda conversa com atividade_moskit_id gravado e religa a que
 // estiver solta — mesmo espirito de reconciliarClassificacao, rodando na mesma cadencia.
+//
+// MEDIDO 14-17/08/2026 (6 negocios): o Moskit responde 429/timeout de 30s quando a varredura bate
+// forte, e um vinculo quebrado era retentado a cada RECONCILIACAO_INTERVAL_MS SEM NUNCA RELIGAR,
+// inundando o Telegram com o mesmo aviso (o dedup por string do resumo nao segurava porque o
+// subconjunto de falhas mudava a cada rodada). Por isso, aqui:
+//   - falha registra vinculo_falhas e coloca a linha em cooldown (vinculo_backoff_ate), que DOBRA a
+//     cada falha — a varredura nunca volta a bater no Moskit antes do cooldown vencer;
+//   - ao atingir VINCULO_MAX_TENTATIVAS a linha entra em estado terminal (vinculo_desistiu=1) e recebe
+//     UM aviso final no Telegram com o comando do script religar-atividade.js (dedup por
+//     vinculo_aviso_hash);
+//   - estado terminal so e desfeito pelo script manual: e um vínculo que precisa de acao humana, nao
+//     de mais retentativa.
+// Erro transitorio (429/timeout) nao gera mais Telegram nenhum — nao e "conferir na mao", e o Moskit
+// dizendo calma. So desistencia (nova) e religacao (de verdade) avisam.
 async function reconciliarVinculoAtividades({ aplicar = false } = {}) {
   const linhas = db.prepare(`
-    SELECT chat_id, deal_id, atividade_moskit_id FROM conversations WHERE atividade_moskit_id IS NOT NULL
+    SELECT chat_id, deal_id, atividade_moskit_id, vinculo_falhas, vinculo_desistiu, vinculo_backoff_ate, vinculo_aviso_hash
+      FROM conversations
+     WHERE atividade_moskit_id IS NOT NULL
   `).all();
 
-  const relatorio = { aplicar, analisados: 0, corrigidos: [], erros: [] };
+  const relatorio = { aplicar, analisados: 0, ja_ok: 0, religadas: [], a_religar: [], desistidas: [], avisadas: [], cooldown: 0, paradas: 0, erros_transitorios: 0 };
+
+  const stmtResetVinculo = db.prepare(`
+    UPDATE conversations SET vinculo_falhas = 0, vinculo_desistiu = 0, vinculo_backoff_ate = NULL, vinculo_aviso_hash = NULL WHERE chat_id = ?
+  `);
+  const stmtFalhaVinculo = db.prepare(`
+    UPDATE conversations SET vinculo_falhas = ?, vinculo_backoff_ate = ?, vinculo_desistiu = ? WHERE chat_id = ?
+  `);
+  const stmtAvisoVinculo = db.prepare(`UPDATE conversations SET vinculo_aviso_hash = ? WHERE chat_id = ?`);
+
+  const agora = Date.now();
 
   let primeira = true;
   for (const linha of linhas) {
     relatorio.analisados++;
+
+    // Estado terminal: so o script religar-atividade.js desfaz. Nem chama a rede — retentativa aqui e
+    // exatamente o que enchia o Telegram de erro.
+    if (linha.vinculo_desistiu === 1) { relatorio.paradas++; continue; }
+    // Cooldown: ainda na janela de backoff, nao bater no Moskit de novo.
+    if (linha.vinculo_backoff_ate && agora < Number(linha.vinculo_backoff_ate)) { relatorio.cooldown++; continue; }
+
     try {
-      if (!primeira) await new Promise((r) => setTimeout(r, RECONCILIACAO_PAUSA_MS));
+      if (!primeira) await new Promise((r) => setTimeout(r, VINCULO_PAUSA_MS));
       primeira = false;
 
       const res = await axios.get(`${MOSKIT_BASE}/activities/${linha.atividade_moskit_id}`, {
@@ -4570,50 +4784,95 @@ async function reconciliarVinculoAtividades({ aplicar = false } = {}) {
         validateStatus: (s) => s < 500,
       });
       if (res.status >= 300) {
-        relatorio.erros.push({ chat_id: linha.chat_id, deal_id: linha.deal_id, atividade_moskit_id: linha.atividade_moskit_id, erro: `HTTP ${res.status}` });
+        await registrarFalhaVinculo(linha, `HTTP ${res.status}`, aplicar, relatorio, stmtFalhaVinculo, stmtAvisoVinculo, agora);
         continue;
       }
       const vinculada = (res.data?.deals || []).some((d) => Number(d?.id) === Number(linha.deal_id));
-      if (vinculada) continue;
+      if (vinculada) {
+        // Ja esta ok: limpa qualquer estado de falha anterior (cooldown/falhas residuais precisam
+        // zerar para uma recuperacao espontanea nao ficar contando tentativa antiga).
+        if (aplicar) stmtResetVinculo.run(linha.chat_id);
+        relatorio.ja_ok++;
+        continue;
+      }
 
       if (!aplicar) {
-        relatorio.corrigidos.push({ chat_id: linha.chat_id, deal_id: linha.deal_id, atividade_moskit_id: linha.atividade_moskit_id });
+        relatorio.a_religar.push({ chat_id: linha.chat_id, deal_id: linha.deal_id, atividade_moskit_id: linha.atividade_moskit_id });
         continue;
       }
       const religou = await garantirVinculoAtividadeDeal(linha.atividade_moskit_id, linha.deal_id);
       if (!religou) {
-        relatorio.erros.push({ chat_id: linha.chat_id, deal_id: linha.deal_id, atividade_moskit_id: linha.atividade_moskit_id, erro: 'PUT de religacao falhou' });
+        await registrarFalhaVinculo(linha, 'PUT de religacao falhou', aplicar, relatorio, stmtFalhaVinculo, stmtAvisoVinculo, agora);
         continue;
       }
-      relatorio.corrigidos.push({ chat_id: linha.chat_id, deal_id: linha.deal_id, atividade_moskit_id: linha.atividade_moskit_id });
+      if (aplicar) stmtResetVinculo.run(linha.chat_id);
+      relatorio.religadas.push({ chat_id: linha.chat_id, deal_id: linha.deal_id, atividade_moskit_id: linha.atividade_moskit_id });
       await criarNotaMoskit(linha.deal_id, '🔁 Atividade da agenda religada automaticamente ao negócio (o Moskit tinha criado sem esse vínculo).').catch(() => {});
       console.log(`  🔁 Deal ${linha.deal_id}: atividade ${linha.atividade_moskit_id} religada ao negocio`);
     } catch (e) {
-      relatorio.erros.push({ chat_id: linha.chat_id, deal_id: linha.deal_id, atividade_moskit_id: linha.atividade_moskit_id, erro: e.message });
+      relatorio.erros_transitorios++;
       console.error(`  ❌ Reconciliacao de vinculo da atividade ${linha.atividade_moskit_id} (deal ${linha.deal_id}): ${e.message}`);
+      await registrarFalhaVinculo(linha, e.message, aplicar, relatorio, stmtFalhaVinculo, stmtAvisoVinculo, agora).catch(() => {});
     }
   }
 
   return relatorio;
 }
 
+// Registra uma falha na reconciliacao de vinculo: incrementa a contagem consecutiva, coloca a linha em
+// cooldown exponencial e, ao estourar VINCULO_MAX_TENTATIVAS, marca o estado terminal e manda o aviso
+// final (uma unica vez por desistencia, dedup por vinculo_aviso_hash).
+async function registrarFalhaVinculo(linha, erro, aplicar, relatorio, stmtFalhaVinculo, stmtAvisoVinculo, agora) {
+  const falhas = (Number(linha.vinculo_falhas) || 0) + 1;
+  const multiplicador = Math.pow(2, Math.min(falhas, 10) - 1);
+  const backoffAte = agora + VINCULO_BACKOFF_CICLOS * RECONCILIACAO_INTERVAL_MS * multiplicador;
+
+  const desistiu = falhas >= VINCULO_MAX_TENTATIVAS;
+  if (aplicar) {
+    stmtFalhaVinculo.run(falhas, desistiu ? null : backoffAte, desistiu ? 1 : 0, linha.chat_id);
+  }
+
+  if (desistiu) {
+    relatorio.desistidas.push({ chat_id: linha.chat_id, deal_id: linha.deal_id, atividade_moskit_id: linha.atividade_moskit_id, erro });
+    if (aplicar) {
+      const hash = `desistida|${linha.deal_id}|${linha.atividade_moskit_id}`;
+      if (linha.vinculo_aviso_hash !== hash) {
+        relatorio.avisadas.push({ chat_id: linha.chat_id, deal_id: linha.deal_id, atividade_moskit_id: linha.atividade_moskit_id, erro });
+        stmtAvisoVinculo.run(hash, linha.chat_id);
+        await enviarTelegram([
+          '❌ *Atividade sem vínculo com o negócio — desistiu de religar sozinho*',
+          `Deal: \`${linha.deal_id}\``,
+          `Atividade: \`${linha.atividade_moskit_id}\``,
+          `Último erro: ${erro}`,
+          '',
+          'O bot tentou religar várias vezes e o Moskit não deixou (rate-limit/timeout). A atividade continua sem aparecer na tela do negócio. Vincular na mão:',
+          '',
+          '```',
+          `node religar-atividade.js ${linha.deal_id} ${linha.atividade_moskit_id} --aplicar`,
+          '```',
+        ].filter(Boolean).join('\n'));
+      }
+    }
+    console.log(`  ❌ Deal ${linha.deal_id}: atividade ${linha.atividade_moskit_id} desistiu de religar apos ${falhas} tentativa(s) (${erro})`);
+    return;
+  }
+
+  relatorio.erros_transitorios++;
+  console.log(`  ⏸️ Deal ${linha.deal_id}: atividade ${linha.atividade_moskit_id} em cooldown (tentativa ${falhas}/${VINCULO_MAX_TENTATIVAS}, ${erro})`);
+}
+
 async function rodarReconciliacaoVinculoAtividades() {
   const r = await reconciliarVinculoAtividades({ aplicar: true });
-  if (!r.corrigidos.length && !r.erros.length) return r;
+  const silencioso = !r.religadas.length && !r.avisadas.length && !r.paradas && !r.cooldown && !r.erros_transitorios && !r.desistidas.length;
+  if (silencioso && r.analisados === r.ja_ok) return r;
 
-  console.log(`  🔁 Reconciliacao de vinculo de atividade: ${r.analisados} conferida(s), ${r.corrigidos.length} religada(s), ${r.erros.length} erro(s)`);
+  console.log(`  🔁 Reconciliacao de vinculo de atividade: ${r.analisados} conferida(s), ${r.ja_ok} ja ok, ${r.religadas.length} religada(s), ${r.desistidas.length} desistida(s), ${r.cooldown} em cooldown, ${r.paradas} parada(s)`);
 
-  const linhasResumo = [
-    r.corrigidos.length ? `✅ ${r.corrigidos.length} atividade(s) religada(s) ao negócio automaticamente` : '',
-    ...r.erros.slice(0, 10).map((e) => `• Deal \`${e.deal_id}\` — atividade \`${e.atividade_moskit_id}\`: ${e.erro}`),
-    r.erros.length > 10 ? `… e mais ${r.erros.length - 10}` : '',
-  ].filter(Boolean);
-
-  const resumo = `🔁 *Reconciliação de vínculo de atividade*\n${linhasResumo.join('\n')}`;
-  if (resumo === ultimoResumoReconciliacaoAtividades) return r; // nada novo desde a ultima rodada
-  ultimoResumoReconciliacaoAtividades = resumo;
-  if (r.erros.length) {
-    await enviarTelegram(`${resumo}\n\nErro precisa de conferência manual (a atividade continua sem aparecer na tela do negócio).`);
+  if (r.religadas.length) {
+    await enviarTelegram([
+      '🔁 *Reconciliação de vínculo de atividade*',
+      ...r.religadas.map((e) => `✅ Deal \`${e.deal_id}\` — atividade \`${e.atividade_moskit_id}\` religada ao negócio automaticamente`),
+    ].join('\n'));
   }
   return r;
 }
@@ -4945,6 +5204,699 @@ function atualizarTranscricaoNaConversa(chatId, idZernio, texto) {
   return true;
 }
 
+// ============================================================
+// Notas de reuniao do Gemini (Google Meet) -> nota no negocio do Moskit
+// ============================================================
+//
+// O ciclo: acha os e-mails de notas ainda nao processados, descobre a QUE NEGOCIO cada um pertence,
+// extrai os dados juridicos com a OpenAI e escreve uma nota no deal.
+//
+// O e-mail e so o gatilho. A ancora de identidade e o EVENTO da agenda: e nele que estao o Doc das
+// notas (attachments[].fileUrl) e o telefone do cliente (linha "Telefone:" da descricao), que e a
+// chave de conversations.chat_id. A decisao de qual negocio usar mora em src/notas-reuniao.js, sem
+// rede; aqui so se busca o que ela precisa.
+//
+// MEDIDO em 16/08/2026, e vale ter em mente ao mexer: dos 6 eventos que geraram notas nos ultimos 30
+// dias, 4 foram criados pelo bot (tem "Telefone:") e 2 foram criados a mao ("Consulta online - Berto
+// e Aurinete", "Consulta online- Iury e Arthur") e nao tem vinculo nenhum. O fallback nao e caso
+// raro: e ~1/3 do volume, e parte dele vai terminar em orfao mesmo. Por isso o orfao aqui e um
+// desfecho de primeira classe — com diagnostico e comando de religar — e nao um erro escondido.
+
+// Rotulos do Gmail. O seletor da fila e a AUSENCIA deles, nunca `is:unread`: se alguem abre o e-mail
+// no celular, o ciclo seguinte nunca mais veria aquela reuniao e nada avisaria. Marcar como lido
+// continua acontecendo, mas como efeito do processamento, jamais como criterio.
+const NOTAS_ROTULOS = { processado: 'Notas/Processado', orfao: 'Notas/Orfao', erro: 'Notas/Erro' };
+const cacheRotulosGmail = new Map();
+
+async function garantirRotuloGmail(gmail, nome) {
+  if (cacheRotulosGmail.has(nome)) return cacheRotulosGmail.get(nome);
+  const lista = await gmail.users.labels.list({ userId: 'me' });
+  for (const l of lista.data.labels || []) cacheRotulosGmail.set(l.name, l.id);
+  if (cacheRotulosGmail.has(nome)) return cacheRotulosGmail.get(nome);
+
+  const criado = await gmail.users.labels.create({
+    userId: 'me',
+    requestBody: { name: nome, labelListVisibility: 'labelShow', messageListVisibility: 'show' },
+  });
+  cacheRotulosGmail.set(nome, criado.data.id);
+  return criado.data.id;
+}
+
+// O corpo do e-mail vem em partes MIME aninhadas e em base64url. O text/plain e o que alimenta a IA
+// (ja traz o resumo inteiro do Gemini); o text/html so interessa como fallback para achar o link do
+// Doc, porque e nele que o link existe — no text/plain o Google manda so a ancora "Abrir notas da
+// reuniao", sem URL nenhuma.
+function extrairCorpoGmail(payload) {
+  let texto = '';
+  let html = '';
+
+  const percorrer = (parte) => {
+    if (!parte) return;
+    const dados = parte.body?.data;
+    if (dados) {
+      const decodificado = Buffer.from(dados, 'base64url').toString('utf8');
+      if (parte.mimeType === 'text/plain') texto += decodificado;
+      else if (parte.mimeType === 'text/html') html += decodificado;
+    }
+    for (const filha of parte.parts || []) percorrer(filha);
+  };
+
+  percorrer(payload);
+  return { texto: texto.trim(), html };
+}
+
+const cabecalhoGmail = (payload, nome) =>
+  (payload?.headers || []).find((h) => h.name?.toLowerCase() === nome.toLowerCase())?.value || '';
+
+// Acha o evento da agenda que corresponde ao e-mail. Casa primeiro pelo Doc (identidade exata) e so
+// depois pelo titulo — o titulo pode se repetir entre dois clientes no mesmo dia, o Doc nunca.
+async function acharEventoDaReuniao(calendar, { dataIso, tituloEvento, docId }) {
+  const janela = notasReuniao.janelaDoDia(dataIso, TZ_ESCRITORIO);
+  if (!janela) return null;
+
+  const res = await calendar.events.list({
+    calendarId: GOOGLE_CALENDAR_ID,
+    timeMin: janela.timeMin,
+    timeMax: janela.timeMax,
+    singleEvents: true,
+    orderBy: 'startTime',
+    maxResults: 250,
+  });
+
+  const eventos = (res.data.items || []).filter((e) => e.status !== 'cancelled');
+
+  if (docId) {
+    const porDoc = eventos.filter((e) => notasReuniao.extrairDocIdDeEvento(e) === docId);
+    if (porDoc.length === 1) return porDoc[0];
+  }
+
+  if (tituloEvento) {
+    const porTitulo = eventos.filter((e) => (e.summary || '').trim() === tituloEvento.trim());
+    // Dois eventos com o titulo identico no mesmo dia: nao da pra saber qual gerou estas notas.
+    // Devolver "nenhum" faz o caso cair para orfao, que e o desfecho correto.
+    if (porTitulo.length === 1) return porTitulo[0];
+  }
+
+  return null;
+}
+
+const stmtDealsPorTelefone = db.prepare(
+  "SELECT DISTINCT deal_id FROM conversations WHERE deal_id IS NOT NULL AND chat_id LIKE '%' || ? || '%'"
+);
+// O e-mail do cliente vive dentro do JSON de last_data. Busca local, sem rede: /contacts do Moskit
+// nao tem busca server-side, so paginacao — procurar por la custaria dezenas de chamadas por e-mail.
+//
+// ESCAPE nao e preciosismo: `_` e caractere COMUM em e-mail e curinga de um caractere no LIKE, entao
+// "joao_silva@x.com" casaria tambem com "joaoXsilva@x.com" — ou seja, apontaria para o negocio de
+// outra pessoa. Num passo cuja unica funcao e dizer de quem e a reuniao, isso e exatamente o erro que
+// nao pode acontecer.
+const stmtDealsPorEmail = db.prepare(
+  "SELECT DISTINCT deal_id FROM conversations WHERE deal_id IS NOT NULL AND last_data LIKE ? ESCAPE '\\'"
+);
+const escaparLike = (s) => String(s).replace(/[\\%_]/g, (c) => `\\${c}`);
+
+function buscarDealsPorTelefone(telefone) {
+  if (!telefone || telefone.length < 8) return [];
+  // Os ultimos 8 digitos sao o mesmo criterio de identidade que ehInterno usa: cobre variacao de
+  // DDI/nono digito sem casar numero de outra pessoa.
+  return stmtDealsPorTelefone.all(String(telefone).slice(-8)).map((r) => r.deal_id).filter(Boolean);
+}
+
+function buscarDealsPorEmail(emails) {
+  const achados = [];
+  for (const email of emails || []) {
+    for (const r of stmtDealsPorEmail.all(`%${escaparLike(email)}%`)) if (r.deal_id) achados.push(r.deal_id);
+  }
+  return [...new Set(achados)];
+}
+
+// Ultimo recurso antes do orfao: a consulta pode ter sido marcada direto no CRM, sem passar por
+// conversa nenhuma. Compara o horario da atividade com o inicio da reuniao.
+async function buscarDealsPorAtividade(inicioIso) {
+  if (!inicioIso) return { ids: [], truncou: false };
+
+  const alvo = new Date(inicioIso).getTime();
+  if (Number.isNaN(alvo)) return { ids: [], truncou: false };
+
+  const { atividades, truncou } = await listarAtividadesMoskit();
+  const JANELA_MS = 90 * 60 * 1000; // a reuniao pode ter comecado atrasada, ou a atividade estar arredondada
+
+  const ids = atividades
+    .filter((a) => MOSKIT_IDS.ATIVIDADE_TIPOS_CONSULTA.has(a?.type?.id))
+    .filter((a) => a?.dueDate && Math.abs(new Date(a.dueDate).getTime() - alvo) <= JANELA_MS)
+    .map((a) => a?.deals?.[0]?.id)
+    .filter(Boolean);
+
+  return { ids: [...new Set(ids.map(Number))], truncou };
+}
+
+async function exportarTextoDoDoc(drive, docId) {
+  if (!drive || !docId) return null;
+  try {
+    const res = await drive.files.export({ fileId: docId, mimeType: 'text/plain' }, { responseType: 'text' });
+    return typeof res.data === 'string' ? res.data : String(res.data || '');
+  } catch (e) {
+    // A transcricao e BONUS: so existe se alguem a ligou na reuniao, e o proprio Google avisa que
+    // pode nao estar la. O resumo do corpo do e-mail ja basta para a nota — falhar aqui nao pode
+    // impedir o registro no CRM.
+    console.log(`  ⏭️ Doc ${docId} nao exportado (${e.message}) — seguindo so com o resumo do e-mail`);
+    return null;
+  }
+}
+
+// Procura o marcador nas notas ja existentes do deal. E o que decide, apos um crash no meio do POST,
+// entre "ja postei" e "preciso postar" — sem isso, so restaria repostar as cegas (nota duplicada no
+// prontuario do cliente) ou desistir sempre.
+//
+// Pagina com `?start=`: medido em 16/08/2026, /deals/{id}/notes devolve 10 por pagina e ignora
+// `limit`. O deal da Lia ja tinha 40 notas — olhar so a primeira pagina responderia "nao achei" para
+// uma nota que existe.
+async function notaComMarcadorExiste(dealId, marcador) {
+  let vistas = 0;
+
+  for (let pagina = 0; pagina < NOTAS_MAX_PAGINAS_BUSCA; pagina++) {
+    const res = await axios.get(`${MOSKIT_BASE}/deals/${dealId}/notes`, {
+      params: { start: vistas },
+      headers: apiHeaders,
+      validateStatus: (s) => s < 500,
+    });
+    if (res.status < 200 || res.status >= 300) {
+      throw new Error(`GET /deals/${dealId}/notes devolveu HTTP ${res.status}`);
+    }
+
+    const lote = Array.isArray(res.data) ? res.data : [];
+    if (lote.some((n) => String(n?.description || '').includes(marcador))) return true;
+
+    vistas += lote.length;
+    if (lote.length < 10) return false; // pagina incompleta = fim da lista
+  }
+
+  // Chegou ao teto sem achar. NAO devolve false: "nao achei" e "nao terminei de procurar" levam a
+  // acoes opostas, e confundir os dois e como se duplicaria a nota.
+  throw new Error(`busca do marcador no deal ${dealId} atingiu o teto de ${NOTAS_MAX_PAGINAS_BUSCA} paginas`);
+}
+
+// ------------------------------------------------------------
+// O ciclo
+// ------------------------------------------------------------
+
+function montarQueryNotas() {
+  const excluir = Object.values(NOTAS_ROTULOS).map((r) => `-label:"${r}"`).join(' ');
+  return `from:${NOTAS_REMETENTE} newer_than:${NOTAS_JANELA_DIAS}d ${excluir}`;
+}
+
+// Processa UM e-mail, do zero ou retomando de onde parou. A ordem existe para que todo artefato caro
+// seja gravado antes do proximo passo arriscado, e para que a unica operacao NAO idempotente (o POST
+// da nota) fique entre dois commits.
+async function processarNotaReuniao({ gmail, calendar, drive, mensagem, stmts, dryRun, dealIdForcado = null }) {
+  const id = mensagem.id;
+  const linha = stmts.get.get(id) || {};
+  const assunto = cabecalhoGmail(mensagem.payload, 'Subject');
+
+  // GUARDA DE ESTADO TERMINAL — e a que impede a nota duplicada no caso mais provavel de todos.
+  //
+  // O rotulo do Gmail e o que tira a mensagem da busca, mas ele e aplicado DEPOIS de o estado virar
+  // terminal, e o `messages.list` do mesmo ciclo roda logo em seguida. Duas rotas levavam ao estrago:
+  //
+  //   1. A retomada de um POSTANDO falha -> vira REVISAR_MANUAL, sem rotulo -> a busca a devolve ->
+  //      o loop principal nao casa nenhum dos `if` de retomada abaixo (o estado nao e mais POSTANDO)
+  //      e reprocessa do ZERO: paga OpenAI e posta de novo uma nota que talvez ja exista.
+  //   2. No caminho de SUCESSO: a retomada conclui e rotula, mas se o indice de busca do Gmail
+  //      atrasar, a mensagem volta na lista com estado CONCLUIDO — e, de novo, nada abaixo a barra.
+  //
+  // O marcador dentro da nota nao cobre isso: ele so e consultado dentro do ramo POSTANDO.
+  //
+  // `dealIdForcado` (religamento manual) atravessa de proposito — e o unico jeito de ressuscitar um
+  // orfao. Menos quando ja foi postada: ai religar so criaria a segunda nota, e quem pediu precisa
+  // saber disso em vez de descobrir no prontuario do cliente.
+  const ESTADOS_TERMINAIS = new Set(['CONCLUIDO', 'ORFAO', 'ERRO_PERMANENTE', 'REVISAR_MANUAL']);
+  if (ESTADOS_TERMINAIS.has(linha.estado)) {
+    if (!dealIdForcado) {
+      console.log(`  ⏭️ ${id}: ja resolvido nesta caixa (${linha.estado}) — o rotulo ainda nao apareceu na busca`);
+      return { estado: linha.estado, dealId: linha.deal_id, jaResolvido: true };
+    }
+    if (linha.estado === 'CONCLUIDO') {
+      throw new Error(`mensagem ${id} ja foi postada no deal ${linha.deal_id} — religar criaria uma segunda nota`);
+    }
+  }
+
+  // Retomada de POSTADA: a nota JA existe no CRM e so o Gmail nao soube. Refaz apenas o rotulo.
+  if (linha.estado === 'POSTADA') {
+    if (!dryRun) await rotularNota(gmail, id, NOTAS_ROTULOS.processado);
+    stmts.avancar.run({ ...camposVazios(), gmail_message_id: id, estado: 'CONCLUIDO', ultimo_erro: null });
+    console.log(`  🔁 ${id}: rotulo pendente aplicado (a nota ja estava no CRM)`);
+    return { estado: 'CONCLUIDO', dealId: linha.deal_id };
+  }
+
+  // Retomada de POSTANDO: ambiguo — o processo morreu entre "vou postar" e "postei", e a nota pode
+  // ou nao existir. Nao reposta as cegas.
+  if (linha.estado === 'POSTANDO' && linha.deal_id && linha.marcador) {
+    const existe = await notaComMarcadorExiste(linha.deal_id, linha.marcador);
+    if (existe) {
+      if (!dryRun) await rotularNota(gmail, id, NOTAS_ROTULOS.processado);
+      stmts.avancar.run({ ...camposVazios(), gmail_message_id: id, estado: 'CONCLUIDO', ultimo_erro: null });
+      console.log(`  🔁 ${id}: nota ja existia no deal ${linha.deal_id} — nada reposto`);
+      return { estado: 'CONCLUIDO', dealId: linha.deal_id };
+    }
+    console.log(`  🔁 ${id}: marcador ausente no deal ${linha.deal_id} — postagem sera refeita`);
+  }
+
+  stmts.inserir.run(id, assunto);
+
+  // --- 1. Fonte -------------------------------------------------------------
+  const { texto: corpo, html } = extrairCorpoGmail(mensagem.payload);
+  if (!corpo && !html) {
+    stmts.avancar.run({ ...camposVazios(), gmail_message_id: id, estado: 'ERRO_PERMANENTE', ultimo_erro: 'e-mail sem corpo' });
+    if (!dryRun) await rotularNota(gmail, id, NOTAS_ROTULOS.erro);
+    return { estado: 'ERRO_PERMANENTE' };
+  }
+
+  const doAssunto = notasReuniao.parseAssuntoGemini(assunto);
+  // Assunto ilegivel nao descarta o e-mail: o dia sai do proprio carimbo de recebimento. Perde-se o
+  // titulo (usado para casar o evento), nao a reuniao inteira.
+  const dataIso = doAssunto?.dataIso
+    || new Date(Number(mensagem.internalDate)).toLocaleDateString('en-CA', { timeZone: TZ_ESCRITORIO });
+
+  const docIdDoCorpo = notasReuniao.extrairDocId(html) || notasReuniao.extrairDocId(corpo);
+  const evento = await acharEventoDaReuniao(calendar, {
+    dataIso,
+    tituloEvento: doAssunto?.tituloEvento,
+    docId: docIdDoCorpo,
+  }).catch((e) => {
+    console.error(`  ⚠️ falha ao buscar o evento na agenda: ${e.message}`);
+    return null;
+  });
+
+  const sinais = notasReuniao.extrairSinais({ evento, assunto, corpo });
+  const docId = sinais.docId || docIdDoCorpo;
+
+  // O mesmo Doc chegando por outra mensagem (encaminhamento, reenvio) nao pode virar segunda nota.
+  //
+  // O guard cobre QUALQUER estado da primeira copia, nao so CONCLUIDO. Antes olhava apenas o caso
+  // concluido, e o resto caia num buraco: se a primeira copia tivesse virado orfa, o UPDATE deste
+  // e-mail com o mesmo doc_id batia no indice unico, lancava, e o e-mail voltava a cada 10 min para
+  // sempre — sem rotulo, sem aviso, so repetindo a violacao de constraint no log.
+  const jaPeloDoc = docId ? stmts.porDoc.get(docId) : null;
+  if (jaPeloDoc && jaPeloDoc.gmail_message_id !== id) {
+    const concluida = jaPeloDoc.estado === 'CONCLUIDO';
+    const motivo = concluida
+      ? `duplicata do Doc ja processado em ${jaPeloDoc.gmail_message_id}`
+      : `duplicata do Doc de ${jaPeloDoc.gmail_message_id}, que esta em ${jaPeloDoc.estado} — resolver por la`;
+
+    stmts.avancar.run({
+      ...camposVazios(), gmail_message_id: id,
+      estado: concluida ? 'CONCLUIDO' : 'ERRO_PERMANENTE',
+      ultimo_erro: motivo,
+    });
+    // Rotula nos dois casos para o e-mail sair da busca. A copia canonica continua sendo a outra
+    // mensagem — e e la que o religamento manual acontece, se for preciso.
+    if (!dryRun) await rotularNota(gmail, id, concluida ? NOTAS_ROTULOS.processado : NOTAS_ROTULOS.erro).catch(() => {});
+    console.log(`  ⏭️ ${id}: ${motivo}`);
+    return { estado: concluida ? 'CONCLUIDO' : 'ERRO_PERMANENTE', dealId: jaPeloDoc.deal_id };
+  }
+
+  const textoDoc = await exportarTextoDoDoc(drive, docId);
+  const { texto: textoFonte, truncou } = notasReuniao.prepararTextoFonte({ corpo, textoDoc, maxChars: NOTAS_MAX_CHARS });
+
+  // --- 2. Qual negocio ------------------------------------------------------
+  const porTelefone = buscarDealsPorTelefone(sinais.telefone);
+  const porEmail = porTelefone.length ? [] : buscarDealsPorEmail(sinais.emails);
+  // A varredura de /activities e a unica chamada cara da cascata: so roda quando nada local resolveu.
+  const precisaAtividades = !sinais.dealIdNoTitulo && !sinais.dealIdMarcado
+    && !porTelefone.length && !sinais.idSolto && !porEmail.length;
+  const { ids: porAtividade, truncou: truncouAtividades } = precisaAtividades
+    ? await buscarDealsPorAtividade(sinais.inicioIso).catch((e) => {
+      console.error(`  ⚠️ falha ao varrer atividades: ${e.message}`);
+      return { ids: [], truncou: false };
+    })
+    : { ids: [], truncou: false };
+
+  const apurada = notasReuniao.decidirDeal(sinais, { porTelefone, porEmail, porAtividade, truncouAtividades });
+
+  // Religamento manual de um orfao (reprocessar-nota-reuniao.js). A cascata roda mesmo assim, e o
+  // que ela teria decidido fica no diagnostico: se um humano precisou corrigir, e porque alguma
+  // regra falhou, e o registro do que ela viu e o que permite consertar a regra depois.
+  const resolucao = dealIdForcado
+    ? {
+      dealId: Number(dealIdForcado),
+      metodo: 'manual',
+      confianca: 'alta',
+      candidatos: [Number(dealIdForcado)],
+      diagnostico: { ...apurada.diagnostico, cascataTeriaDecidido: { dealId: apurada.dealId, metodo: apurada.metodo } },
+    }
+    : apurada;
+
+  stmts.avancar.run({
+    ...camposVazios(),
+    gmail_message_id: id,
+    estado: 'DEAL_RESOLVIDO',
+    doc_id: docId,
+    evento_id: sinais.eventoId,
+    deal_id: resolucao.dealId,
+    metodo: resolucao.metodo,
+    diagnostico: JSON.stringify(resolucao.diagnostico),
+    ultimo_erro: null,
+  });
+
+  if (!resolucao.dealId) {
+    stmts.avancar.run({ ...camposVazios(), gmail_message_id: id, estado: 'ORFAO', ultimo_erro: resolucao.metodo });
+    if (!dryRun) {
+      await rotularNota(gmail, id, NOTAS_ROTULOS.orfao);
+      await avisarOrfao({ id, assunto, resolucao });
+    }
+    console.log(`  ❓ ${id}: orfao (${resolucao.metodo}) — "${assunto}"`);
+    return { estado: 'ORFAO', resolucao };
+  }
+
+  // --- 3. Extracao ----------------------------------------------------------
+  let extracao;
+  let avisos;
+  if (linha.estado === 'EXTRAIDO' && linha.extracao) {
+    // Ja pago em ciclo anterior: nao chama a OpenAI de novo.
+    ({ extracao, avisos } = JSON.parse(linha.extracao));
+  } else {
+    const mensagens = notasReuniao.montarMensagensExtracao(textoFonte, {
+      tituloEvento: sinais.tituloEvento || doAssunto?.tituloEvento,
+      dataIso,
+      truncou,
+    });
+    const bruto = await openaiChat(mensagens, 'json');
+
+    let parseado;
+    try {
+      parseado = JSON.parse(bruto);
+    } catch (e) {
+      throw new Error(`OpenAI devolveu JSON invalido: ${e.message}`);
+    }
+
+    const validado = notasReuniao.validarExtracao(parseado, textoFonte);
+    if (validado.vazia) {
+      // Resumo vazio nao e "reuniao sem assunto": e falha de extracao. Uma nota vazia no negocio do
+      // cliente e pior que nenhuma — parece que a reuniao nao rendeu nada.
+      stmts.avancar.run({ ...camposVazios(), gmail_message_id: id, estado: 'ERRO_PERMANENTE', ultimo_erro: 'extracao vazia (resumo_caso em branco)' });
+      if (!dryRun) await rotularNota(gmail, id, NOTAS_ROTULOS.erro);
+      console.log(`  ⚠️ ${id}: extracao vazia — nada postado no deal ${resolucao.dealId}`);
+      return { estado: 'ERRO_PERMANENTE' };
+    }
+
+    extracao = validado.extracao;
+    avisos = validado.avisos;
+    stmts.avancar.run({
+      ...camposVazios(), gmail_message_id: id, estado: 'EXTRAIDO',
+      extracao: JSON.stringify({ extracao, avisos }), ultimo_erro: null,
+    });
+  }
+
+  // --- 4. A nota ------------------------------------------------------------
+  const marcador = notasReuniao.marcadorNota(id, docId);
+  const texto = notasReuniao.montarTextoNota({
+    extracao,
+    avisos,
+    marcador,
+    meta: {
+      dataBr: dataIso.split('-').reverse().join('/'),
+      tituloEvento: sinais.tituloEvento || doAssunto?.tituloEvento,
+      truncou,
+      semTranscricao: !textoDoc,
+      linkDoc: docId ? `https://docs.google.com/document/d/${docId}` : '',
+      metodo: resolucao.metodo,
+      confianca: resolucao.confianca,
+    },
+  });
+
+  if (dryRun) {
+    stmts.avancar.run({ ...camposVazios(), gmail_message_id: id, estado: 'CONCLUIDO', marcador, ultimo_erro: null });
+    console.log(`\n  📝 [dry-run] nota que IRIA para o deal ${resolucao.dealId} (${resolucao.metodo}):\n${texto}\n`);
+    return { estado: 'CONCLUIDO', dealId: resolucao.dealId, resolucao, texto };
+  }
+
+  // O bracket: grava a INTENCAO antes da rede, para que um crash no meio deixe rastro suficiente
+  // para a retomada decidir sem adivinhar.
+  stmts.avancar.run({ ...camposVazios(), gmail_message_id: id, estado: 'POSTANDO', marcador, ultimo_erro: null });
+  await criarNotaMoskit(resolucao.dealId, texto); // 4xx LANCA, de proposito
+  stmts.avancar.run({ ...camposVazios(), gmail_message_id: id, estado: 'POSTADA', ultimo_erro: null });
+
+  await rotularNota(gmail, id, NOTAS_ROTULOS.processado);
+  stmts.avancar.run({ ...camposVazios(), gmail_message_id: id, estado: 'CONCLUIDO', ultimo_erro: null });
+
+  console.log(`  ✅ ${id}: nota criada no deal ${resolucao.dealId} (${resolucao.metodo}/${resolucao.confianca})`);
+  return { estado: 'CONCLUIDO', dealId: resolucao.dealId, resolucao };
+}
+
+// Todos os campos do UPDATE precisam existir no objeto nomeado, mesmo quando nao mudam — o
+// COALESCE do statement e quem preserva o valor antigo.
+const camposVazios = () => ({
+  doc_id: null, evento_id: null, deal_id: null, metodo: null,
+  diagnostico: null, extracao: null, marcador: null,
+});
+
+// Registra a falha e DESISTE depois de NOTAS_MAX_TENTATIVAS. Sem isto o e-mail voltava a cada ciclo
+// para sempre: pagando OpenAI de novo quando a falha era depois da extracao, e — pior — em silencio,
+// porque nada lia a coluna `tentativas` que vinha sendo incrementada.
+//
+// Desistir aqui significa estado terminal + rotulo + Telegram UMA vez. O e-mail sai da busca, o
+// trabalho ja feito continua na tabela, e religar e um comando manual.
+async function registrarFalhaNota({ stmts, gmail, id, erro, dryRun, ambiguo = false }) {
+  stmts.falhar.run(erro, id);
+  const linha = stmts.get.get(id);
+  if (!linha) return false; // falhou antes de existir linha (ex.: o proprio messages.get) — nada a escalar
+
+  // `ambiguo` significa uma coisa so: a RETOMADA de um POSTANDO nao conseguiu descobrir se a nota ja
+  // existe no CRM. Nao e o mesmo que "o POST falhou" — um POST que falha deixa o estado em POSTANDO e
+  // o ciclo seguinte resolve sozinho, conferindo o marcador e repostando se faltar. Inferir isso do
+  // estado mandaria uma falha de rede comum direto para revisao manual, desperdicando a reconciliacao
+  // que existe justamente para esse caso.
+  if (ambiguo) {
+    stmts.avancar.run({ ...camposVazios(), gmail_message_id: id, estado: 'REVISAR_MANUAL', ultimo_erro: erro });
+    if (!dryRun) {
+      // Rotular e o que tira a mensagem da busca. Sem isso ela voltava no `messages.list` do MESMO
+      // ciclo — e a guarda de estado terminal a barraria, mas depender de uma unica defesa aqui e
+      // pouco: o desfecho ruim e uma segunda nota no prontuario do cliente.
+      await rotularNota(gmail, id, NOTAS_ROTULOS.erro).catch(() => {});
+      await enviarTelegram(`⚠️ *Nota de reunião em estado ambíguo*\nMensagem \`${id}\`, deal \`${linha.deal_id}\`.\nNão foi possível confirmar se a nota já existe: ${erro}\nConferir na mão antes de reprocessar.`).catch(() => {});
+    }
+    return true;
+  }
+
+  if (linha.tentativas < NOTAS_MAX_TENTATIVAS) return false;
+
+  stmts.avancar.run({ ...camposVazios(), gmail_message_id: id, estado: 'ERRO_PERMANENTE', ultimo_erro: erro });
+  if (!dryRun) {
+    await rotularNota(gmail, id, NOTAS_ROTULOS.erro).catch(() => {});
+    await enviarTelegram([
+      '❌ *Nota de reunião desistida após 3 tentativas*',
+      `Mensagem: \`${id}\``,
+      linha.deal_id ? `Negócio: \`${linha.deal_id}\`` : 'Negócio: não identificado',
+      `Último erro: ${erro}`,
+      '',
+      `Depois de resolver: \`node reprocessar-nota-reuniao.js ${id} <dealId> --aplicar\``,
+    ].join('\n')).catch(() => {});
+  }
+  console.error(`  🛑 ${id}: desistido apos ${linha.tentativas} tentativas — ${erro}`);
+  return true;
+}
+
+// Silencio prolongado = alguma coisa quebrou calada. Roda no fim do ciclo, olhando a ultima vez que a
+// busca devolveu ALGUMA mensagem — nunca "este ciclo veio vazio", que e o estado normal.
+async function conferirSilencioNotas({ viuMensagem, dryRun }) {
+  if (viuMensagem) {
+    stmtNotasViuEmail.run();
+    return;
+  }
+  if (dryRun) return; // durante a semana de dry-run tem gente olhando; aviso aqui seria ruido
+
+  const saude = stmtNotasSaude.get();
+  const desde = saude?.ultimo_email_em ? Date.parse(`${saude.ultimo_email_em}Z`) : null;
+  if (!desde) return;
+
+  const dias = (Date.now() - desde) / (24 * 60 * 60 * 1000);
+  if (dias < NOTAS_SILENCIO_DIAS) return;
+
+  // Um aviso por janela de silencio, nao um a cada 10 min.
+  const avisou = saude.ultimo_aviso_em ? Date.parse(`${saude.ultimo_aviso_em}Z`) : null;
+  if (avisou && (Date.now() - avisou) / (24 * 60 * 60 * 1000) < NOTAS_SILENCIO_DIAS) return;
+
+  stmtNotasAvisouSilencio.run();
+  await enviarTelegram([
+    '🔕 *Notas de reunião: nenhum e-mail novo há ' + Math.floor(dias) + ' dias*',
+    'Pode ser que simplesmente não houve reunião com notas — ou que o token do Google expirou,',
+    'ou que o Google mudou o formato do assunto e a busca parou de casar.',
+    '',
+    'Conferir: `node sondar-notas.js` e a caixa do escritório por e-mails de `gemini-notes@google.com`.',
+  ].join('\n')).catch(() => {});
+}
+
+async function rotularNota(gmail, messageId, rotulo) {
+  const labelId = await garantirRotuloGmail(gmail, rotulo);
+  await gmail.users.messages.modify({
+    userId: 'me',
+    id: messageId,
+    requestBody: { addLabelIds: [labelId], removeLabelIds: ['UNREAD'] },
+  });
+}
+
+async function avisarOrfao({ id, assunto, resolucao }) {
+  const d = resolucao.diagnostico || {};
+  const linhas = [
+    '❓ *Notas de reunião sem negócio identificado*',
+    `Assunto: ${assunto}`,
+    d.tituloEvento ? `Evento: ${d.tituloEvento}` : '⚠️ Nenhum evento correspondente na agenda',
+    `Motivo: ${resolucao.metodo}${resolucao.candidatos?.length ? ` (candidatos: ${resolucao.candidatos.join(', ')})` : ''}`,
+    // Divergencia entre os dois marcadores tem conserto diferente: o problema esta no EVENTO, nao na
+    // regra. Quase sempre evento copiado de outro cliente com so um dos dois atualizado.
+    resolucao.metodo === 'marcadores_divergentes'
+      ? `⚠️ O título diz #${d.tituloDizia} e a descrição diz [deal:${d.descricaoDizia}]. Corrija o evento na agenda antes de religar.`
+      : '',
+    d.atividadesTruncadas ? '⚠️ A varredura de atividades bateu no teto — pode haver candidato não visto.' : '',
+    '',
+    `Para vincular na mão: \`node reprocessar-nota-reuniao.js ${id} <dealId>\``,
+  ].filter(Boolean);
+  await enviarTelegram(linhas.join('\n')).catch(() => {});
+}
+
+// Evita dois ciclos sobrepostos (o setInterval e a rota manual podem coincidir). Mesmo motivo de
+// sincronizacaoAtividadesEmAndamento: cada mensagem faz varias chamadas de rede e duas execucoes
+// simultaneas gerariam nota e rotulo duplicados.
+let sincronizacaoNotasEmAndamento = false;
+
+async function sincronizarNotasReuniao({ dryRun = NOTAS_REUNIAO_DRY_RUN, limite = NOTAS_MAX_POR_CICLO, soAmostrar = false } = {}) {
+  if (sincronizacaoNotasEmAndamento) {
+    console.log('  ⏭️ Sincronizacao de notas de reuniao ja em andamento — pulando');
+    return { pulado: true };
+  }
+
+  const auth = getGoogleAuthClientNotas();
+  if (!auth) {
+    return { erro: 'credencial de Gmail/Drive ausente — rodar node autorizar-google-notas.js' };
+  }
+
+  sincronizacaoNotasEmAndamento = true;
+  const stmts = stmtsNotas(dryRun);
+  const relatorio = { processadas: 0, notas: 0, orfaos: 0, erros: 0, itens: [] };
+
+  try {
+    const gmail = google.gmail({ version: 'v1', auth });
+    const drive = google.drive({ version: 'v3', auth });
+    const calendar = google.calendar({ version: 'v3', auth });
+
+    // Cria os tres rotulos ANTES de montar a busca. A query e feita de `-label:"Notas/..."`, e no
+    // primeiro ciclo eles ainda nao existem — um `-label:` de rotulo inexistente nao tem
+    // comportamento garantido, e se ele nao casar nada a rotina volta vazia e parece estar
+    // funcionando sem fazer nada. Uma chamada resolve e tira a duvida do caminho.
+    for (const rotulo of Object.values(NOTAS_ROTULOS)) await garantirRotuloGmail(gmail, rotulo);
+
+    // Dívida primeiro: um e-mail que ficou preso em POSTADA/POSTANDO tem de ser resolvido antes de
+    // aceitar trabalho novo, senao a pendencia envelhece atras da fila.
+    //
+    // Pulado na amostragem: `soAmostrar` promete só leitura, e esta retomada CHEGA A POSTAR. Hoje a
+    // rota fixa dryRun=true, entao nao havia dano — mas era uma armadilha esperando a primeira
+    // chamada com dryRun=false.
+    const pendentes = soAmostrar
+      ? []
+      : stmts.pendentes.all().filter((p) => ['POSTANDO', 'POSTADA'].includes(p.estado));
+    for (const p of pendentes) {
+      try {
+        const msg = await gmail.users.messages.get({ userId: 'me', id: p.gmail_message_id, format: 'full' });
+        await processarNotaReuniao({ gmail, calendar, drive, mensagem: msg.data, stmts, dryRun });
+      } catch (e) {
+        console.error(`  ❌ retomada de ${p.gmail_message_id} falhou: ${e.message}`);
+        await registrarFalhaNota({ stmts, gmail, id: p.gmail_message_id, erro: e.message, dryRun, ambiguo: p.estado === 'POSTANDO' });
+      }
+    }
+
+    const lista = await gmail.users.messages.list({ userId: 'me', q: montarQueryNotas(), maxResults: limite });
+    const mensagens = lista.data.messages || [];
+    console.log(`📨 Notas de reuniao: ${mensagens.length} e-mail(s) a processar${dryRun ? ' [DRY-RUN]' : ''}`);
+
+    for (const ref of mensagens) {
+      try {
+        const msg = await gmail.users.messages.get({ userId: 'me', id: ref.id, format: 'full' });
+
+        if (soAmostrar) {
+          relatorio.itens.push(await amostrarNota({ calendar, mensagem: msg.data }));
+          continue;
+        }
+
+        const r = await processarNotaReuniao({ gmail, calendar, drive, mensagem: msg.data, stmts, dryRun });
+        relatorio.processadas++;
+        if (r.estado === 'CONCLUIDO' && r.dealId) relatorio.notas++;
+        if (r.estado === 'ORFAO') relatorio.orfaos++;
+        if (r.estado === 'ERRO_PERMANENTE') relatorio.erros++;
+      } catch (e) {
+        relatorio.erros++;
+        console.error(`  ❌ ${ref.id}: ${e.message}`);
+        if (String(e.message).includes('invalid_grant')) {
+          // Nao conta como tentativa do e-mail: a culpa e da credencial, nao dele. Contar aqui
+          // gastaria as 3 chances de todos os e-mails da caixa num unico token expirado.
+          await enviarTelegram('❌ *Notas de reunião: token do Google expirou*\nRodar `node autorizar-google-notas.js` na VPS. Enquanto isso, nenhuma nota de reunião entra no CRM.').catch(() => {});
+          break; // as proximas falhariam igual
+        }
+        // Garante que exista linha antes de contar a tentativa: se a falha foi no proprio
+        // `messages.get`, `processarNotaReuniao` nem chegou ao INSERT, e sem linha o contador nao
+        // sobe — a mensagem tentaria para sempre, que e o defeito que NOTAS_MAX_TENTATIVAS existe
+        // para matar.
+        stmts.inserir.run(ref.id, '(assunto nao lido)');
+        const desistiu = await registrarFalhaNota({ stmts, gmail, id: ref.id, erro: e.message, dryRun });
+        if (desistiu) relatorio.desistidas = (relatorio.desistidas || 0) + 1;
+      }
+    }
+
+    await conferirSilencioNotas({ viuMensagem: mensagens.length > 0, dryRun }).catch(() => {});
+
+    return relatorio;
+  } finally {
+    sincronizacaoNotasEmAndamento = false;
+  }
+}
+
+// Só leitura: mostra o que a cascata decidiria, sem extrair nada nem escrever em lugar nenhum.
+// É o teste de regressão manual para quando o Google mudar o formato do e-mail.
+async function amostrarNota({ calendar, mensagem }) {
+  const assunto = cabecalhoGmail(mensagem.payload, 'Subject');
+  const { texto: corpo, html } = extrairCorpoGmail(mensagem.payload);
+  const doAssunto = notasReuniao.parseAssuntoGemini(assunto);
+  const dataIso = doAssunto?.dataIso
+    || new Date(Number(mensagem.internalDate)).toLocaleDateString('en-CA', { timeZone: TZ_ESCRITORIO });
+
+  const docIdDoCorpo = notasReuniao.extrairDocId(html) || notasReuniao.extrairDocId(corpo);
+  const evento = await acharEventoDaReuniao(calendar, { dataIso, tituloEvento: doAssunto?.tituloEvento, docId: docIdDoCorpo })
+    .catch(() => null);
+
+  const sinais = notasReuniao.extrairSinais({ evento, assunto, corpo });
+  const porTelefone = buscarDealsPorTelefone(sinais.telefone);
+  const porEmail = porTelefone.length ? [] : buscarDealsPorEmail(sinais.emails);
+  const resolucao = notasReuniao.decidirDeal(sinais, { porTelefone, porEmail, porAtividade: [] });
+
+  return {
+    id: mensagem.id,
+    assunto,
+    data: dataIso,
+    evento_encontrado: !!evento,
+    titulo_evento: sinais.tituloEvento,
+    telefone: sinais.telefone,
+    doc_id: sinais.docId || docIdDoCorpo || null,
+    corpo_chars: corpo.length,
+    deal_id: resolucao.dealId,
+    metodo: resolucao.metodo,
+    confianca: resolucao.confianca,
+    // A varredura de /activities NAO roda aqui: e a unica etapa cara da cascata e a amostragem
+    // precisa ser barata o bastante para rodar a vontade. Um item sem deal aqui ainda pode resolver
+    // no ciclo real.
+    observacao: resolucao.dealId ? null : 'sem deal por sinal local; o ciclo real ainda tentaria /activities',
+  };
+}
+
+app.get('/notas-reuniao/amostrar', exigeAdmin, rota(async (req, res) => {
+  const limite = Math.min(Number(req.query.limite) || 10, 50);
+  const r = await sincronizarNotasReuniao({ soAmostrar: true, limite, dryRun: true });
+  res.json(r);
+}));
+
+app.post('/notas-reuniao/sincronizar', exigeAdmin, rota(async (req, res) => {
+  const r = await sincronizarNotasReuniao({ dryRun: req.query.aplicar === '1' ? false : NOTAS_REUNIAO_DRY_RUN });
+  res.json(r);
+}));
+
 async function enviarTelegram(texto) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
@@ -5155,29 +6107,48 @@ app.listen(PORT, () => {
     sincronizarAtividadesMoskit().catch((e) => console.error(`  ❌ Erro na sincronizacao de atividades: ${e.message}`));
   }, SYNC_INTERVAL_MS);
 
+  // Notas de reuniao do Gemini -> nota no negocio. Cadencia propria e bem maior que a das duas
+  // acima: reuniao termina algumas vezes por dia, e cada ciclo custa uma chamada de IA por e-mail.
+  // Nasce em dry-run (NOTAS_REUNIAO_DRY_RUN) — a chave so vira depois de conferir, no acervo real,
+  // as notas que TERIAM sido postadas.
+  if (NOTAS_REUNIAO_ATIVO) {
+    const modo = NOTAS_REUNIAO_DRY_RUN ? 'DRY-RUN (nao escreve no CRM)' : 'ATIVO';
+    console.log(`   Notas de reuniao: a cada ${Math.round(NOTAS_SYNC_INTERVAL_MS / 60000)} min — ${modo}`);
+    if (!getGoogleAuthClientNotas()) {
+      console.log('   ⚠️ ...mas a credencial de Gmail/Drive nao existe: rodar `node autorizar-google-notas.js`');
+    }
+    setInterval(() => {
+      sincronizarNotasReuniao().catch((e) => console.error(`  ❌ Erro na sincronizacao de notas de reuniao: ${e.message}`));
+    }, NOTAS_SYNC_INTERVAL_MS);
+  }
+
   // Reconciliacao da classificacao: rede de seguranca para o CRM nao ficar diferente do que o bot apurou
   // (PUT que nao pegou, conversa que parou de receber mensagem, alteracao feita fora do bot). Intervalo
   // proprio, bem maior que o da sincronizacao: e uma varredura de deals, 1 GET por deal.
+  //
+  // As TRES reconciliacoes (classificacao, vinculo, pendencias) varrem o Moskit. Se disparassem no
+  // MESMO instante a cada ciclo, triplicariam o burst de GETs de uma vez — medido 14-17/08/2026, o
+  // rate-limit do Moskit (HTTP 429) foi o que impediu a rotina de vinculo de religar qualquer coisa.
+  // `agendarReconciliacao` desloca a FASE de cada uma (0/5/10 min), entao os picos nao coincidem.
+  function agendarReconciliacao(nome, fn, faseMin) {
+    const dispara = () => fn().catch((e) => console.error(`  ❌ Erro na ${nome}: ${e.message}`));
+    setTimeout(dispara, faseMin * 60 * 1000);
+    setInterval(dispara, RECONCILIACAO_INTERVAL_MS);
+  }
   if (RECONCILIACAO_ATIVA) {
     console.log(`   Reconciliacao de classificacao: a cada ${Math.round(RECONCILIACAO_INTERVAL_MS / 60000)} min (janela de ${RECONCILIACAO_DIAS} dias)`);
-    setInterval(() => {
-      rodarReconciliacaoPeriodica().catch((e) => console.error(`  ❌ Erro na reconciliacao periodica: ${e.message}`));
-    }, RECONCILIACAO_INTERVAL_MS);
+    agendarReconciliacao('reconciliacao periodica', rodarReconciliacaoPeriodica, 0);
 
     // Mesma cadencia e mesma flag: religa sozinha a Atividade que o Moskit criou sem vincular ao
     // negocio (ver garantirVinculoAtividadeDeal/reconciliarVinculoAtividades).
     console.log(`   Reconciliacao de vinculo de atividade: a cada ${Math.round(RECONCILIACAO_INTERVAL_MS / 60000)} min`);
-    setInterval(() => {
-      rodarReconciliacaoVinculoAtividades().catch((e) => console.error(`  ❌ Erro na reconciliacao de vinculo de atividade: ${e.message}`));
-    }, RECONCILIACAO_INTERVAL_MS);
+    agendarReconciliacao('reconciliacao de vinculo de atividade', rodarReconciliacaoVinculoAtividades, 5);
 
     // Mesma cadencia e mesma flag: avisa sobre pendencia de agendamento numa conversa que PAROU DE VEZ
     // (ver reconciliarPendenciasAgendamento) — a escalada por proximidade so roda dentro de um ciclo
     // de reprocessamento, e uma conversa muda nunca e reprocessada de novo.
     console.log(`   Reconciliacao de pendencia de agendamento: a cada ${Math.round(RECONCILIACAO_INTERVAL_MS / 60000)} min (janela de ${AGENDAMENTO_PENDENCIA_SILENCIOSA_DIAS} dias)`);
-    setInterval(() => {
-      rodarReconciliacaoPendenciasAgendamento().catch((e) => console.error(`  ❌ Erro na reconciliacao de pendencia de agendamento: ${e.message}`));
-    }, RECONCILIACAO_INTERVAL_MS);
+    agendarReconciliacao('reconciliacao de pendencia de agendamento', rodarReconciliacaoPendenciasAgendamento, 10);
   } else {
     console.log('   Reconciliacao de classificacao: DESLIGADA (RECONCILIACAO_ATIVA=false)');
   }
@@ -5255,6 +6226,7 @@ module.exports = {
   reconciliarClassificacao,
   reconciliarVinculoAtividades,
   reconciliarPendenciasAgendamento,
+  garantirVinculoAtividadeDeal, // religar-atividade.js (script manual) religa e limpa o estado terminal
   buscarIdOpcao,
   handleAgendamentoCalendar,
   // Exportadas para teste: a data-ancora em texto do escritorio (nao em ISO) e o que impede o modelo
@@ -5279,4 +6251,13 @@ module.exports = {
   // sem os timers de sincronizacao e sem reprocessar as conversas pendentes. O teste chama
   // app.listen() por conta propria e exercita so o HTTP.
   app,
+  // Notas de reuniao (Gemini -> nota no negocio). Exportados para o script de religar orfao e para
+  // inspecao manual — nao ha teste automatico que os chame, porque todos falam com a rede.
+  sincronizarNotasReuniao,
+  processarNotaReuniao,
+  notaComMarcadorExiste,
+  registrarFalhaNota,
+  conferirSilencioNotas,
+  stmtsNotas,
+  getGoogleAuthClientNotas,
 };

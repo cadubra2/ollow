@@ -2,6 +2,10 @@
 google-service-account.json
 google-oauth-client.json
 google-oauth-token.json
+# Credencial da rotina de notas de reuniao (Gmail/Drive) — separada da do Calendar de proposito,
+# para que ligar essa funcionalidade nunca arrisque o token que faz o agendamento funcionar.
+google-oauth-client-notas.json
+google-oauth-token-notas.json
 
 # Banco e backups: contem o historico completo das conversas dos clientes.
 # `conversations.db` ja estava ignorado, mas os backups gerados pelos scripts de correcao NAO —

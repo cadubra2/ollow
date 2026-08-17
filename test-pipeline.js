@@ -28,6 +28,10 @@ process.env.FUNIL_FECHAMENTO_DRY_RUN = 'true';
 // impede que um .env de producao com a flag ligada faca esses testes passarem por engano, sem
 // escrever nada. O caminho desligado tem arquivo proprio: test-agenda-dry-run.js.
 process.env.AGENDA_MOSKIT_DRY_RUN = 'false';
+// Mesmo motivo: fixar os limites da reconciliacao de vinculo (defaults identicos aos de producao)
+// para o teste nao depender de um .env que esteja em outro valor.
+process.env.VINCULO_MAX_TENTATIVAS = '3';
+process.env.VINCULO_BACKOFF_CICLOS = '4';
 
 // ---------- dublê do axios ----------
 const axios = require('axios');
@@ -44,12 +48,17 @@ for (const metodo of ['get', 'post', 'put', 'patch', 'delete']) {
 
 // ---------- dublê do Google Calendar ----------
 const { google } = require('googleapis');
-const agenda = { insert: [], patch: [], get: [], delete: [], respostaInsert: null };
+const agenda = { insert: [], patch: [], get: [], delete: [], list: [], respostaInsert: null, respostaGet: null, respostaList: null };
 google.calendar = () => ({
   events: {
     insert: async (a) => { agenda.insert.push(a); return { data: agenda.respostaInsert }; },
+    // Usado por acharEventoDaReuniao (rotina de notas). Vazio por padrao = "nenhum evento casou",
+    // que e o caminho em que a identificacao tem de se virar sem a agenda.
+    list: async (a) => { agenda.list.push(a); return { data: { items: agenda.respostaList || [] } }; },
     patch: async (a) => { agenda.patch.push(a); return { data: {} }; },
-    get: async (a) => { agenda.get.push(a); return { data: { summary: 'antigo', description: 'antigo' } }; },
+    // respostaGet permite ao teste devolver o evento que o proprio bot acabou de criar — e assim que
+    // se prova que sincronizarMetadadosEvento NAO fica repatchando um evento que nao mudou.
+    get: async (a) => { agenda.get.push(a); return { data: agenda.respostaGet || { summary: 'antigo', description: 'antigo' } }; },
     delete: async (a) => { agenda.delete.push(a); return {}; },
   },
 });
@@ -59,10 +68,12 @@ const {
   handleAgendamentoCalendar, listarAtividadesMoskit, finalizarCiclo,
   aplicarGateCasoDescrito, deveEsperarCasoDescrito, registrarBriefing, mergeDados,
   mesclarParaCrm, derivarAdvogadoDaArea, detectarOpcoesInvalidas, registrarOpcoesInvalidas,
-  reconciliarClassificacao, reconciliarPendenciasAgendamento, montarPayloadMoskit,
+  reconciliarClassificacao, reconciliarPendenciasAgendamento, reconciliarVinculoAtividades, montarPayloadMoskit,
   descreverAncora, somarMinutosNaive, formatarHorarioEscritorio,
+  stmtsNotas, registrarFalhaNota, conferirSilencioNotas, processarNotaReuniao,
 } = require('./index');
 const moskitIds = require('./src/moskit-ids');
+const notasReuniao = require('./src/notas-reuniao');
 const { BLOCO_CONDICOES_PAGA } = require('./src/bloco-condicoes');
 
 const db = new Database(process.env.DB_PATH);
@@ -83,8 +94,10 @@ const ID_ATIVIDADE = 990001;
 function limpar() {
   rede.chamadas = []; rede.get = rede.put = null;
   rede.post = (url) => (url.includes('/activities') ? { status: 200, data: { id: ID_ATIVIDADE } } : { status: 200, data: {} });
-  agenda.insert = []; agenda.patch = []; agenda.get = []; agenda.delete = [];
+  agenda.insert = []; agenda.patch = []; agenda.get = []; agenda.delete = []; agenda.list = [];
   agenda.respostaInsert = { id: 'ev1', htmlLink: 'https://exemplo/ev1' };
+  agenda.respostaGet = null;
+  agenda.respostaList = null;
   // Tabela de dedupe entre as duas agendas — sem limpar, o INSERT OR IGNORE do teste anterior faria
   // o proximo enxergar uma linha velha e passar por engano.
   db.prepare('DELETE FROM atividades_sincronizadas').run();
@@ -551,6 +564,55 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
       notas()[0].corpo.description.includes('pode ser sim') && notas()[0].corpo.description.includes('marquei sua consulta'));
     checar('   com comprovante verificado, a nota nao alerta', notas()[0].corpo.description.includes('comprovante verificado'));
   }
+
+  {
+    // Titulo e descricao do evento carregam o vinculo com o negocio para a rotina de notas de reuniao
+    // (sincronizarNotasReuniao). Sem eles, identificar o deal depende do "Telefone:", que so existe em
+    // evento criado pelo bot — a sondagem de 16/08/2026 mediu 1/3 das reunioes com notas nascendo de
+    // evento criado a mao.
+    //
+    // Deal com id REALISTA (8 digitos) de proposito: a extracao exige no minimo 5 digitos depois do
+    // "#", entao com o `deal_id: 20` dos outros cenarios a ida-e-volta abaixo nao seria exercida —
+    // passaria sem testar nada.
+    const DEAL = 48292471;
+    limpar();
+    const row = semear(CHAT, { deal_id: DEAL });
+    await handleAgendamentoCalendar(DEAL, { ...DADOS }, CHAT, true, row, CONFIRMADO);
+    const criado = agenda.insert[0].requestBody;
+
+    checar(`titulo do evento termina em · #${DEAL}`, criado.summary.endsWith(` · #${DEAL}`), criado.summary);
+    checar('descricao do evento leva [deal:...]', criado.description.includes(`[deal:${DEAL}]`), criado.description);
+    checar('   e mantem o "Telefone:" (identificacao antiga continua valendo)', criado.description.includes(`Telefone: ${CHAT}`));
+
+    // O numero e SUFIXO, nunca prefixo: a rota que adiciona link do Meet reconhece consulta na agenda
+    // com /^Consulta\s*—/ sobre o summary. Com o numero na frente ela pararia de enxergar qualquer
+    // consulta, e sem erro nenhum — o pior modo de falha possivel.
+    checar('   e o /^Consulta —/ da rota do Meet continua casando', /^Consulta\s*—/.test(criado.summary), criado.summary);
+
+    // Ida e volta: o que o bot ESCREVE no titulo tem que ser o que o bot LE depois. E o contrato
+    // entre montarResumoEvento (index.js) e extrairSinais (src/notas-reuniao.js), e nada mais o cobre:
+    // cada metade tem teste proprio e as duas poderiam divergir em silencio.
+    const sinais = notasReuniao.extrairSinais({ evento: { summary: criado.summary, description: criado.description } });
+    igual('   o modulo de notas le esse titulo de volta', sinais.dealIdNoTitulo, DEAL);
+    igual('   e a cascata resolve o negocio certo', notasReuniao.decidirDeal(sinais, {}).dealId, DEAL);
+
+    // Mesmo contrato pelo ASSUNTO do e-mail, que reproduz o titulo entre aspas — este e o caminho que
+    // dispensa achar o evento na agenda.
+    const doAssunto = notasReuniao.extrairSinais({ evento: null, assunto: `Notas: "${criado.summary}" de 05/08/2026` });
+    igual('   e le tambem pelo assunto, sem evento nenhum', doAssunto.dealIdNoTitulo, DEAL);
+
+    // O RISCO das duas mudancas: sincronizarMetadadosEvento COMPARA o titulo e a descricao que monta
+    // com os que estao no Google para decidir se da patch. Se a criacao e a comparacao derivassem o
+    // dealId de fontes diferentes — por exemplo lendo do banco, onde stmtFinalizarCiclo so grava
+    // DEPOIS deste ponto — toda rodada veria "mudou" e repatcharia o evento para sempre. Devolvendo o
+    // evento recem-criado no GET, nenhum patch pode sair.
+    agenda.respostaGet = { summary: criado.summary, description: criado.description };
+    agenda.patch = [];
+    await handleAgendamentoCalendar(DEAL, { ...DADOS }, CHAT, true, linha(CHAT), CONFIRMADO);
+    igual('   evento inalterado → NENHUM patch (sem repatch infinito)', agenda.patch.length, 0);
+    igual('   e nenhum evento novo', agenda.insert.length, 1);
+  }
+
   {
     limpar();
     const row = semear(CHAT, { deal_id: 20 });
@@ -1393,6 +1455,95 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
   }
 
   // ============================================================
+  // reconciliarVinculoAtividades: rede de seguranca do vinculo Atividade x negocio. MEDIDO 14-17/08/2026
+  // em 6 negocios: o Moskit responde 429/timeout quando a varredura bate forte, e a rotina antiga
+  // retentava a cada 30 min SEM religar nada, inundando o Telegram com o mesmo aviso (o dedup por
+  // string do resumo nao segurava porque o subconjunto de falhas mudava a cada rodada). Regras novas:
+  // cooldown por linha (que dobra a cada falha), erro transitorio SILENCIOSO, desistencia terminal apos
+  // VINCULO_MAX_TENTATIVAS com UM aviso final (dedup por vinculo_aviso_hash), e estado terminal que so
+  // o religar-atividade.js desfaz.
+  console.log('\n=== reconciliarVinculoAtividades: backoff, desistencia e dedup ===');
+  const CHAT_VINC = '5511966000001';
+  const ATV_VINC = 880001;
+  {
+    limpar();
+    semear(CHAT_VINC, { deal_id: 30, atividade_moskit_id: ATV_VINC });
+    // Moskit rate-limitando: toda leitura da atividade volta 429.
+    rede.get = () => ({ status: 429, data: {} });
+
+    const r1 = await reconciliarVinculoAtividades({ aplicar: true });
+    igual('1a tentativa com 429 → erro transitorio', r1.erros_transitorios, 1);
+    igual('   nenhum Telegram (429 nao e "conferir na mao")', telegrams().length, 0);
+    igual('   falhas = 1', linha(CHAT_VINC).vinculo_falhas, 1);
+    checar('   cooldown gravado', !!linha(CHAT_VINC).vinculo_backoff_ate);
+
+    limpar();
+    const r2 = await reconciliarVinculoAtividades({ aplicar: true });
+    igual('ciclo seguinte dentro do cooldown → linha pulada', r2.cooldown, 1);
+    igual('   sem chamar a rede', de('GET', '/activities/').length, 0);
+    igual('   nenhum Telegram novo', telegrams().length, 0);
+  }
+  {
+    // Simula o cooldown vencer (o bot nao dorme 30 min no teste) ate estourar MAX_TENTATIVAS.
+    // Moskit continua rate-limitando: o stub de 429 fica ligado o bloco inteiro — sem isso o dublê
+    // devolveria 200 e a 2a tentativa "religaria com sucesso", zerando o estado.
+    limpar();
+    rede.get = () => ({ status: 429, data: {} });
+    db.prepare('UPDATE conversations SET vinculo_backoff_ate = NULL WHERE chat_id = ?').run(CHAT_VINC);
+    const r3 = await reconciliarVinculoAtividades({ aplicar: true });
+    igual('2a tentativa → falhas = 2', r3.erros_transitorios, 1);
+    igual('   e cooldown dobrado gravado', linha(CHAT_VINC).vinculo_falhas, 2);
+
+    db.prepare('UPDATE conversations SET vinculo_backoff_ate = NULL WHERE chat_id = ?').run(CHAT_VINC);
+    const r4 = await reconciliarVinculoAtividades({ aplicar: true });
+    igual('3a tentativa → desistiu (estado terminal)', r4.desistidas.length, 1);
+    igual('   vinculo_desistiu = 1', linha(CHAT_VINC).vinculo_desistiu, 1);
+    checar('   cooldown limpo (nunca mais retenta sozinho)', linha(CHAT_VINC).vinculo_backoff_ate === null);
+    igual('   UM aviso final no Telegram', telegrams().length, 1);
+    checar('   o aviso traz o comando do script',
+      telegrams()[0]?.corpo?.text?.includes(`religar-atividade.js 30 ${ATV_VINC}`), telegrams()[0]?.corpo?.text);
+    igual('   e o hash de dedup fica gravado', linha(CHAT_VINC).vinculo_aviso_hash, `desistida|30|${ATV_VINC}`);
+
+    limpar();
+    const r5 = await reconciliarVinculoAtividades({ aplicar: true });
+    igual('ciclo seguinte → linha parada (terminal), sem rede', r5.paradas, 1);
+    igual('   NENHUM Telegram novo (dedup por linha, nao por resumo)', telegrams().length, 0);
+  }
+  {
+    // religar-atividade.js limpa o estado terminal e a rotina volta a conferir a linha.
+    limpar();
+    db.prepare('UPDATE conversations SET vinculo_desistiu = 0, vinculo_falhas = 0, vinculo_backoff_ate = NULL, vinculo_aviso_hash = NULL WHERE chat_id = ?').run(CHAT_VINC);
+    rede.get = () => ({ status: 200, data: { id: ATV_VINC, deals: [{ id: 30 }] } });
+    const r6 = await reconciliarVinculoAtividades({ aplicar: true });
+    igual('apos o script limpar → reconferida e ja ok', r6.ja_ok, 1);
+    igual('   estado continua zerado', linha(CHAT_VINC).vinculo_falhas, 0);
+    igual('   nenhum Telegram', telegrams().length, 0);
+  }
+  {
+    // dry-run tem que ser leitura pura (mesmo contrato da reconciliacao de classificacao).
+    limpar();
+    semear(CHAT_VINC, { deal_id: 30, atividade_moskit_id: ATV_VINC });
+    rede.get = () => ({ status: 429, data: {} });
+    const r7 = await reconciliarVinculoAtividades({ aplicar: false });
+    igual('dry-run com 429 → nao grava falhas', r7.erros_transitorios, 1);
+    igual('   vinculo_falhas continua 0', linha(CHAT_VINC).vinculo_falhas, 0);
+    igual('   vinculo_desistiu continua 0', linha(CHAT_VINC).vinculo_desistiu, 0);
+    igual('   nenhum Telegram', telegrams().length, 0);
+  }
+  {
+    // Caminho feliz: atividade sem vinculo que o PUT consegue religar — reseta e posta a nota.
+    limpar();
+    semear(CHAT_VINC, { deal_id: 30, atividade_moskit_id: ATV_VINC });
+    rede.get = (url) => url.includes('/activities/')
+      ? { status: 200, data: { id: ATV_VINC, deals: [], contacts: [{ id: 999 }] } }
+      : { status: 200, data: {} };
+    const r8 = await reconciliarVinculoAtividades({ aplicar: true });
+    igual('atividade sem vinculo → religada', r8.religadas.length, 1);
+    igual('   estado zerado', linha(CHAT_VINC).vinculo_falhas, 0);
+    igual('   nota no deal', notas().length, 1);
+  }
+
+  // ============================================================
   // A rede de seguranca: se o CRM ficar diferente do que o bot apurou, alguem tem que voltar e conferir.
   // As regras vieram da varredura real de 12/08/2026 (64 deals): area do CRM manda, responsavel e
   // derivado dela, e tipo de consulta so sobe para paga — nunca rebaixa para R$0.
@@ -1565,6 +1716,306 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     // como UTC de proposito ("nao girar de novo"), entao 17:30 tem que sair 17:30 em qualquer fuso.
     checar('formatarHorarioEscritorio nao gira a hora', formatarHorarioEscritorio('2026-08-05T17:30:00').includes('17:30'), formatarHorarioEscritorio('2026-08-05T17:30:00'));
     igual('   e devolve null sem horario', formatarHorarioEscritorio(null), null);
+  }
+
+  // ------------------------------------------------------------
+  console.log('\n=== Estado das notas de reuniao (idempotencia) ===');
+  {
+    // A tabela notas_reuniao E a garantia de que um e-mail nunca vira duas notas no prontuario do
+    // cliente. Os UPDATE usam parametros NOMEADOS, e better-sqlite3 e estrito com eles: uma chave a
+    // mais ou a menos lanca em runtime — e esses caminhos so seriam exercidos em producao.
+    const camposVazios = () => ({
+      doc_id: null, evento_id: null, deal_id: null, metodo: null,
+      diagnostico: null, extracao: null, marcador: null,
+    });
+
+    for (const dryRun of [false, true]) {
+      const s = stmtsNotas(dryRun);
+      const id = `msg-${dryRun}`;
+      const rotulo = dryRun ? '[dry-run]' : '[real]';
+
+      s.inserir.run(id, 'Notas: "Consulta — X (Y)" de 14/08/2026');
+      igual(`${rotulo} nasce em RESERVADO`, s.get.get(id).estado, 'RESERVADO');
+
+      s.avancar.run({
+        ...camposVazios(), gmail_message_id: id, estado: 'DEAL_RESOLVIDO',
+        doc_id: 'doc1', evento_id: 'ev1', deal_id: 123, metodo: 'evento_telefone',
+        diagnostico: '{}', ultimo_erro: null,
+      });
+      s.avancar.run({ ...camposVazios(), gmail_message_id: id, estado: 'EXTRAIDO', extracao: '{"a":1}', ultimo_erro: null });
+
+      // O COALESCE de cada campo e o que permite avancar um passo sem reenviar o que ja se sabe —
+      // sem ele, o passo EXTRAIDO apagaria o deal_id descoberto no passo anterior.
+      igual(`${rotulo} COALESCE preserva o deal_id`, s.get.get(id).deal_id, 123);
+      igual(`${rotulo} COALESCE preserva o doc_id`, s.get.get(id).doc_id, 'doc1');
+
+      s.avancar.run({ ...camposVazios(), gmail_message_id: id, estado: 'POSTANDO', marcador: '[ollow-notas:abcd1234]', ultimo_erro: null });
+      s.avancar.run({ ...camposVazios(), gmail_message_id: id, estado: 'POSTADA', ultimo_erro: null });
+
+      // POSTADA = a nota existe no CRM e so o rotulo do Gmail faltou. Tem que ser retomavel, senao
+      // o e-mail volta pra fila e a nota e postada de novo.
+      checar(`${rotulo} POSTADA aparece em pendentes (retomavel)`,
+        s.pendentes.all().some((x) => x.gmail_message_id === id && x.estado === 'POSTADA'));
+
+      s.falhar.run('erro de teste', id);
+      igual(`${rotulo} falhar incrementa tentativas`, s.get.get(id).tentativas, 1);
+
+      s.avancar.run({ ...camposVazios(), gmail_message_id: id, estado: 'CONCLUIDO', ultimo_erro: null });
+      checar(`${rotulo} CONCLUIDO sai de pendentes`, !s.pendentes.all().some((x) => x.gmail_message_id === id));
+      igual(`${rotulo} porDoc encontra pelo Doc`, s.porDoc.get('doc1')?.gmail_message_id, id);
+
+      // O mesmo Doc chegando por outra mensagem (encaminhamento, reenvio) nao pode virar 2a nota.
+      s.inserir.run(`${id}-b`, 'reenvio do mesmo Doc');
+      let barrou = false;
+      try {
+        s.avancar.run({ ...camposVazios(), gmail_message_id: `${id}-b`, estado: 'DEAL_RESOLVIDO', doc_id: 'doc1', ultimo_erro: null });
+      } catch { barrou = true; }
+      checar(`${rotulo} indice unico barra o MESMO Doc em outra mensagem`, barrou);
+
+      // Reprocessar o mesmo e-mail nao pode ressuscitar um caso ja concluido.
+      s.inserir.run(id, 'assunto diferente');
+      igual(`${rotulo} reinsert nao sobrescreve o estado`, s.get.get(id).estado, 'CONCLUIDO');
+    }
+
+    // As duas tabelas sao independentes de proposito: se o dry-run gravasse na real, a primeira
+    // execucao de verdade acharia tudo CONCLUIDO e nao postaria nada.
+    checar('dry-run e real nao compartilham estado',
+      stmtsNotas(true).get.get('msg-false') === undefined && stmtsNotas(false).get.get('msg-true') === undefined);
+  }
+
+  // ------------------------------------------------------------
+  console.log('\n=== Notas de reuniao: desistencia, silencio e Doc duplicado ===');
+
+  // gmail so precisa aceitar rotulo: as chamadas de verdade estao cobertas pelos dublês de rede.
+  const gmailFalso = {
+    users: {
+      messages: { modify: async () => ({}), get: async () => ({}) },
+      labels: { list: async () => ({ data: { labels: [] } }), create: async () => ({ data: { id: 'L1' } }) },
+    },
+  };
+
+  {
+    // Sem teto de tentativas, um e-mail que falha sempre (deal apagado, Doc corrompido) reprocessava
+    // a cada 10 min PARA SEMPRE — pagando OpenAI quando a falha era depois da extracao, e em silencio,
+    // porque a coluna `tentativas` era incrementada e nunca lida por ninguem.
+    limpar();
+    const s = stmtsNotas(false);
+    const id = 'msg-desiste';
+    db.prepare('DELETE FROM notas_reuniao').run();
+    s.inserir.run(id, 'assunto');
+    s.avancar.run({
+      doc_id: null, evento_id: null, metodo: null, diagnostico: null, extracao: null, marcador: null,
+      gmail_message_id: id, estado: 'DEAL_RESOLVIDO', deal_id: 48292471, ultimo_erro: null,
+    });
+
+    const p1 = await registrarFalhaNota({ stmts: s, gmail: gmailFalso, id, erro: 'timeout', dryRun: false });
+    const p2 = await registrarFalhaNota({ stmts: s, gmail: gmailFalso, id, erro: 'timeout', dryRun: false });
+    checar('1a e 2a falha nao desistem', p1 === false && p2 === false, [p1, p2]);
+    igual('   estado preservado para o proximo ciclo', s.get.get(id).estado, 'DEAL_RESOLVIDO');
+    igual('   telegram ainda em silencio', telegrams().length, 0);
+
+    const p3 = await registrarFalhaNota({ stmts: s, gmail: gmailFalso, id, erro: 'deal 48292471 nao existe', dryRun: false });
+    checar('3a falha DESISTE', p3 === true);
+    igual('   estado terminal', s.get.get(id).estado, 'ERRO_PERMANENTE');
+    checar('   sai de pendentes (nao volta no proximo ciclo)', !s.pendentes.all().some((x) => x.gmail_message_id === id));
+    checar('   e avisa no Telegram com o comando de religar',
+      telegrams().some((t) => t.corpo.text.includes('desistida') && t.corpo.text.includes('reprocessar-nota-reuniao')),
+      telegrams().map((t) => t.corpo.text));
+  }
+
+  {
+    // `ambiguo` = a RETOMADA nao conseguiu descobrir se a nota ja existe no CRM. Nao e o mesmo que
+    // "o POST falhou": um POST que falha deixa POSTANDO e o ciclo seguinte reconcilia sozinho. Se
+    // isso escalasse na primeira falha, uma queda de rede viraria trabalho manual a toa.
+    limpar();
+    const s = stmtsNotas(false);
+    const id = 'msg-ambiguo';
+    db.prepare('DELETE FROM notas_reuniao').run();
+    s.inserir.run(id, 'assunto');
+    s.avancar.run({
+      doc_id: null, evento_id: null, metodo: null, diagnostico: null, extracao: null, marcador: null,
+      gmail_message_id: id, estado: 'POSTANDO', deal_id: 48292471, ultimo_erro: null,
+    });
+
+    const r = await registrarFalhaNota({ stmts: s, gmail: gmailFalso, id, erro: 'Moskit fora do ar', dryRun: false, ambiguo: true });
+    checar('ambiguo escala na PRIMEIRA vez, sem esperar 3', r === true);
+    igual('   vai para revisao manual, nao para erro', s.get.get(id).estado, 'REVISAR_MANUAL');
+    checar('   com aviso dizendo que pode haver nota no CRM',
+      telegrams().some((t) => t.corpo.text.includes('ambíguo')), telegrams().map((t) => t.corpo.text));
+  }
+
+  {
+    // "Ciclo vazio" e o estado NORMAL: o que ja foi processado sai da busca pelo rotulo. O que precisa
+    // de aviso e silencio prolongado — que tem a mesma cara de token expirado e de formato de assunto
+    // mudado, as duas falhas que ninguem percebe.
+    limpar();
+    const marcarUltimoEmail = (quando) => db.prepare('UPDATE notas_reuniao_saude SET ultimo_email_em = ?, ultimo_aviso_em = NULL WHERE id = 1').run(quando);
+
+    await conferirSilencioNotas({ viuMensagem: true, dryRun: false });
+    igual('viu mensagem → nenhum aviso', telegrams().length, 0);
+
+    marcarUltimoEmail('2026-08-01 10:00:00'); // bem antes de "agora"
+    await conferirSilencioNotas({ viuMensagem: false, dryRun: false });
+    checar('silencio prolongado → avisa',
+      telegrams().some((t) => t.corpo.text.includes('nenhum e-mail novo')), telegrams().map((t) => t.corpo.text));
+
+    const apos = telegrams().length;
+    await conferirSilencioNotas({ viuMensagem: false, dryRun: false });
+    igual('   e nao repete o aviso no ciclo seguinte', telegrams().length, apos);
+
+    limpar();
+    marcarUltimoEmail(new Date().toISOString().slice(0, 19).replace('T', ' '));
+    await conferirSilencioNotas({ viuMensagem: false, dryRun: false });
+    igual('ciclo vazio recente NAO avisa (e o estado normal)', telegrams().length, 0);
+  }
+
+  {
+    // Doc duplicado cuja primeira copia NAO concluiu. O guard antigo so cobria CONCLUIDO: o resto
+    // batia no indice unico de doc_id, lancava, e o e-mail voltava a cada 10 min para sempre.
+    limpar();
+    const s = stmtsNotas(false);
+    db.prepare('DELETE FROM notas_reuniao').run();
+    const DOC = 'AbC123_def-456GHI789jkl';
+
+    s.inserir.run('msg-orfa', 'primeira copia');
+    s.avancar.run({
+      evento_id: null, deal_id: null, metodo: null, diagnostico: null, extracao: null, marcador: null,
+      gmail_message_id: 'msg-orfa', estado: 'ORFAO', doc_id: DOC, ultimo_erro: 'nao_encontrado',
+    });
+
+    const mensagem = {
+      id: 'msg-reenvio',
+      internalDate: String(Date.parse('2026-08-14T21:40:00Z')),
+      payload: {
+        headers: [{ name: 'Subject', value: 'Notas: "Consulta — X (Berto)" de 14/08/2026' }],
+        mimeType: 'text/plain',
+        body: { data: Buffer.from(`Resumo\nhttps://docs.google.com/document/d/${DOC}/edit`).toString('base64url') },
+      },
+    };
+
+    const erro = await esperarErro(() => processarNotaReuniao({
+      gmail: gmailFalso,
+      calendar: google.calendar(),
+      drive: { files: { export: async () => ({ data: '' }) } },
+      mensagem,
+      stmts: s,
+      dryRun: false,
+    }));
+
+    igual('reenvio do mesmo Doc nao lanca constraint', erro, null);
+    igual('   vira terminal, e nao volta a cada ciclo', s.get.get('msg-reenvio').estado, 'ERRO_PERMANENTE');
+    checar('   apontando para a copia que precisa ser resolvida',
+      (s.get.get('msg-reenvio').ultimo_erro || '').includes('msg-orfa'), s.get.get('msg-reenvio').ultimo_erro);
+    igual('   e a primeira copia continua intacta', s.get.get('msg-orfa').estado, 'ORFAO');
+    igual('   nenhuma nota foi postada', notas().length, 0);
+  }
+
+  {
+    // O DEFEITO MAIS GRAVE que este bloco cobre: o rotulo do Gmail e aplicado DEPOIS de o estado
+    // virar terminal, e o `messages.list` do mesmo ciclo roda logo em seguida. Se o indice de busca
+    // do Gmail atrasar — ou se a retomada falhar sem conseguir rotular — a mesma mensagem volta na
+    // lista, nenhum dos `if` de retomada casa (o estado nao e mais POSTANDO) e ela seria reprocessada
+    // do zero: nova chamada de OpenAI e uma SEGUNDA nota no prontuario do cliente.
+    const mensagemQualquer = {
+      id: 'msg-reprocesso',
+      internalDate: String(Date.parse('2026-08-14T21:40:00Z')),
+      payload: {
+        headers: [{ name: 'Subject', value: 'Notas: "Consulta — X (Berto)" de 14/08/2026' }],
+        mimeType: 'text/plain',
+        body: { data: Buffer.from('Resumo da reuniao').toString('base64url') },
+      },
+    };
+    const rodar = (extra = {}) => processarNotaReuniao({
+      gmail: gmailFalso,
+      calendar: google.calendar(),
+      drive: { files: { export: async () => ({ data: '' }) } },
+      mensagem: mensagemQualquer,
+      stmts: stmtsNotas(false),
+      dryRun: false,
+      ...extra,
+    });
+
+    for (const estado of ['CONCLUIDO', 'REVISAR_MANUAL', 'ORFAO', 'ERRO_PERMANENTE']) {
+      limpar();
+      const s = stmtsNotas(false);
+      db.prepare('DELETE FROM notas_reuniao').run();
+      s.inserir.run('msg-reprocesso', 'assunto');
+      s.avancar.run({
+        doc_id: null, evento_id: null, metodo: null, diagnostico: null, extracao: null, marcador: null,
+        gmail_message_id: 'msg-reprocesso', estado, deal_id: 48292471, ultimo_erro: null,
+      });
+
+      const r = await rodar();
+      checar(`${estado} reaparecendo na busca NAO e reprocessado`, r.jaResolvido === true, r);
+      igual(`   ${estado}: nenhuma nota postada`, notas().length, 0);
+      igual(`   ${estado}: estado preservado`, s.get.get('msg-reprocesso').estado, estado);
+    }
+
+    // O religamento manual atravessa a guarda de proposito — e o unico jeito de ressuscitar um orfao.
+    limpar();
+    const s = stmtsNotas(false);
+    db.prepare('DELETE FROM notas_reuniao').run();
+    s.inserir.run('msg-reprocesso', 'assunto');
+    s.avancar.run({
+      doc_id: null, evento_id: null, metodo: null, diagnostico: null, extracao: null, marcador: null,
+      gmail_message_id: 'msg-reprocesso', estado: 'ORFAO', deal_id: null, ultimo_erro: 'nao_encontrado',
+    });
+    const erroOrfao = await esperarErro(() => rodar({ dealIdForcado: 48292471 }));
+    checar('religar um ORFAO atravessa a guarda', erroOrfao === null || !/segunda nota/.test(erroOrfao), erroOrfao);
+
+    // ...menos quando ja foi postada: religar ai so criaria a segunda nota, e quem pediu precisa
+    // saber disso em vez de descobrir no prontuario do cliente.
+    limpar();
+    db.prepare('DELETE FROM notas_reuniao').run();
+    s.inserir.run('msg-reprocesso', 'assunto');
+    s.avancar.run({
+      doc_id: null, evento_id: null, metodo: null, diagnostico: null, extracao: null, marcador: null,
+      gmail_message_id: 'msg-reprocesso', estado: 'CONCLUIDO', deal_id: 48292471, ultimo_erro: null,
+    });
+    const erroConcluida = await esperarErro(() => rodar({ dealIdForcado: 48292471 }));
+    checar('religar uma CONCLUIDA e recusado com motivo', /segunda nota/.test(erroConcluida || ''), erroConcluida);
+    igual('   e nada e postado', notas().length, 0);
+  }
+
+  {
+    // `_` e caractere comum em e-mail e curinga de um caractere no LIKE. Sem ESCAPE,
+    // "joao_silva@x.com" casaria com o last_data de "joaoXsilva@x.com" — o negocio de outra pessoa.
+    limpar();
+    semear('5586000000001', { deal_id: 70000001, last_data: JSON.stringify({ email_cliente: 'joaoXsilva@x.com' }) });
+    semear('5586000000002', { deal_id: 70000002, last_data: JSON.stringify({ email_cliente: 'joao_silva@x.com' }) });
+
+    const s = stmtsNotas(false);
+    db.prepare('DELETE FROM notas_reuniao').run();
+    const mensagem = {
+      id: 'msg-email',
+      internalDate: String(Date.parse('2026-08-14T21:40:00Z')),
+      payload: {
+        headers: [{ name: 'Subject', value: 'Notas: "Consulta online" de 14/08/2026' }],
+        mimeType: 'text/plain',
+        body: { data: Buffer.from('Resumo').toString('base64url') },
+      },
+    };
+    agenda.respostaList = [{
+      id: 'ev-email',
+      status: 'confirmed',
+      summary: 'Consulta online',
+      description: '',
+      organizer: { email: 'escritoriocr2019@gmail.com' },
+      attendees: [{ email: 'joao_silva@x.com' }],
+      start: { dateTime: '2026-08-14T18:00:00-03:00' },
+    }];
+
+    await processarNotaReuniao({
+      gmail: gmailFalso,
+      calendar: google.calendar(),
+      drive: { files: { export: async () => ({ data: '' }) } },
+      mensagem,
+      stmts: s,
+      dryRun: true,
+    });
+    igual('e-mail com "_" casa o deal certo, nao o vizinho', s.get.get('msg-email').deal_id, 70000002);
+
+    db.prepare('DELETE FROM conversations WHERE deal_id IN (70000001, 70000002)').run();
   }
 
   db.close();
