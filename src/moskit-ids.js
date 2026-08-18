@@ -234,6 +234,21 @@ const ADVOGADO_POR_AREA_ID = {
   [AREA_DIREITO['direito do trabalho']]: 'Iury',
 };
 
+// Estagios do Funil de Vendas (pipeline id 40631), medidos via GET /stages em 04/08/2026. Nasceram
+// duplicados como MOSKIT_STAGE_MAP em index.js (com override por env var e a `priority` que decide a
+// ordem do funil, que continuam la — sao logica de negocio, nao identificador do CRM); os literais
+// tambem vazaram para test-pipeline.js, test-funil-simulado.js, test-moskit-put.js e
+// testar-briefing-unico.js. Se o Moskit renumerar um estagio, o ajuste e so aqui.
+const STAGE = {
+  agendamento: 179388,
+  consulta_agendada: 184382,
+  aguardando_condicao: 285584,
+  elaboracao_proposta: 267035,
+  negociacao: 182159,
+  elaboracao_contrato: 179385,
+  contrato_enviado: 179386,
+};
+
 // Tipos de atividade que representam consulta marcada (GET /activityTypes).
 // Ligacao/Email/WhatsApp ficam de fora de proposito: nao viram compromisso de agenda.
 const ATIVIDADE_TIPO = {
@@ -281,6 +296,7 @@ module.exports = {
   APELIDOS,
   INDICE_BUSCA,
   ADVOGADO_POR_AREA_ID,
+  STAGE,
   normalizarChave,
   buscarOpcao,
   ATIVIDADE_TIPO,

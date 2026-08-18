@@ -72,6 +72,7 @@ const {
   refrescarBriefingsPertoDaConsulta,
   descreverAncora, somarMinutosNaive, formatarHorarioEscritorio,
   stmtsNotas, registrarFalhaNota, conferirSilencioNotas, processarNotaReuniao,
+  garantirDealExiste, importarContatosMoskit,
 } = require('./index');
 const moskitIds = require('./src/moskit-ids');
 const notasReuniao = require('./src/notas-reuniao');
@@ -1418,6 +1419,22 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     igual('   e o responsavel e derivado dela', mesclado.advogado_responsavel, 'Berto');
   }
   {
+    // O bug que sobrevivia mesmo depois do teste acima: aplicarGateCasoDescrito e chamado DE NOVO
+    // dentro de mesclarParaCrm, sobre o objeto MESCLADO, usando so a evidencia DESTA rodada — uma
+    // classificacao que uma rodada ANTERIOR ja tinha validado com evidencia real era apagada de novo
+    // assim que uma rodada seguinte (ex: so reagendamento) nao reemitisse cliente_descreveu_caso,
+    // revertendo ate o nome do deal em atualizarNegocioMoskit. `_casoDescritoValidado` persiste em
+    // last_data pra distinguir "ja provado uma vez" de um palpite pre-gate (teste anterior, que nunca
+    // carrega o marcador e continua sendo limpo).
+    const rodada1 = mesclarParaCrm(null, { area_direito: 'Direito Administrativo' }, OBS_CASO);
+    igual('rodada 1 (com evidencia): area entra', rodada1.area_direito, 'Direito Administrativo');
+    igual('   e marca _casoDescritoValidado', rodada1._casoDescritoValidado, true);
+
+    const rodada2 = mesclarParaCrm(rodada1, { modalidade_consulta: 'online' }, []);
+    igual('rodada 2 (SEM evidencia nova, ex: so reagendamento): area validada antes sobrevive', rodada2.area_direito, 'Direito Administrativo');
+    igual('   responsavel tambem sobrevive', rodada2.advogado_responsavel, 'Berto');
+  }
+  {
     const mesclado = mesclarParaCrm({ area_direito: 'Direito de Familia', advogado_responsavel: 'Iury' }, {}, OBS_CASO);
     igual('advogado incoerente com a area e corrigido no merge', mesclado.advogado_responsavel, 'Bruno');
   }
@@ -1425,6 +1442,62 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     const dados = { area_direito: 'Outros', advogado_responsavel: 'Bruno' };
     derivarAdvogadoDaArea(dados);
     igual('area "Outros" → responsavel vazio', dados.advogado_responsavel, null);
+  }
+
+  // ============================================================
+  console.log('\n=== garantirDealExiste: erro transitorio nao pode criar deal duplicado ===');
+  {
+    limpar();
+    rede.get = () => ({ status: 404, data: {} });
+    let dealCriado = false;
+    rede.post = (url) => { if (url.includes('/deals')) dealCriado = true; return { status: 201, data: { id: 999 } }; };
+    const dealId = await garantirDealExiste(50, { nome: 'Fulano' }, 1, {});
+    igual('404 CONFIRMADO → recria o deal', dealId, 999);
+    checar('   POST /deals foi chamado', dealCriado);
+  }
+  {
+    limpar();
+    rede.get = () => { throw new Error('timeout of 30000ms exceeded'); };
+    let dealCriado = false;
+    rede.post = (url) => { if (url.includes('/deals')) dealCriado = true; return { status: 201, data: { id: 12345 } }; };
+    const erro = await esperarErro(() => garantirDealExiste(50, { nome: 'Fulano' }, 1, {}));
+    checar('timeout (erro transitorio, NAO 404) relanca em vez de recriar', !!erro && !dealCriado, { erro, dealCriado });
+  }
+  {
+    limpar();
+    rede.get = () => { const e = new Error('Request failed with status code 503'); e.response = { status: 503 }; throw e; };
+    let dealCriado = false;
+    rede.post = (url) => { if (url.includes('/deals')) dealCriado = true; return { status: 201, data: { id: 1 } }; };
+    const erro = await esperarErro(() => garantirDealExiste(50, { nome: 'Fulano' }, 1, {}));
+    checar('5xx do Moskit (nao 404) tambem relanca em vez de recriar', !!erro && !dealCriado, { erro, dealCriado });
+  }
+  {
+    limpar();
+    rede.get = () => ({ status: 200, data: { id: 50 } });
+    const dealId = await garantirDealExiste(50, { nome: 'Fulano' }, 1, {});
+    igual('deal confirmado existente → devolve o mesmo id', dealId, 50);
+    igual('   sem nenhum POST de criacao', de('POST', '/deals').length, 0);
+  }
+
+  // ============================================================
+  console.log('\n=== importarContatosMoskit: mesmo limiar de telefone que o resto do sistema (MIN_DIGITOS=8) ===');
+  {
+    limpar();
+    rede.get = () => ({
+      status: 200,
+      data: [
+        { id: 1, name: 'Fixo sem DDD', phones: [{ number: '32345678' }] },   // 8 digitos
+        { id: 2, name: 'Celular completo', phones: [{ number: '5511988887777' }] }, // 13 digitos
+        { id: 3, name: 'Curto demais', phones: [{ number: '1234567' }] },   // 7 digitos
+      ],
+      headers: {},
+    });
+    const r = await importarContatosMoskit();
+    igual('3 contatos, mas so 2 telefones validos entram no espelho', r.telefones_importados, 2);
+    const espelho8 = db.prepare('SELECT moskit_id FROM moskit_contacts WHERE phone = ?').get('32345678');
+    igual('telefone de 8 digitos (fixo sem DDD) ENTRA no espelho — antes o minimo era 10', espelho8?.moskit_id, 1);
+    const espelhoCurto = db.prepare('SELECT moskit_id FROM moskit_contacts WHERE phone = ?').get('1234567');
+    igual('telefone de 7 digitos continua de fora (MIN_DIGITOS)', espelhoCurto, undefined);
   }
 
   // ============================================================
