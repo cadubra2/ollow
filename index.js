@@ -2003,6 +2003,30 @@ function montarDescricaoEvento(dados, chatId, dealId) {
   ].filter(Boolean).join('\n');
 }
 
+// Mesmo sufixo `· #dealId` de montarResumoEvento (SUFIXO, NUNCA PREFIXO — mesmo motivo), mas
+// aplicado a um titulo que JA EXISTE (o que a equipe digitou na Atividade do Moskit), em vez de
+// gerado do zero a partir de `dados` do pipeline do bot. sincronizarAtividadesMoskit cobre consultas
+// que nunca passam pela conversa de WhatsApp (Atividade criada a mao no Moskit, ou pelo Moskit
+// Boost) — sem esse sufixo, a rotina de notas de reuniao dependia so dos metodos mais fracos da
+// cascata (atividade do Moskit / e-mail de participante) pra essas reunioes, em vez do metodo 1
+// (titulo com #dealId, "alta confianca", que dispensa ate achar o evento na agenda). Idempotente de
+// proposito: nao duplica o sufixo se ja estiver la.
+function comSufixoDealId(titulo, dealId) {
+  const t = titulo || 'Consulta agendada';
+  if (!dealId) return t;
+  return new RegExp(`·\\s*#${dealId}\\b`).test(t) ? t : `${t} · #${dealId}`;
+}
+
+// Mesmo marcador `[deal:...]` de montarDescricaoEvento, acrescentado a uma descricao que ja existe
+// (atv.notes + o link do negocio) em vez de montada do zero. Idempotente pelo mesmo motivo do
+// comentario acima — a atividade "evento nativo" so passa por aqui UMA vez (ver
+// stmtAtividadeMarcarSincronizada/stmtAtividadeJaSincronizada em sincronizarAtividadesMoskit).
+function comMarcadorDeal(descricao, dealId) {
+  const d = descricao || '';
+  if (!dealId) return d;
+  return /\[deal:\d+\]/.test(d) ? d : [d, `[deal:${dealId}]`].filter(Boolean).join('\n\n');
+}
+
 // Cria, na AGENDA do Moskit, a atividade que corresponde ao evento recem-criado no Google Agenda.
 //
 // O PONTO CRITICO AQUI E O `stmtAtividadeMarcarSincronizada` NO FIM. sincronizarAtividadesMoskit roda
@@ -4217,6 +4241,18 @@ async function sincronizarAtividadesMoskit() {
 
         if (eventoNativo) {
           if (eventoNativo.hangoutLink || eventoNativo.conferenceData?.entryPoints?.length) {
+            // Unica chance de enriquecer titulo/descricao desta atividade: depois de marcada como
+            // sincronizada ela nunca mais passa por aqui (stmtAtividadeJaSincronizada filtra no topo
+            // do loop). Se ja tinha Meet mas nao tinha o numero do negocio, e agora ou nunca.
+            const summaryComDeal = comSufixoDealId(eventoNativo.summary, dealId);
+            const descComDeal = comMarcadorDeal(eventoNativo.description, dealId);
+            if (dealId && (summaryComDeal !== eventoNativo.summary || descComDeal !== eventoNativo.description)) {
+              await calendar.events.patch({
+                calendarId: GOOGLE_CALENDAR_ID,
+                eventId: ollEventId,
+                requestBody: { summary: summaryComDeal, description: descComDeal },
+              });
+            }
             stmtAtividadeMarcarSincronizada.run(atv.id, ollEventId, dealId);
             relatorio.ja_sincronizadas++;
             continue;
@@ -4238,6 +4274,11 @@ async function sincronizarAtividadesMoskit() {
             eventId: ollEventId,
             conferenceDataVersion: 1,
             requestBody: {
+              // Mesma logica do curto-circuito acima: esta e a outra (e ultima) janela em que esta
+              // atividade passa por aqui, entao o numero do negocio entra no MESMO patch que cria o
+              // Meet — nao vale a pena um segundo round-trip so pra isso.
+              summary: comSufixoDealId(eventoNativo.summary, dealId),
+              description: comMarcadorDeal(eventoNativo.description, dealId),
               conferenceData: { createRequest: { requestId: `meet-native-${atv.id}`, conferenceSolutionKey: { type: 'hangoutsMeet' } } },
             },
           });
@@ -4281,11 +4322,11 @@ async function sincronizarAtividadesMoskit() {
             calendarId: GOOGLE_CALENDAR_ID,
             requestBody: {
               id: eventIdAtv,
-              summary: atv.title || 'Consulta agendada',
-              description: [
+              summary: comSufixoDealId(atv.title, dealId),
+              description: comMarcadorDeal([
                 atv.notes || '',
                 dealId ? `Negócio no Moskit: https://app.ollow.com.br/?/deal/${dealId}` : '',
-              ].filter(Boolean).join('\n\n'),
+              ].filter(Boolean).join('\n\n'), dealId),
               start: { dateTime: inicio.toISOString() },
               end: { dateTime: fim.toISOString() },
               conferenceData: {
@@ -6444,6 +6485,11 @@ module.exports = {
   // Exportada para teste: a paginacao por pageToken (e NAO por ?page=) e o tipo de detalhe que passa
   // despercebido — o codigo antigo "paginava" e lia sempre os mesmos 10 registros sem erro nenhum.
   listarAtividadesMoskit,
+  // Exportada para teste: e a rotina que decide se uma atividade criada direto no Moskit ganha o
+  // sufixo #dealId/marcador [deal:...] no evento do Google (ver comSufixoDealId/comMarcadorDeal).
+  sincronizarAtividadesMoskit,
+  comSufixoDealId,
+  comMarcadorDeal,
   finalizarCiclo,
   moverParaEstagio,
   moverEstagioSeAvancar,
