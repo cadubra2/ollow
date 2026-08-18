@@ -28,7 +28,7 @@ const PORT = process.env.PORT || 3000;
 // Ver src/moskit-ids.js — todo identificador do Moskit vive la, numa fonte so.
 const { LAYLA_USER_ID, PRODUTO_CONSULTA_PAGA_ID, STATUS_DEAL, LOST_REASON, LOST_REASON_PADRAO_ID } = require('./src/moskit-ids');
 const TEMPO_INATIVIDADE_MS = Number(process.env.TEMPO_INATIVIDADE_MS) || 5 * 60 * 1000;
-const MOSKIT_STAGE_CONSULTA_AGENDADA = Number(process.env.MOSKIT_STAGE_CONSULTA_AGENDADA) || 184382;
+const MOSKIT_STAGE_CONSULTA_AGENDADA = Number(process.env.MOSKIT_STAGE_CONSULTA_AGENDADA) || MOSKIT_IDS.STAGE.consulta_agendada;
 const MOSKIT_BASE = process.env.MOSKIT_BASE || 'https://api.moskitcrm.com/v2';
 const TZ_ESCRITORIO = process.env.TZ_ESCRITORIO || 'America/Fortaleza';
 
@@ -109,14 +109,17 @@ const BRIEFING_REFRESH_MAX_POR_CICLO = Number(process.env.BRIEFING_REFRESH_MAX_P
 // Default DESLIGADO de proposito: sobe o codigo, roda GET /auditoria-consulta-gratis pra ver o que
 // seria liberado, e so entao liga no .env.
 const LIBERAR_CONSULTA_GRATIS = process.env.LIBERAR_CONSULTA_GRATIS === 'true';
+// Os IDs de estagio vem de MOSKIT_IDS.STAGE (src/moskit-ids.js) — a fonte unica para todo ID do
+// Moskit. Aqui so vive o que E de fato logica de negocio do funil: o override por env var e a
+// `priority` que decide a ordem (moverEstagioSeAvancar nunca deixa o funil andar pra tras).
 const MOSKIT_STAGE_MAP = {
-  agendamento: { id: Number(process.env.MOSKIT_STAGE_ID) || 179388, priority: 3 },
+  agendamento: { id: Number(process.env.MOSKIT_STAGE_ID) || MOSKIT_IDS.STAGE.agendamento, priority: 3 },
   consulta_agendada: { id: MOSKIT_STAGE_CONSULTA_AGENDADA, priority: 4 },
-  aguardando_condicao: { id: Number(process.env.MOSKIT_STAGE_AGUARDANDO_CONDICAO) || 285584, priority: 5 },
-  elaboracao_proposta: { id: Number(process.env.MOSKIT_STAGE_ELABORACAO_PROPOSTA) || 267035, priority: 9 },
-  negociacao: { id: Number(process.env.MOSKIT_STAGE_NEGOCIACAO) || 182159, priority: 12 },
-  elaboracao_contrato: { id: Number(process.env.MOSKIT_STAGE_ELABORACAO_CONTRATO) || 179385, priority: 13 },
-  contrato_enviado: { id: Number(process.env.MOSKIT_STAGE_CONTRATO_ENVIADO) || 179386, priority: 17 },
+  aguardando_condicao: { id: Number(process.env.MOSKIT_STAGE_AGUARDANDO_CONDICAO) || MOSKIT_IDS.STAGE.aguardando_condicao, priority: 5 },
+  elaboracao_proposta: { id: Number(process.env.MOSKIT_STAGE_ELABORACAO_PROPOSTA) || MOSKIT_IDS.STAGE.elaboracao_proposta, priority: 9 },
+  negociacao: { id: Number(process.env.MOSKIT_STAGE_NEGOCIACAO) || MOSKIT_IDS.STAGE.negociacao, priority: 12 },
+  elaboracao_contrato: { id: Number(process.env.MOSKIT_STAGE_ELABORACAO_CONTRATO) || MOSKIT_IDS.STAGE.elaboracao_contrato, priority: 13 },
+  contrato_enviado: { id: Number(process.env.MOSKIT_STAGE_CONTRATO_ENVIADO) || MOSKIT_IDS.STAGE.contrato_enviado, priority: 17 },
 };
 
 const ZERNIO_API_KEY = process.env.ZERNIO_API_KEY;
@@ -916,10 +919,25 @@ function camposPendentes(dados) {
 // Zera para null, nunca para um valor de fachada: mergeDados so sobrescreve com valor nao-nulo, entao
 // uma area boa de um ciclo anterior sobrevive a uma rodada em que a evidencia nao aparecer.
 // Muta `dados` (mesmo contrato das outras sanitizacoes do pipeline) e devolve o veredito.
+//
+// `_casoDescritoValidado`: marcador interno (nunca vai pro Moskit — montarPayloadMoskit so le campos
+// nomeados) que persiste em last_data uma vez que o gate passou com evidencia real. Sem ele, chamar
+// esta funcao de novo sobre o objeto MESCLADO (mesclarParaCrm), usando so a evidencia DESTA rodada,
+// apagava de volta uma area/advogado legitimos herdados de uma rodada anterior toda vez que a
+// conversa seguinte nao reemitisse cliente_descreveu_caso/equipe_descreveu_caso (ex: uma rodada so
+// sobre reagendamento) — revertendo ate o NOME do deal em atualizarNegocioMoskit, a mesma classe de
+// corrupcao (deal 48423360) que este gate existe pra evitar. O marcador so nasce quando a evidencia
+// realmente apareceu; um palpite antigo gravado em last_data ANTES de o gate existir nunca o carrega
+// e continua sendo limpo normalmente (ver teste "mesclarParaCrm: o palpite antigo nao volta").
 function aplicarGateCasoDescrito(dados, obsValidas) {
-  const casoDescrito = !!(ultimaObservacao(obsValidas, 'cliente_descreveu_caso')
+  const casoDescritoAgora = !!(ultimaObservacao(obsValidas, 'cliente_descreveu_caso')
     || ultimaObservacao(obsValidas, 'equipe_descreveu_caso'));
-  if (casoDescrito || !dados) return { casoDescrito };
+  const casoDescrito = casoDescritoAgora || dados?._casoDescritoValidado === true;
+  if (casoDescrito) {
+    if (dados) dados._casoDescritoValidado = true;
+    return { casoDescrito };
+  }
+  if (!dados) return { casoDescrito };
 
   if (dados.area_direito || dados.advogado_responsavel) {
     console.log(`  🚫 area/advogado descartados — ninguem descreveu o caso nesta conversa (area="${dados.area_direito}", advogado="${dados.advogado_responsavel}")`);
@@ -1348,8 +1366,13 @@ async function garantirDealExiste(dealId, dados, contactId, opcoes = {}) {
     });
     if (checkRes.status !== 404) return dealId;
     console.log(`  ⚠️ Deal ${dealId} nao existe mais no Moskit — criando novo`);
-  } catch {
-    console.log(`  ⚠️ Erro ao verificar deal ${dealId} — criando novo`);
+  } catch (e) {
+    // Timeout, erro de rede ou 5xx (validateStatus so aceita <500, entao qualquer coisa alem disso cai
+    // aqui) NAO significa que o deal sumiu — so que nao deu pra confirmar. Tratar como 404 criava um
+    // deal DUPLICADO no CRM na primeira instabilidade do Moskit, porque criarNegocioMoskit faz um POST
+    // incondicional sem checar se o cliente ja tem negocio. Relanca para o chamador (processarConversaDirect)
+    // cair na fila de retry (src/fila.js) em vez de seguir como se a ausencia tivesse sido confirmada.
+    throw new Error(`Nao foi possivel confirmar se o deal ${dealId} ainda existe no Moskit (erro transitorio, nao 404 confirmado): ${e.message}`);
   }
   const deal = await criarNegocioMoskit(dados, contactId, opcoes);
   return deal.id;
@@ -3073,6 +3096,9 @@ async function processarConversaDirect(chatId) {
       if (o._horarioImplausivel) {
         console.log(`  🚫 horario_iso descartado na msg ${o.msg_idx} — ${o._horarioImplausivel.motivo}`);
       }
+      if (o._propagacaoRecusada) {
+        console.log(`  🚫 propagacao de dia recusada na msg ${o.msg_idx} — ${o._propagacaoRecusada.motivo}`);
+      }
     }
 
     // A mesma rede deterministica das observacoes, agora no campo solto do modelo.
@@ -3093,9 +3119,14 @@ async function processarConversaDirect(chatId) {
     const apuracao = apurarDuplaConfirmacao(obsValidas);
     // Viaja junto com a apuracao pra chegar em registrarAgendamentoPendente: e a diferenca entre
     // "ninguem confirmou ainda" e "alguem confirmou mas o horario extraido nao servia".
+    // _horarioImplausivel e _propagacaoRecusada tem o mesmo formato ({valor, motivo}) e o mesmo papel
+    // aqui: um horario que a rede deterministica recusou como perna de confirmacao. Sem incluir a
+    // segunda, uma consulta bloqueada pela regra "propagacao nao anda pra tras" (o incidente do deal
+    // 47543238) aparecia so como "faltou confirmacao" — indistinguivel de uma conversa comum ainda
+    // incompleta — em vez de "o codigo recusou de proposito por seguranca", que e o que de fato houve.
     apuracao.horariosDescartados = obsValidas
-      .filter((o) => o._horarioImplausivel)
-      .map((o) => ({ msg_idx: o.msg_idx, ...o._horarioImplausivel }));
+      .filter((o) => o._horarioImplausivel || o._propagacaoRecusada)
+      .map((o) => ({ msg_idx: o.msg_idx, ...(o._horarioImplausivel || o._propagacaoRecusada) }));
     console.log(`  🔐 Dupla confirmacao: ${apuracao.confirmado
       ? `OK para ${apuracao.horarioIso} (cliente msg ${apuracao.cliente.msg_idx}, equipe msg ${apuracao.equipe.msg_idx})`
       : `NAO — ${descreverPendencia(apuracao)}`}`);
@@ -3116,7 +3147,7 @@ async function processarConversaDirect(chatId) {
         data_hora_consulta: dados.data_hora_consulta || null,
         observacoesHorario: obsValidas
           .filter((o) => /_horario$/.test(o.tipo))
-          .map((o) => ({ tipo: o.tipo, msg_idx: o.msg_idx, horario_iso: o.horario_iso, trecho: o.trecho, ...(o._dataCorrigida ? { _dataCorrigida: o._dataCorrigida } : {}), ...(o._horarioImplausivel ? { _horarioImplausivel: o._horarioImplausivel } : {}) })),
+          .map((o) => ({ tipo: o.tipo, msg_idx: o.msg_idx, horario_iso: o.horario_iso, trecho: o.trecho, ...(o._dataCorrigida ? { _dataCorrigida: o._dataCorrigida } : {}), ...(o._horarioImplausivel ? { _horarioImplausivel: o._horarioImplausivel } : {}), ...(o._propagacaoRecusada ? { _propagacaoRecusada: o._propagacaoRecusada } : {}) })),
         observacoesRejeitadas: obsRejeitadas.map((r) => ({ motivo: r.motivo, tipo: r.obs?.tipo, msg_idx: r.obs?.msg_idx, horario_iso: r.obs?.horario_iso })),
       }), chatId);
     } catch (e) {
@@ -3235,15 +3266,24 @@ async function processarConversaDirect(chatId) {
         row.briefing_added = 0;
       }
 
+      await finalizarCiclo({ dealId, dados, dadosMesclados, chatId, row, apuracao, acao, obsValidas,
+        resumo: `Processamento de ${chatId} concluido` });
+
+      // So DEPOIS de finalizarCiclo (que chama handleAgendamentoCalendar): postar o Briefing com
+      // apuracao.horarioIso otimisticamente, ANTES de saber se o Google/Moskit confirmaram o
+      // agendamento de verdade, deixava a nota dizendo um horario que podia nunca ter sido marcado —
+      // se handleAgendamentoCalendar falhasse (rede/OAuth/quota do Google), so uma nota de erro
+      // SEPARADA era postada, sem corrigir o Briefing ja publicado. evento_calendar_data so e gravado
+      // no banco QUANDO o agendamento realmente aconteceu (ver criarEventoGoogleCalendar/
+      // atualizarEventoSeRemarcado), entao reler daqui garante que o Briefing so cite um horario de
+      // fato confirmado.
+      const rowPosAgendamento = db.prepare('SELECT evento_calendar_data FROM conversations WHERE chat_id = ?').get(chatId);
       await registrarBriefing(dealId, chatId, {
         dados: dadosMesclados,
         contato: row.contact_name,
         telefone: chatId,
-        horarioConsulta: formatarHorarioEscritorio(apuracao?.horarioIso || row.evento_calendar_data),
+        horarioConsulta: formatarHorarioEscritorio(rowPosAgendamento?.evento_calendar_data),
       });
-
-      await finalizarCiclo({ dealId, dados, dadosMesclados, chatId, row, apuracao, acao, obsValidas,
-        resumo: `Processamento de ${chatId} concluido` });
       return;
     }
 
@@ -3267,19 +3307,24 @@ async function processarConversaDirect(chatId) {
 
       if (!dados.resumo_atendimento) {
         console.log(`  ⏭️ acao "nota" sem resumo — ignorando`);
-      } else {
-        await registrarBriefing(dealId, chatId, {
-          dados: mesclarParaCrm(dadosAnteriores, dados, obsValidas),
-          contato: row.contact_name,
-          telefone: chatId,
-          horarioConsulta: formatarHorarioEscritorio(apuracao?.horarioIso || row.evento_calendar_data),
-        });
       }
 
       await finalizarCiclo({
         dealId, dados, dadosMesclados: mesclarParaCrm(dadosAnteriores, dados, obsValidas),
         chatId, row, apuracao, acao, obsValidas, resumo: `Nota adicionada para ${chatId}`,
       });
+
+      if (dados.resumo_atendimento) {
+        // Ver comentario equivalente no ramo "criar" — briefing so depois de finalizarCiclo, com o
+        // horario RECEM-CONFIRMADO no banco, nunca com apuracao.horarioIso otimista.
+        const rowPosAgendamento = db.prepare('SELECT evento_calendar_data FROM conversations WHERE chat_id = ?').get(chatId);
+        await registrarBriefing(dealId, chatId, {
+          dados: mesclarParaCrm(dadosAnteriores, dados, obsValidas),
+          contato: row.contact_name,
+          telefone: chatId,
+          horarioConsulta: formatarHorarioEscritorio(rowPosAgendamento?.evento_calendar_data),
+        });
+      }
       return;
     }
 
@@ -3309,7 +3354,12 @@ async function processarConversaDirect(chatId) {
       const dealVerificado = await garantirDealExiste(dealId, dadosMesclados, contactId, opcoesPayload);
       if (dealVerificado !== dealId) {
         dealId = dealVerificado;
-        db.prepare('UPDATE conversations SET briefing_added = 0, briefing_hash = NULL, campos_nota_hash = NULL, custom_fields_bot = NULL, campos_travados = NULL WHERE chat_id = ?').run(chatId);
+        // deal_id tem que ser gravado AQUI, nao so em stmtFinalizarCiclo no fim do ciclo: os branches
+        // "criar"/"nota" ja fazem isso, mas este ficava sem — se qualquer chamada seguinte (nota de
+        // campos, briefing, pagamento, agendamento) lancasse antes do fim do ciclo, a linha ficava com
+        // o deal_id ANTIGO (inexistente) e o proximo ciclo recriava outro deal de novo.
+        db.prepare('UPDATE conversations SET deal_id = ?, briefing_added = 0, briefing_hash = NULL, campos_nota_hash = NULL, custom_fields_bot = NULL, campos_travados = NULL WHERE chat_id = ?').run(dealId, chatId);
+        row.deal_id = dealId;
         row.briefing_added = 0;
         console.log(`  ✅ Deal recriado como ${dealId} (o anterior nao existia mais no Moskit)`);
       } else {
@@ -3339,16 +3389,22 @@ async function processarConversaDirect(chatId) {
 
       if (pendentes.length === 0) {
         console.log('  🎯 Todos os campos obrigatorios preenchidos!');
-        await registrarBriefing(dealId, chatId, {
-          dados: dadosMesclados,
-          contato: row.contact_name,
-          telefone: chatId,
-          horarioConsulta: formatarHorarioEscritorio(apuracao?.horarioIso || row.evento_calendar_data),
-        });
       }
 
       await finalizarCiclo({ dealId, dados, dadosMesclados, chatId, row, apuracao, acao, obsValidas,
         resumo: `Deal ${dealId} atualizado com campos pendentes` });
+
+      if (pendentes.length === 0) {
+        // Ver comentario equivalente no ramo "criar" — briefing so depois de finalizarCiclo, com o
+        // horario RECEM-CONFIRMADO no banco, nunca com apuracao.horarioIso otimista.
+        const rowPosAgendamento = db.prepare('SELECT evento_calendar_data FROM conversations WHERE chat_id = ?').get(chatId);
+        await registrarBriefing(dealId, chatId, {
+          dados: dadosMesclados,
+          contato: row.contact_name,
+          telefone: chatId,
+          horarioConsulta: formatarHorarioEscritorio(rowPosAgendamento?.evento_calendar_data),
+        });
+      }
       return;
     }
 
@@ -4092,6 +4148,15 @@ let sincronizacaoAtividadesEmAndamento = false;
 // Sincroniza Atividades do Moskit (marcadas manualmente ou por qualquer integracao, incluindo
 // o Moskit Boost) com o Google Calendar — cobre consultas que nunca passaram pela conversa
 // que o bot analisa (ex: deals vindos do Boost, ou atividade criada direto no Moskit).
+// Pausa entre atividades da varredura. Sem ela, cada atividade nova podia disparar ate 6 chamadas
+// HTTP de volta em volta (checar evento nativo no Google, ate 2 GETs de autorizacao no Moskit,
+// criar/patch do evento no Google, POST de nota no Moskit, Telegram) sem nenhum delay — o mesmo
+// padrao de rajada que ja causou o incidente de 429/timeout medido em reconciliarVinculoAtividades
+// (ver RECONCILIACAO_PAUSA_MS/VINCULO_PAUSA_MS, mais abaixo), so que esta rotina nunca ganhou a
+// mesma defesa. Um backlog de N atividades (pos-indisponibilidade, importacao em massa via Moskit
+// Boost) e o cenario que dispara isso.
+const SYNC_ATIVIDADES_PAUSA_MS = Number(process.env.SYNC_ATIVIDADES_PAUSA_MS) || 300;
+
 async function sincronizarAtividadesMoskit() {
   const relatorio = { atividades_verificadas: 0, eventos_criados: 0, ja_sincronizadas: 0, aguardando_pagamento: 0, liberadas_consulta_gratis: 0, ignoradas: 0, erros: 0 };
 
@@ -4116,6 +4181,7 @@ async function sincronizarAtividadesMoskit() {
     if (truncou) console.log(`  ⚠️ teto de ${MAX_PAGINAS_ATIVIDADES} paginas atingido — atividades mais antigas que essas nao foram verificadas neste ciclo`);
 
     const agora = Date.now();
+    let primeira = true;
 
     for (const atv of atividades) {
       try {
@@ -4127,6 +4193,12 @@ async function sincronizarAtividadesMoskit() {
           relatorio.ja_sincronizadas++;
           continue;
         }
+
+        // So pausa quando a atividade realmente vai gerar chamada de rede — os filtros acima (tipo,
+        // estado, ja sincronizada) sao locais e nao tocam Google/Moskit, pausar antes deles
+        // desperdicaria tempo em atividades que nem chegam a fazer request nenhum.
+        if (!primeira) await new Promise((r) => setTimeout(r, SYNC_ATIVIDADES_PAUSA_MS));
+        primeira = false;
 
         const dealId = atv.deals?.[0]?.id || null;
         const calendar = google.calendar({ version: 'v3', auth: getGoogleAuthClient() });
@@ -4519,9 +4591,13 @@ async function importarContatosMoskit() {
       for (const c of contatos) {
         const phones = c.phones || [];
         for (const p of phones) {
-          let num = String(p.number || '').replace(/\D/g, '');
-          if (num.length >= 10) {
-            if (num.length > 13) num = num.slice(-13);
+          // chaveConversa (src/telefone.js) e a MESMA regra que buscarOuCriarContato usa pra ler este
+          // espelho depois. Antes este loop tinha seu proprio minimo (>=10 digitos), diferente do
+          // resto do sistema (MIN_DIGITOS=8) — um contato de 8-9 digitos (fixo sem DDD) nunca entrava
+          // no espelho, e toda busca por ele caia no fallback lento da API, justo o caso que o espelho
+          // existe para evitar (contato duplicado).
+          const num = chaveConversa(p.number);
+          if (num) {
             stmtMoskitUpsert.run(num, c.id, c.name || '', JSON.stringify(c));
             importados++;
           }
@@ -6339,6 +6415,8 @@ module.exports = {
   buscarOuCriarContato,
   aplicarViradaCobranca,
   atualizarNegocioMoskit,
+  garantirDealExiste,
+  importarContatosMoskit,
   // Gate do caso descrito e autoria de campos: funcoes puras (ou so-banco) exercitadas direto em
   // test-pipeline.js, porque processarConversaDirect depende da OpenAI e nao roda nos testes.
   aplicarGateCasoDescrito,

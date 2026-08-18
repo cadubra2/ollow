@@ -82,6 +82,33 @@ function conferirTrecho(trecho, textoMensagem) {
   return presentes / palavras.length >= 0.8 ? 'palavras' : null;
 }
 
+// Palavra de negacao perto do trecho citado invalida um ACEITE/CONFIRMACAO mesmo que o trecho apareca
+// literalmente na mensagem. Caso real: "Não, sexta às 14h não vai dar, pode ser segunda?" contem
+// literalmente "sexta às 14h" — conferirTrecho aprovava isso como 'literal' mesmo a frase inteira
+// sendo uma recusa, e nada em aceiteEvasivo (src/agendamento.js, que so cobre hesitacao: "vou ver",
+// "talvez") pegava esse caso. Sem rede deterministica, a unica defesa era o prompt da IA acertar.
+const RE_NEGACAO = /\b(nao|nunca|jamais|nem)\b/;
+
+// So os tipos que FECHAM uma perna da dupla confirmacao precisam dessa checagem: negar uma PROPOSTA
+// de horario ainda prova que a proposta foi feita (o fato citado aconteceu), so negar um ACEITE ou
+// uma CONFIRMACAO muda o fato em si.
+const TIPOS_SENSIVEIS_A_NEGACAO = new Set(['cliente_aceitou_horario', 'equipe_confirmou_horario']);
+
+// Verifica se ha negacao a ate 6 palavras de distancia do trecho dentro da mensagem (antes ou depois
+// — "nao vai dar" tanto aparece antes quanto depois do horario citado). Se a propria citacao ja
+// contem a negacao, o modelo classificou certo e nao ha nada a rejeitar aqui.
+const JANELA_PALAVRAS_NEGACAO = 6;
+function trechoDentroDeNegacao(trecho, textoMensagem) {
+  const t = normalizar(trecho);
+  const m = normalizar(textoMensagem);
+  if (!t || RE_NEGACAO.test(t)) return false;
+  const idx = m.indexOf(t);
+  if (idx === -1) return false; // so o modo 'literal' tem posicao pra abrir uma janela de contexto
+  const antes = m.slice(0, idx).split(' ').filter(Boolean).slice(-JANELA_PALAVRAS_NEGACAO).join(' ');
+  const depois = m.slice(idx + t.length).split(' ').filter(Boolean).slice(0, JANELA_PALAVRAS_NEGACAO).join(' ');
+  return RE_NEGACAO.test(antes) || RE_NEGACAO.test(depois);
+}
+
 function horarioValido(iso) {
   if (!iso) return false;
   const d = new Date(iso);
@@ -390,6 +417,13 @@ function validarObservacoes(observacoes, mensagens) {
       continue;
     }
 
+    // Aceite/confirmacao citando um trecho que esta dentro de uma negacao ("nao, sexta as 14h nao vai
+    // dar") nao pode fechar uma perna da dupla confirmacao — ver trechoDentroDeNegacao acima.
+    if (TIPOS_SENSIVEIS_A_NEGACAO.has(tipo) && trechoDentroDeNegacao(obs.trecho, mensagem.text)) {
+      rejeitadas.push({ obs, motivo: `trecho citado na msg ${idx} esta dentro de uma negacao — nao serve como aceite/confirmacao de horario` });
+      continue;
+    }
+
     // horario_iso ausente NAO invalida a observacao. Faltar horario e incompletude, nao invencao —
     // e o modelo costuma omitir justamente no "pode ser", em que o horario vem da mensagem anterior.
     // Fica null e quem apura resolve por heranca (ver src/agendamento.js). Descartar aqui perderia a
@@ -484,6 +518,7 @@ module.exports = {
   TIPOS_OBSERVACAO,
   normalizar,
   conferirTrecho,
+  trechoDentroDeNegacao,
   corrigirDataRelativa,
   validarObservacoes,
   ultimaObservacao,

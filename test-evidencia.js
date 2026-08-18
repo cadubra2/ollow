@@ -135,6 +135,61 @@ checar('conferirTrecho tolera pontuacao diferente', conferirTrecho('marquei, sua
 checar('conferirTrecho reprova citacao sem relacao', conferirTrecho('vou cancelar tudo agora mesmo', conversa[3].text) === null);
 
 // ------------------------------------------------------------
+console.log('\n=== Negacao perto do trecho invalida aceite/confirmacao ===');
+// O trecho pode aparecer LITERALMENTE na mensagem e ainda assim estar dentro de uma recusa —
+// conferirTrecho sozinho aprovava isso como 'literal'. Sem essa checagem, "Nao, sexta as 14h nao vai
+// dar, pode ser segunda?" fechava uma perna da dupla confirmacao no horario recusado.
+{
+  const negando = [
+    { role: 'cliente', text: 'oi' },
+    { role: 'equipe', text: 'Pode ser sexta as 14h?' },
+    { role: 'cliente', text: 'Nao, sexta as 14h nao vai dar, pode ser segunda?' },
+  ];
+  const { validas, rejeitadas } = validarObservacoes([
+    { tipo: 'cliente_aceitou_horario', msg_idx: 2, trecho: 'sexta as 14h', horario_iso: '2026-08-07T14:00:00' },
+  ], negando);
+  checar('aceite dentro de negacao e rejeitado', validas.length === 0 && /negacao/.test(rejeitadas[0]?.motivo || ''), { validas, rejeitadas });
+}
+{
+  const negando = [
+    { role: 'cliente', text: 'oi' },
+    { role: 'cliente', text: 'pode ser sexta as 14h' },
+    { role: 'equipe', text: 'Sexta as 14h nao da, o Dr. Berto ja tem compromisso' },
+  ];
+  const { validas, rejeitadas } = validarObservacoes([
+    { tipo: 'equipe_confirmou_horario', msg_idx: 2, trecho: 'Sexta as 14h', horario_iso: '2026-08-07T14:00:00' },
+  ], negando);
+  checar('confirmacao da equipe dentro de negacao e rejeitada (negacao DEPOIS do trecho)', validas.length === 0, { validas, rejeitadas });
+}
+{
+  // Nao pode virar falso positivo: aceite genuino, sem negacao nenhuma por perto, continua valendo.
+  const { validas, rejeitadas } = validarObservacoes([
+    { tipo: 'cliente_aceitou_horario', msg_idx: 2, trecho: 'pode ser sim, quarta as 17:30 esta otimo', horario_iso: '2026-08-05T17:30:00' },
+  ], conversa);
+  checar('aceite genuino (sem negacao por perto) continua valido', validas.length === 1 && rejeitadas.length === 0, { validas, rejeitadas });
+}
+{
+  // Proposta negada NAO precisa ser rejeitada pela negacao: o fato "a equipe propos" aconteceu de
+  // verdade, so nao vale como ACEITE/CONFIRMACAO — por isso so cliente_aceitou_horario/
+  // equipe_confirmou_horario entram em TIPOS_SENSIVEIS_A_NEGACAO, nao equipe_propos_horario.
+  const negando = [
+    { role: 'cliente', text: 'oi' },
+    { role: 'equipe', text: 'Nao pode ser sexta as 14h, o Dr. Berto ja tem compromisso — que tal quinta?' },
+  ];
+  const { validas, rejeitadas } = validarObservacoes([
+    { tipo: 'equipe_propos_horario', msg_idx: 1, trecho: 'sexta as 14h', horario_iso: '2026-08-07T14:00:00' },
+  ], negando);
+  checar('proposta dentro de negacao NAO e alvo desta checagem (so aceite/confirmacao)', validas.length === 1, { validas, rejeitadas });
+}
+{
+  // A propria citacao ja contem a negacao ("nao vai dar sexta as 14h"): o modelo classificou certo
+  // (nao devia ter marcado como aceite), mas a checagem de negacao nao precisa disparar de novo aqui —
+  // quem descarta esse caso e o proprio modelo nao tendo motivo pra citar isso como aceite.
+  checar('trechoDentroDeNegacao nao dispara quando a negacao esta DENTRO do proprio trecho',
+    require('./src/evidencia').trechoDentroDeNegacao('nao vai dar sexta as 14h', 'Nao vai dar sexta as 14h, que pena') === false);
+}
+
+// ------------------------------------------------------------
 console.log('\n=== Correcao de data relativa ("hoje"/"amanha"/"depois de amanha") ===');
 // Caso real: deal 48346871 (Natanael Sousa) — a equipe disse "amanha as 09h" numa mensagem de
 // 06/08/2026 e o modelo resolveu horario_iso pro MESMO dia (06/08) em vez do dia seguinte.

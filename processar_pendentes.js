@@ -232,27 +232,46 @@ ${historico}`;
     const dealId = dealRes.data.id;
     console.log('   Deal criado:', dealId);
 
-    // Nota de briefing
+    // Nota de briefing — MESMO formato (titulo versionado + hash) que registrarBriefing usa em
+    // index.js, para a nota religada manualmente nunca sair com cara diferente da rotina normal.
+    // Antes o titulo era hardcoded ("📋 Briefing pré-reunião", sem versao/data) e briefing_hash nunca
+    // era gravado — o proximo ciclo real caia no ramo de migracao de registrarBriefing (que ADOTA o
+    // hash do resumo atual sem repostar), quebrando a trilha de versoes v1/v2/v3 logo na primeira
+    // nota religada manualmente.
+    const briefingLib = require('./src/briefing');
+    let briefingHash = null;
+    let briefingVersao = null;
     if (dados.resumo_atendimento) {
-      const texto = require('./src/briefing').montarTextoBriefing({
+      const texto = briefingLib.montarTextoBriefing({
         dados,
         contato: contactName,
         telefone: phone || chatId,
         horarioConsulta: null,
       });
       if (texto) {
+        // Deal recem-criado por este script: sempre v1, o mesmo que registrarBriefing produziria pra
+        // um deal novo (atual?.briefing_versao ausente).
+        const dataFormatada = new Intl.DateTimeFormat('pt-BR', {
+          timeZone: process.env.TZ_ESCRITORIO || 'America/Fortaleza',
+          day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+        }).format(new Date());
+        const titulo = `📋 Briefing · v1 · ${dataFormatada}`;
         await axios.post(MOSKIT_BASE + '/deals/' + dealId + '/notes', {
-          description: '📋 Briefing pré-reunião\n\n' + texto + '\n\n' + require('./src/briefing').MARCADOR_BRIEFING,
+          description: titulo + '\n\n' + texto + '\n\n' + briefingLib.MARCADOR_BRIEFING,
           user: { id: LAYLA_USER_ID },
         }, { headers: apiHeaders, validateStatus: s => s < 500 });
-        console.log('   Nota adicionada');
+        briefingHash = briefingLib.hashTextoBriefing(texto);
+        briefingVersao = 1;
+        console.log('   Nota adicionada:', titulo);
       } else {
         console.log('   Sem conteudo de briefing — nota nao adicionada');
       }
     }
 
-    // Atualizar banco
-    db.prepare("UPDATE conversations SET deal_id=?, last_action='criar', processed=1, briefing_added=1, last_data=?, last_processed_at=datetime('now') WHERE chat_id=?").run(dealId, JSON.stringify(dados), chatId);
+    // Atualizar banco — grava briefing_hash/briefing_versao junto com briefing_added, para o proximo
+    // ciclo real de registrarBriefing comparar contra o texto REALMENTE postado aqui, nao adotar um
+    // hash as cegas.
+    db.prepare("UPDATE conversations SET deal_id=?, last_action='criar', processed=1, briefing_added=1, briefing_hash=?, briefing_versao=?, last_data=?, last_processed_at=datetime('now') WHERE chat_id=?").run(dealId, briefingHash, briefingVersao, JSON.stringify(dados), chatId);
     console.log('   ✅ Concluido!');
   } catch (e) {
     console.error('   ERRO ao criar deal:', e.response?.status, e.response?.data ? JSON.stringify(e.response.data).substring(0,200) : e.message);
