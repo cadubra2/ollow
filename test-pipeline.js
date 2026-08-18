@@ -48,7 +48,7 @@ for (const metodo of ['get', 'post', 'put', 'patch', 'delete']) {
 
 // ---------- dublê do Google Calendar ----------
 const { google } = require('googleapis');
-const agenda = { insert: [], patch: [], get: [], delete: [], list: [], respostaInsert: null, respostaGet: null, respostaList: null };
+const agenda = { insert: [], patch: [], get: [], delete: [], list: [], respostaInsert: null, respostaGet: null, respostaList: null, getDeveLancar: false };
 google.calendar = () => ({
   events: {
     insert: async (a) => { agenda.insert.push(a); return { data: agenda.respostaInsert }; },
@@ -58,7 +58,14 @@ google.calendar = () => ({
     patch: async (a) => { agenda.patch.push(a); return { data: {} }; },
     // respostaGet permite ao teste devolver o evento que o proprio bot acabou de criar — e assim que
     // se prova que sincronizarMetadadosEvento NAO fica repatchando um evento que nao mudou.
-    get: async (a) => { agenda.get.push(a); return { data: agenda.respostaGet || { summary: 'antigo', description: 'antigo' } }; },
+    // getDeveLancar simula o 404 que sincronizarAtividadesMoskit espera quando o Moskit AINDA nao
+    // sincronizou uma atividade nativamente com o Google — sem isso o dublê nunca lanca, e o branch
+    // "Moskit ainda nao sincronizou" (calendar.events.insert) ficaria impossivel de exercitar.
+    get: async (a) => {
+      agenda.get.push(a);
+      if (agenda.getDeveLancar) { const e = new Error('Not Found'); e.code = 404; throw e; }
+      return { data: agenda.respostaGet || { summary: 'antigo', description: 'antigo' } };
+    },
     delete: async (a) => { agenda.delete.push(a); return {}; },
   },
 });
@@ -73,6 +80,7 @@ const {
   descreverAncora, somarMinutosNaive, formatarHorarioEscritorio,
   stmtsNotas, registrarFalhaNota, conferirSilencioNotas, processarNotaReuniao,
   garantirDealExiste, importarContatosMoskit,
+  sincronizarAtividadesMoskit, comSufixoDealId, comMarcadorDeal,
 } = require('./index');
 const moskitIds = require('./src/moskit-ids');
 const notasReuniao = require('./src/notas-reuniao');
@@ -102,6 +110,7 @@ function limpar() {
   agenda.respostaInsert = { id: 'ev1', htmlLink: 'https://exemplo/ev1' };
   agenda.respostaGet = null;
   agenda.respostaList = null;
+  agenda.getDeveLancar = false;
   // Tabela de dedupe entre as duas agendas — sem limpar, o INSERT OR IGNORE do teste anterior faria
   // o proximo enxergar uma linha velha e passar por engano.
   db.prepare('DELETE FROM atividades_sincronizadas').run();
@@ -718,6 +727,94 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     rede.get = () => ({ status: 500, data: null, headers: {} });
     const r = await listarAtividadesMoskit();
     igual('erro na primeira pagina → devolve lista vazia, nao lanca', r.atividades.length, 0);
+  }
+
+  // ============================================================
+  // Helpers puros: sufixo/marcador de deal aplicados a um titulo/descricao que JA EXISTE (o que a
+  // equipe digitou na Atividade do Moskit), e nao gerados do zero como montarResumoEvento faz.
+  console.log('\n=== comSufixoDealId / comMarcadorDeal (idempotentes) ===');
+  {
+    igual('acrescenta o sufixo quando falta', comSufixoDealId('Consulta on-line- Fulano e Ciclano', 70), 'Consulta on-line- Fulano e Ciclano · #70');
+    igual('nao duplica se ja tiver o sufixo', comSufixoDealId('Consulta on-line- Fulano e Ciclano · #70', 70), 'Consulta on-line- Fulano e Ciclano · #70');
+    igual('sem dealId, titulo fica intacto', comSufixoDealId('Consulta on-line- Fulano e Ciclano', null), 'Consulta on-line- Fulano e Ciclano');
+    igual('titulo vazio vira o placeholder padrao', comSufixoDealId(null, 70), 'Consulta agendada · #70');
+  }
+  {
+    igual('acrescenta o marcador quando falta', comMarcadorDeal('nota da equipe', 70), 'nota da equipe\n\n[deal:70]');
+    igual('nao duplica se ja tiver algum [deal:]', comMarcadorDeal('nota da equipe\n\n[deal:70]', 70), 'nota da equipe\n\n[deal:70]');
+    igual('sem dealId, descricao fica intacta', comMarcadorDeal('nota da equipe', null), 'nota da equipe');
+    igual('descricao vazia vira so o marcador', comMarcadorDeal('', 70), '[deal:70]');
+  }
+
+  // ============================================================
+  // O mesmo sufixo/marcador que o fluxo completo do bot ja grava (montarResumoEvento/
+  // montarDescricaoEvento) precisa chegar tambem em reunioes cuja Atividade nasceu DIRETO no Moskit
+  // (equipe digitando na mao, ou Moskit Boost) — sem isso a rotina de notas de reuniao dependia so
+  // dos metodos mais fracos da cascata (telefone/atividade/e-mail) pra essas reunioes, nunca do
+  // metodo 1 (titulo com #dealId, "alta confianca").
+  console.log('\n=== sincronizarAtividadesMoskit: #dealId/[deal:...] tambem para atividade criada direto no Moskit ===');
+  const FUTURO = new Date(Date.now() + 3 * 24 * 3600 * 1000).toISOString();
+  const semearComprovante = (dealId) => db.prepare('INSERT INTO comprovantes (chat_id, phone, deal_id, match) VALUES (?, ?, ?, 1)').run(`teste-atv-${dealId}`, `teste-atv-${dealId}`, dealId);
+  const atv = (id, dealId, extra = {}) => ({
+    id, type: { id: moskitIds.ATIVIDADE_TIPO.videoconferencia }, dueDate: FUTURO, duration: 60,
+    deals: dealId ? [{ id: dealId }] : [], title: 'Consulta on-line- Fulano e Ciclano', notes: 'nota da equipe',
+    ...extra,
+  });
+  {
+    // Branch "evento nativo", Meet JA existe: unica janela em que da pra enriquecer, porque depois
+    // stmtAtividadeMarcarSincronizada tira a atividade da varredura pra sempre.
+    limpar();
+    rede.get = () => ({ status: 200, data: [atv(500170, 70)], headers: {} });
+    agenda.respostaGet = { summary: 'Consulta on-line- Fulano e Ciclano', description: 'nota antiga', hangoutLink: 'https://meet.google.com/abc' };
+    await sincronizarAtividadesMoskit();
+    igual('evento nativo com Meet: um patch de titulo/descricao', agenda.patch.length, 1);
+    igual('   titulo ganha o sufixo #dealId', agenda.patch[0]?.requestBody?.summary, 'Consulta on-line- Fulano e Ciclano · #70');
+    igual('   descricao ganha o marcador [deal:...]', agenda.patch[0]?.requestBody?.description, 'nota antiga\n\n[deal:70]');
+    checar('   patch NAO mexe em conferenceData (Meet ja existia)', agenda.patch[0]?.requestBody?.conferenceData === undefined, agenda.patch[0]);
+  }
+  {
+    // Mesmo branch, mas sem dealId vinculado — nao pode inventar numero nem gerar patch a toa.
+    limpar();
+    rede.get = () => ({ status: 200, data: [atv(500171, null)], headers: {} });
+    agenda.respostaGet = { summary: 'Consulta on-line- Fulano e Ciclano', description: 'nota antiga', hangoutLink: 'https://meet.google.com/abc' };
+    await sincronizarAtividadesMoskit();
+    igual('evento nativo com Meet, SEM deal vinculado: nenhum patch', agenda.patch.length, 0);
+  }
+  {
+    // Branch "evento nativo", Meet AINDA nao existe: o numero entra no MESMO patch que cria o Meet.
+    limpar();
+    semearComprovante(71);
+    rede.get = () => ({ status: 200, data: [atv(500172, 71)], headers: {} });
+    agenda.respostaGet = { summary: 'Consulta presencial- Maria e Joao', description: '', hangoutLink: null, conferenceData: null };
+    await sincronizarAtividadesMoskit();
+    db.prepare('DELETE FROM comprovantes WHERE deal_id = 71').run();
+    igual('evento nativo sem Meet: um patch so (cria o Meet e ja enriquece)', agenda.patch.length, 1);
+    igual('   titulo ganha o sufixo #dealId', agenda.patch[0]?.requestBody?.summary, 'Consulta presencial- Maria e Joao · #71');
+    igual('   descricao ganha o marcador [deal:...]', agenda.patch[0]?.requestBody?.description, '[deal:71]');
+    checar('   conferenceData continua criando o Meet', !!agenda.patch[0]?.requestBody?.conferenceData?.createRequest);
+  }
+  {
+    // Branch "Moskit ainda nao sincronizou": o bot cria o evento do zero (calendar.events.insert).
+    limpar();
+    semearComprovante(72);
+    agenda.getDeveLancar = true; // simula 404: nao existe evento nativo "oll<id>"
+    rede.get = () => ({ status: 200, data: [atv(500173, 72)], headers: {} });
+    await sincronizarAtividadesMoskit();
+    db.prepare('DELETE FROM comprovantes WHERE deal_id = 72').run();
+    igual('atividade nao sincronizada: um evento criado', agenda.insert.length, 1);
+    igual('   titulo ganha o sufixo #dealId', agenda.insert[0]?.requestBody?.summary, 'Consulta on-line- Fulano e Ciclano · #72');
+    checar('   descricao contem o marcador [deal:...]', (agenda.insert[0]?.requestBody?.description || '').includes('[deal:72]'), agenda.insert[0]?.requestBody?.description);
+    checar('   e ainda tem o link pro negocio (nao foi substituido, so acrescido)', (agenda.insert[0]?.requestBody?.description || '').includes('/deal/72'));
+  }
+  {
+    // Mesmo branch, mas sem dealId: autorizacaoParaAgendar nem chega a liberar (motivo "sem_deal"),
+    // entao nenhum evento e criado — comportamento inalterado, so confirma que o dealId nulo nao
+    // quebra nada antes de chegar em comSufixoDealId/comMarcadorDeal.
+    limpar();
+    agenda.getDeveLancar = true;
+    rede.get = () => ({ status: 200, data: [atv(500174, null)], headers: {} });
+    await sincronizarAtividadesMoskit();
+    igual('sem deal vinculado: nenhum evento criado (aguardando_pagamento)', agenda.insert.length, 0);
   }
 
   // ============================================================
