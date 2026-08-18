@@ -21,6 +21,7 @@ const TESTES = [
   'test-moskit-ids.js',
   'test-atividade-moskit.js',
   'test-evidencia.js',
+  'test-briefing.js',
   'test-fila.js',
   'test-payload.js',
   'test-rotas.js',
@@ -30,6 +31,7 @@ const TESTES = [
   'test-agendamento-bloco-mensagens.js',
   'test-transcricao.js',
   'test-zapsign.js',
+  'test-notas-reuniao.js',
 ];
 
 const TZ_TESTES = process.env.TZ_TESTES || 'UTC';

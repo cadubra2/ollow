@@ -27,7 +27,7 @@ node test-telefone.js    # roda um arquivo de teste isolado (mesmo padrão para 
 `test-telefone.js`, `test-moskit-ids.js`, `test-atividade-moskit.js`, `test-evidencia.js`,
 `test-fila.js`, `test-payload.js`, `test-rotas.js`, `test-pipeline.js`, `test-agenda-dry-run.js`,
 `test-guards-internos.js`, `test-agendamento-bloco-mensagens.js`, `test-transcricao.js`,
-`test-zapsign.js`. Todos usam `DB_PATH` apontando para um arquivo inexistente (banco descartável) —
+`test-zapsign.js`, `test-notas-reuniao.js`. Todos usam `DB_PATH` apontando para um arquivo inexistente (banco descartável) —
 **nunca** deixe um teste abrir `conversations.db` de produção.
 
 **A suíte roda com `TZ=UTC`, o fuso da VPS** — é isso que o `rodar-testes.js` existe para garantir.
@@ -76,6 +76,21 @@ Escrevem em dados reais de produção (Moskit e/ou banco real):
   revelou os dois defeitos descritos em "O eco da data-âncora" e "Propagação de dia corrigido".
 - `test-cenarios-classificacao.js` e `test-simulacao.js` — chamam a OpenAI de verdade mas não têm
   asserção automática de pass/fail; servem para inspeção manual, não regressão.
+- `sondar-notas.js [dealId]` — mede, contra as APIs reais, os contratos que a rotina de notas de
+  reunião assume: se `GET /deals/{id}/notes` devolve o texto (e como pagina), se `events.list` traz
+  `attachments[]` pela credencial do bot, e qual a cobertura real do passo "Telefone:" da cascata.
+  **Só leitura**, mas lê Moskit e Google de produção, então fica fora do `npm test`.
+- `reprocessar-nota-reuniao.js <gmailMessageId> <dealId> [--aplicar]` — religa à mão uma nota de
+  reunião que ficou órfã (o id vem no aviso do Telegram). Sem `--aplicar` só imprime a nota que
+  iria; com `--aplicar` **escreve no CRM**.
+- `religar-atividade.js <dealId> <atividadeId> [--aplicar]` — religa à mão uma Atividade do Moskit que
+  ficou sem vínculo com o negócio e **limpa o estado terminal** (`vinculo_desistiu`) que a
+  reconciliação deixou depois de desistir. O comando exato vem no aviso final do Telegram. Sem
+  `--aplicar` só imprime o vínculo atual e o PUT que seria enviado; com `--aplicar` **escreve no
+  CRM** (GET + PUT com o corpo do GET inteiro, `deals` corrigido) e zera o estado no banco para a
+  rotina voltar a vigiar.
+- `autorizar-google-notas.js` — OAuth interativo do Gmail/Drive para a rotina de notas (roda uma
+  vez, porta 8092). Grava `google-oauth-token-notas.json`.
 - `corrigir-*.js` — scripts pontuais de correção de dados já aplicados (histórico, não reexecutar).
 
 ### Gerar segredos
@@ -110,6 +125,8 @@ src/
   fila.js                fila de retry em disco para o worker (MAX_TENTATIVAS, depois desiste e avisa Telegram)
   mensagens.js           deduplicação e ordenação cronológica de mensagens do WhatsApp
   moskit-ids.js          TODOS os IDs/campos do Moskit — fonte única, ver abaixo
+  notas-reuniao.js       notas do Gemini → nota no negócio: parse do assunto, cascata que escolhe o
+                         deal, filtro de ancoragem sobre a saída da IA, texto da nota (tudo sem rede)
   telefone.js            normalização de telefone e detecção de números internos (equipe)
   transcricao.js         transcrição de áudios do cliente via OpenAI (contrato: nunca lança)
 docs/pop/                POP oficial do processo de negócio (HTML + PDF) — fonte da verdade
@@ -268,10 +285,23 @@ risco de evento duplicado.
   `criarAtividadeMoskit`), mas quando o negócio tinha acabado de ser criado/escrito quase ao MESMO
   tempo (segundos a poucas horas antes), o Moskit às vezes não persiste esse vínculo — a atividade
   fica só ligada ao contato, some da tela do negócio, e o aviso "nenhuma atividade agendada" aparece
-  mesmo com a consulta marcada. `garantirVinculoAtividadeDeal` (`index.js`) confere logo após criar
+  mesmo com a consulta marcada.   `garantirVinculoAtividadeDeal` (`index.js`) confere logo após criar
   (GET + PUT com `deals` corrigido, mesmo padrão de `atualizarAtividadeMoskit`) e
   `reconciliarVinculoAtividades`/`rodarReconciliacaoVinculoAtividades` rodam na mesma cadência de
   `RECONCILIACAO_INTERVAL_MS` como rede de segurança para o que escapar da conferência imediata.
+  **A reconciliação desiste — e avisa uma única vez.** MEDIDO 14-17/08/2026 em 6 negócios
+  (48287898, 48292471, 48441223, 48447661, 48464876, 48474073): o Moskit responde 429/timeout de 30s
+  quando a varredura bate forte, e a rotina antiga retentava a cada 30 min SEM religar nada, inundando
+  o Telegram com o mesmo aviso (o dedup por string do resumo não segurava porque o subconjunto de
+  falhas mudava a cada rodada). Agora cada linha tem estado próprio em `conversations`
+  (`vinculo_falhas`, `vinculo_backoff_ate`, `vinculo_desistiu`, `vinculo_aviso_hash`): falha entra em
+  cooldown exponencial (o dobro de ciclos a cada tentativa, sem chamar rede durante ele) e é
+  **silenciosa** — 429/timeout não é "conferir na mão", é o Moskit dizendo calma; ao estourar
+  `VINCULO_MAX_TENTATIVAS` (padrão 3) a linha desiste (estado terminal, nunca mais retenta sozinha) e
+  recebe UM aviso final no Telegram com o comando exato. O aviso é deduplicado por
+  `vinculo_aviso_hash` (por linha, não por resumo), e o estado terminal só é desfeito por
+  `religar-atividade.js`. As três reconciliações também são escalonadas no boot (0/5/10 min) para não
+  triplicar o burst de GETs no mesmo instante. Regressões em `test-pipeline.js`.
 - **Remarcação tem que mover a Atividade também, mesmo quando ela acabou de nascer no mesmo ciclo.**
   `handleAgendamentoCalendar` recebe `row` como um snapshot lido ANTES do ciclo. Quando o ramo "evento
   já existia" roda a auto-cura (cria a Atividade que faltava) e, na MESMA rodada, a dupla confirmação
@@ -339,6 +369,175 @@ risco de evento duplicado.
   redeploy (o evento no Google continua sendo criado; o deal recebe uma nota `[dry-run]`). O padrão é
   o **inverso** de `FUNIL_DRY_RUN`: sem a variável, a agenda funciona. Aquelas flags seguram palpite
   de IA sobre funil; esta guarda uma regra determinística, então nasce ligada.
+
+### Briefing pré-consulta: a nota "📋 Briefing · vN · data" no deal
+
+O advogado abre o negócio no CRM minutos antes da consulta. Se a conversa parou no dia anterior, a
+nota que ele lê não pode ser a da hora em que o cliente sumiu. `registrarBriefing` (`index.js`) posta
+uma nota no deal com o estado atual da conversa, e o bot reprocessa de propósito antes do horário.
+
+- **Trilha de notas nativa, não edição in place.** Cada mudança real posta uma nota NOVA com título
+  versionado `📋 Briefing · v{n} · {dd/mm/aaaa hh:mm}` (data no fuso `TZ_ESCRITORIO`). A remarcação
+  conta como mudança real. O histórico do Moskit é o histórico do briefing — não existe "última nota
+  viva".
+- **Texto composto em duas camadas** ([src/briefing.js](src/briefing.js), módulo puro sem rede):
+  o **cabeçalho** é determinístico, montado em código (cliente, telefone, horário da consulta —
+  esvazia o campo se não houver); a **narrativa** é o `resumo_atendimento` que a IA produz. A saída
+  muda de formato sem depender de o modelo "aprender" o novo cabeçalho.
+- **O resumo do prompt ganhou 6 seções** (`Caso` / `Objetivo` / `Urgencia·prazo` / `Ja tentou` /
+  `Pendencias` / `Documentos citados`), com regra de ouro: campo que não apareceu na conversa sai
+  "Nao mencionado.", nunca "—" vazio nem chute.
+- **Hash sobre o texto final** (cabeçalho + narrativa, fora título/versão/data): valor novo,
+  narrativa nova ou mudança de horário repostam; só a data do título passando para a frente não.
+- **Aguardar mudança não basta.** O refresh da conversa depende de mensagem nova, e consulta marcada
+  não gera mensagem. `refrescarBriefingsPertoDaConsulta` roda no intervalo de
+  `RECONCILIACAO_INTERVAL_MS` (escalonado 15 min no boot) e reprocessa as conversas com consulta
+  marcada nas próximas `BRIEFING_REFRESH_ANTECEDENCIA_HORAS` horas (padrão 4) — janela conservadora
+  porque cada reprocessamento custa ~2 chamadas OpenAI. Dedup por linha com coluna
+  `briefing_refresh_para` (o horário para o qual já refrescou): remarcação volta a processar. Teto de
+  `BRIEFING_REFRESH_MAX_POR_CICLO` (padrão 5). `BRIEFING_REFRESH_ATIVO=false` desliga sem redeploy.
+- **Migração.** Linhas com `briefing_added=1` e sem `briefing_hash` adotam o hash sem repostar (a
+  nota já existe); linhas com hash do formato antigo (de 4 linhas) repostam naturalmente no próximo
+  reprocessamento — virada de formato sem script de backfill.
+- **`processar_pendentes.js` reposta no mesmo formato** (mesmo `src/briefing.js`), para a nota
+  religada nunca sair com cara diferente da rotina.
+- Regressões em `test-briefing.js` (módulo puro) e `test-pipeline.js` (call sites, versão, migração,
+  refresh perto da consulta).
+
+### Notas de reunião do Gemini → nota no negócio
+
+O que acontece **dentro** da consulta não voltava para o CRM. `sincronizarNotasReuniao` (`index.js`,
+a cada `NOTAS_SYNC_INTERVAL_MS`, padrão 10 min) lê os e-mails de notas do Gemini, descobre a que
+negócio pertencem, extrai os dados jurídicos com a OpenAI e escreve uma nota no deal. A decisão fica
+em [src/notas-reuniao.js](src/notas-reuniao.js) (puro, sem rede); o `index.js` só busca o que ela pede.
+
+- **O e-mail é o gatilho; o evento da agenda é o enriquecimento.** Assunto real:
+  `Notas: "Consulta — Lia 🇧🇷💛💚 (Berto)" de 14/08/2026`, de `gemini-notes@google.com`. O evento
+  correspondente traz o Doc das notas em `attachments[].fileUrl` (campo estruturado, sem parsear
+  HTML) e o telefone em `description` (`Telefone: 558681876734`), que é a chave de
+  `conversations.chat_id` → `deal_id`. Desde que o número do negócio passou a viajar no título (ver
+  abaixo), o evento deixou de ser indispensável para *identificar* — continua sendo o que traz o Doc.
+  **Não confundir com `meetings-noreply@google.com`**, que manda
+  `Problema com as notas: ...` quando o Gemini FALHA — esse e-mail não tem nota nenhuma dentro e
+  viraria uma nota vazia no negócio do cliente.
+- **O corpo do e-mail já traz o resumo inteiro**; o Doc só acrescenta a transcrição literal, e só
+  existe se alguém a ligou na reunião. Por isso o corpo é obrigatório e o Doc é *best-effort*: falha
+  no `drive.files.export` marca o rodapé e segue, nunca impede a nota.
+- **Candidato único ou órfão, sem exceção.** Duas consultas às 15h com advogados diferentes fariam a
+  nota do caso de um cliente cair no negócio de outro — dentro do CRM isso é vazamento de sigilo, e
+  ninguém detecta lendo, porque a nota parece plausível no negócio errado. Quando um passo devolve
+  DOIS candidatos a cascata **para ali** em vez de tentar o passo seguinte: dois resultados não
+  significam "sinal fraco, tente outro", significam "este sinal aponta para dois negócios reais".
+  O método usado vai **impresso no rodapé da nota** (`Vínculo: evento_telefone (confiança alta)`) —
+  é o que permite descobrir qual regra corrigir quando uma nota aparecer no lugar errado.
+- **O fallback não é caso raro.** MEDIDO em 16/08/2026 (`sondar-notas.js`): dos 6 eventos que geraram
+  notas nos últimos 30 dias, 4 tinham `Telefone:` (criados pelo bot) e 2 não (`"Consulta online -
+  Berto e Aurinete"`, `"Consulta online- Iury e Arthur"`, criados na mão). ~1/3 do volume depende do
+  fallback e parte vai terminar em órfão mesmo — por isso o órfão é desfecho de primeira classe, com
+  Telegram, diagnóstico do que a cascata viu e o comando `reprocessar-nota-reuniao.js` pronto.
+- **Dois marcadores no evento, e o do TÍTULO é o que vale mais.** `montarResumoEvento` põe
+  `· #48292471` no fim do título e `montarDescricaoEvento` põe `[deal:48292471]` na descrição. O do
+  título é o mais valioso porque **o assunto do e-mail do Gemini reproduz o título entre aspas**
+  (`Notas: "Consulta — Lia (Berto) · #48292471" de 14/08/2026`) — ou seja, o número chega dentro do
+  próprio assunto e o bot identifica o negócio **sem precisar achar o evento na agenda**. Isso tira o
+  Google Calendar do caminho crítico: evento apagado, renomeado, movido de calendário ou fora da
+  janela de busca deixa de derrubar a identificação. Também é o único marcador que uma reunião criada
+  na mão tende a ganhar, porque o título é onde as pessoas digitam.
+- **O número é SUFIXO, nunca prefixo.** A rota que adiciona link do Meet reconhece consulta na agenda
+  com `/^Consulta\s*—/.test(ev.summary)` — casamento por **início**. Com o número na frente ela
+  simplesmente pararia de enxergar qualquer consulta, sem erro nenhum. Regressão explícita em
+  `test-pipeline.js`.
+- **`dealId` sempre por parâmetro, nos três call sites.** `sincronizarMetadadosEvento` **compara** o
+  título e a descrição que monta com os que estão no Google para decidir se dá `patch`. Derivar o
+  `dealId` de fontes diferentes na criação e na comparação faria toda rodada ver "mudou" e repatchar o
+  evento para sempre. Ler do banco seria exatamente esse caso: `stmtFinalizarCiclo` só grava
+  `conversations.deal_id` DEPOIS de `handleAgendamentoCalendar`, então na criação de um deal novo o
+  banco ainda traz `null`. O terceiro call site é o título da Atividade do Moskit
+  (`registrarConsultaNaAgendaMoskit`), e não é opcional: `test-pipeline.js` já afirma que ele é igual
+  ao `summary` do evento — é o mesmo compromisso nas duas agendas.
+- **Marcadores explícitos que discordam = órfão, com motivo próprio.** Se o título disser `#48111111`
+  e a descrição `[deal:48222222]`, `decidirDeal` para antes da cascata e devolve
+  `marcadores_divergentes`. Não há desempate honesto: é evento copiado de outro cliente com só um dos
+  dois atualizado, e escolher qualquer um poria a nota do caso de um cliente no negócio de outro. O
+  motivo é separado da ambiguidade comum porque o conserto é diferente — aqui alguém precisa arrumar o
+  **evento**, não a regra, e o aviso do Telegram diz isso com todas as letras.
+- **A extração do `#NNNNN` só olha título e assunto**, nunca o corpo do e-mail nem a transcrição
+  (`RE_DEAL_TITULO`, mínimo de 5 dígitos). Em texto de fala corrida, `#` seguido de número é ruído
+  provável — "o protocolo #99887766" numa transcrição não pode virar vínculo com um negócio.
+- **Nota duplicada é pior que nota atrasada.** A última linha de toda nota é um marcador
+  `[ollow-notas:xxxxxxxx]` derivado da origem. O POST fica entre dois commits (`POSTANDO` → POST →
+  `POSTADA`): se o processo morrer no meio, a retomada **não reposta às cegas** — procura o marcador
+  em `GET /deals/{id}/notes` e só posta se não achar. Não conseguindo conferir, vira `REVISAR_MANUAL`
+  + Telegram. Medido em 16/08/2026: esse GET devolve `description` íntegra (sem truncagem), pagina
+  por `?start=` e **ignora `limit`** (sempre 10 por página) — o deal da Lia já tinha 40 notas, então
+  olhar só a primeira página responderia "não achei" para uma nota existente, que é exatamente o caso
+  em que o código postaria a segunda. Bater no teto de páginas **lança**, nunca devolve "não achei".
+- **`is:unread` não é a fila.** O seletor é a AUSÊNCIA dos rótulos `Notas/Processado`, `Notas/Orfao`
+  e `Notas/Erro`. Se fosse "não lido", alguém abrindo o e-mail no celular faria o bot nunca mais ver
+  aquela reunião — e nada avisaria. Os três rótulos são **criados no início de cada ciclo**, antes de
+  montar a busca: a query é feita de `-label:"Notas/..."`, e um `-label:` de rótulo inexistente não
+  tem comportamento garantido — se não casar nada, o primeiro ciclo volta vazio e a rotina parece
+  funcionar sem fazer nada.
+- **Nada reprocessa para sempre, e nada fica em silêncio.** Duas defesas que faltavam e que o
+  `tentativas` da tabela sozinho não dava:
+  - `registrarFalhaNota` **desiste** após `NOTAS_MAX_TENTATIVAS` (padrão 3, o mesmo de
+    `src/fila.js` e pelo mesmo motivo: cada tentativa custa uma chamada de IA com o texto inteiro).
+    Antes a coluna era incrementada e **nunca lida** — um e-mail com deal apagado voltava a cada 10
+    min para sempre, pagando OpenAI, sem avisar ninguém. Ao desistir: estado terminal, rótulo
+    `Notas/Erro` e Telegram com o comando de religar.
+  - `conferirSilencioNotas` avisa após `NOTAS_SILENCIO_DIAS` (padrão 10) **sem nenhum e-mail novo**.
+    Repare no que é medido: a última vez que a busca devolveu ALGUMA mensagem, gravada em
+    `notas_reuniao_saude` — nunca "este ciclo veio vazio", que é o estado normal da maioria dos ciclos.
+    Silêncio prolongado tem a mesma cara de "não houve reunião", "o token morreu" e "o Google mudou o
+    formato do assunto".
+- **Estado terminal nunca é reprocessado — é a trava contra nota duplicada.** O rótulo do Gmail é
+  aplicado DEPOIS de o estado virar terminal, e o `messages.list` do mesmo ciclo roda logo em seguida.
+  Se o índice de busca do Gmail atrasar, ou se a retomada falhar antes de conseguir rotular, a mesma
+  mensagem volta na lista — e os dois `if` de retomada de `processarNotaReuniao` não casam mais (o
+  estado deixou de ser `POSTANDO`), então ela seria reprocessada do zero: nova chamada de OpenAI e uma
+  **segunda nota** no prontuário do cliente. O marcador não cobre isso, porque só é consultado dentro
+  do ramo `POSTANDO`. Por isso a guarda de `ESTADOS_TERMINAIS` é a primeira coisa da função.
+  `dealIdForcado` atravessa de propósito (é o único jeito de ressuscitar um órfão) — menos em
+  `CONCLUIDO`, onde religar **lança**, porque só criaria a segunda nota.
+- **`ambiguo` não é "o POST falhou".** Só a *retomada* de um `POSTANDO` que não conseguiu descobrir se
+  a nota já existe escala direto para `REVISAR_MANUAL`. Um POST que falha deixa o estado em `POSTANDO`
+  e o ciclo seguinte reconcilia sozinho pelo marcador — inferir a ambiguidade do estado faria uma
+  queda de rede comum virar trabalho manual à toa.
+- **Doc duplicado é barrado em QUALQUER estado da primeira cópia**, não só em `CONCLUIDO`. O índice
+  único em `doc_id` é o que impede a segunda nota; sem cobrir os outros estados, um reenvio cuja
+  primeira cópia virou órfã batia na constraint, lançava, e o e-mail voltava a cada ciclo para sempre.
+  A cópia canônica continua sendo a primeira, e é lá que o religamento manual acontece.
+- **Nenhum sinal de identidade sai do corpo nem da transcrição.** `#NNNNN` só de título e assunto;
+  `ID NNNNN` só do assunto. O corpo é o resumo que o Gemini escreveu **a partir da fala** — "o ID
+  12345678 do processo administrativo", um número que o cliente leu em voz alta, viraria vínculo de
+  confiança *alta* com um negócio qualquer. A transcrição nem chega em `extrairSinais`: não existe
+  parâmetro para ela, e há teste garantindo que continue assim.
+- **Filtro de ancoragem sobre a saída da IA** (`validarExtracao`, o análogo de `src/evidencia.js`):
+  todo valor monetário, CPF/CNPJ, número CNJ e data que apareça na extração e **não** apareça no
+  texto-fonte (comparando só os dígitos, para pontuação diferente não gerar falso alarme) é **marcado
+  inline** com `[⚠ não localizado no texto]` e vira aviso no rodapé. Marca em vez de apagar de
+  propósito: o falso positivo é real (o valor pode ter sido dito por extenso) e apagar destruiria um
+  dado que o advogado precisa — o risco a matar não era a presença do número, era a **confiança** que
+  ele transmite.
+  **Dinheiro é comparado como NÚMERO, não como cadeia de dígitos.** MEDIDO no e-mail real de
+  07/08/2026: o Gemini escreve `"precificada em 5000 reais"`, sem formatação de moeda. Se o modelo
+  devolver isso como `R$ 5.000,00` — que é o mesmo valor, formatado — a comparação por dígitos
+  procuraria `500000` num texto que tem `5000` e marcaria um valor **certo** como não localizado.
+  Falso alarme no campo de honorários é pior que nenhum aviso: ensina o advogado a ignorar o símbolo.
+  Documento, processo e data continuam por dígitos, onde a identidade é a própria sequência.
+- **Credencial separada.** `google-oauth-token-notas.json`, cliente OAuth próprio, porta 8092
+  (`autorizar-google-notas.js`). O token do bot tem escopo só de Calendar; somar Gmail/Drive a ele
+  exigiria refazer o consentimento, e um consentimento refeito pode invalidar o refresh token em uso
+  — derrubar o agendamento para ligar uma funcionalidade nova. **Conferir o publishing status da tela
+  de consentimento**: em "Testing" o refresh token expira em 7 dias e a rotina para em silêncio.
+- **Botão de emergência.** `NOTAS_REUNIAO_ATIVO=false` (padrão) desliga; `NOTAS_REUNIAO_DRY_RUN=true`
+  (padrão) roda o ciclo inteiro e imprime a nota sem escrever nada, gravando o estado em
+  `notas_reuniao_dryrun` — tabela **separada** de propósito: se o dry-run gravasse na tabela real, a
+  primeira execução de verdade acharia tudo `CONCLUIDO` e não faria nada.
+- **Inspeção:** `GET /notas-reuniao/amostrar?limite=N` (só leitura, atrás de `exigeAdmin`) mostra o
+  que a cascata decidiria para cada e-mail, sem extrair nem escrever. É o teste de regressão manual
+  quando o Google mudar o formato do e-mail. `POST /notas-reuniao/sincronizar?aplicar=1` força um
+  ciclo real.
 
 ### Segurança das rotas
 

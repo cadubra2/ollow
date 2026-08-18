@@ -165,7 +165,7 @@ Campos:
 - tipo_consulta: "consulta paga"
 - area_direito: Direito Administrativo, Direito Educacional, Direito Imobiliario, Direito Previdenciario, Direito de Familia, Direito do Consumidor, Direito do Trabalho, LGPD, Direito Empresarial, Outros, Solucoes Medicas
 - pagamento_confirmado: boolean
-- resumo_atendimento: "O que aconteceu: ... | O que o cliente quer: ... | O que ja foi tentado: ..."
+- resumo_atendimento: briefing em secoes para o advogado: "📌 Caso: <o que aconteceu> | 📌 Objetivo do cliente: <o que ele quer> | 📌 Urgencia/prazo: <se houver> | 📌 Ja tentou: <se houver> | 📌 Pendencias: <o que falta combinar/enviar> | 📌 Documentos citados: <se houver>". Campo que nao apareceu na conversa sai "Nao mencionado.", nunca vazio nem chute.
 
 Dados anteriores: ${JSON.stringify(dadosAnteriores || {})}
 
@@ -234,11 +234,21 @@ ${historico}`;
 
     // Nota de briefing
     if (dados.resumo_atendimento) {
-      await axios.post(MOSKIT_BASE + '/deals/' + dealId + '/notes', {
-        description: '📋 Briefing pré-reunião\n\n' + dados.resumo_atendimento,
-        user: { id: LAYLA_USER_ID },
-      }, { headers: apiHeaders, validateStatus: s => s < 500 });
-      console.log('   Nota adicionada');
+      const texto = require('./src/briefing').montarTextoBriefing({
+        dados,
+        contato: contactName,
+        telefone: phone || chatId,
+        horarioConsulta: null,
+      });
+      if (texto) {
+        await axios.post(MOSKIT_BASE + '/deals/' + dealId + '/notes', {
+          description: '📋 Briefing pré-reunião\n\n' + texto + '\n\n' + require('./src/briefing').MARCADOR_BRIEFING,
+          user: { id: LAYLA_USER_ID },
+        }, { headers: apiHeaders, validateStatus: s => s < 500 });
+        console.log('   Nota adicionada');
+      } else {
+        console.log('   Sem conteudo de briefing — nota nao adicionada');
+      }
     }
 
     // Atualizar banco
