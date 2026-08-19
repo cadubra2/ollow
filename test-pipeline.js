@@ -38,6 +38,12 @@ process.env.VINCULO_BACKOFF_CICLOS = '4';
 process.env.NOTAS_ANEXO_ATIVO = 'true';
 process.env.PUBLIC_BASE_URL = 'https://tunel-de-teste.example';
 process.env.NOTAS_ANEXO_MAX_TENTATIVAS = '3';
+// Cliente que volta: em producao nasce DESLIGADO e em dry-run (CLIENTE_RETORNO_ATIVO=false,
+// CLIENTE_RETORNO_DRY_RUN=true). Aqui vale o inverso, pelo mesmo motivo de NOTAS_ANEXO_ATIVO: o
+// caminho que escreve e o que pode errar, e as duas flags sao lidas como const no require abaixo.
+process.env.CLIENTE_RETORNO_ATIVO = 'true';
+process.env.CLIENTE_RETORNO_DRY_RUN = 'false';
+process.env.RETORNO_FOLGA_HORAS = '2';
 
 // ---------- dublê do axios ----------
 const axios = require('axios');
@@ -51,6 +57,37 @@ for (const metodo of ['get', 'post', 'put', 'patch', 'delete']) {
     return { status: 200, data: {} };
   };
 }
+
+// ---------- dublê da OpenAI ----------
+// openaiChat fala HTTPS direto (sem SDK), entao o dublê e no https.request — e ele existe tambem para
+// tapar um buraco antigo: processarNotaReuniao chama a OpenAI de verdade, e este arquivo nao
+// interceptava https.request. Rodar a suite numa maquina com OPENAI_API_KEY valida gastava credito, e
+// sem rede a chamada virava unhandledRejection.
+//
+// Fila explicita por cenario; sem resposta enfileirada, devolve `{}` — que para a rotina de notas
+// significa 'extracao vazia' (caminho ja tratado) e nunca uma extracao inventada que passasse por boa.
+const httpsModulo = require('https');
+const { EventEmitter } = require('events');
+const openai = { respostas: [], prompts: [] };
+httpsModulo.request = (opcoes, cb) => {
+  const corpo = [];
+  const res = new EventEmitter();
+  const req = {
+    on: () => req,
+    write: (c) => corpo.push(String(c)),
+    destroy: () => {},
+    end: () => {
+      openai.prompts.push(corpo.join(''));
+      const resposta = openai.respostas.shift() || {};
+      setImmediate(() => {
+        cb(res);
+        res.emit('data', JSON.stringify({ choices: [{ message: { content: JSON.stringify(resposta) } }] }));
+        res.emit('end');
+      });
+    },
+  };
+  return req;
+};
 
 // ---------- dublê do Google Calendar ----------
 const { google } = require('googleapis');
@@ -89,7 +126,10 @@ const {
   enviarTelegram, baixarParaArquivo,
   garantirDealExiste, importarContatosMoskit,
   sincronizarAtividadesMoskit, comSufixoDealId, comMarcadorDeal,
+  processarConversaDirect, montarHistorico, equipeEnviouCondicoesDeValor,
+  janelaAtendimento, consultaDoAtendimento, lerDealsAnteriores, abrirNovoAtendimento, avisarRetornoUmaVez,
 } = require('./index');
+const { lerFila, salvarFila } = require('./src/fila');
 const moskitIds = require('./src/moskit-ids');
 const notasReuniao = require('./src/notas-reuniao');
 const briefingModule = require('./src/briefing');
@@ -131,6 +171,10 @@ const atividadesRemarcadas = () => de('PUT', '/activities');
 const sincronizada = (id) => db.prepare('SELECT * FROM atividades_sincronizadas WHERE activity_id = ?').get(id);
 const telegrams = () => de('POST', 'api.telegram.org');
 const linha = (chatId) => db.prepare('SELECT * FROM conversations WHERE chat_id = ?').get(chatId);
+// `de('POST', '/deals')` casaria tambem /deals/{id}/notes e /deals/{id}/attachments: para contar
+// negocio CRIADO x negocio ATUALIZADO a URL tem que terminar ali.
+const dealsCriados = () => rede.chamadas.filter((c) => c.metodo === 'POST' && c.url.endsWith('/deals'));
+const dealsAtualizados = () => rede.chamadas.filter((c) => { if (c.metodo !== 'PUT') return false; const cauda = c.url.split('/deals/')[1]; return !!cauda && !cauda.includes('/'); });
 
 function semear(chatId, extras = {}) {
   db.prepare('DELETE FROM conversations WHERE chat_id = ?').run(chatId);
@@ -2713,6 +2757,378 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     // A tabela real nao pode ser tocada pelo dry-run: se fosse, a primeira execucao de verdade
     // acharia tudo pronto e nao faria nada.
     igual('   e a tabela real segue intacta', stmtsNotas(false).get.get('msg-dry'), undefined);
+  }
+
+  // ============================================================
+  console.log('\n=== Negocio fechado nao reabre num PUT de campos ===');
+  // O defeito que o cliente de retorno tornava inevitavel, mas que vale para TODO negocio:
+  // montarPayloadMoskit sempre monta `status: 'OPEN'` e o PUT e full replace. Sem preservar o status do
+  // GET, qualquer atualizacao de campo transformava um GANHO em aberto e apagava closeDate/lostReason —
+  // e atingia justamente os negocios bem atendidos, que sao os que ficam fechados.
+  {
+    limpar();
+    const CHAT_WON = '5511955550001';
+    semear(CHAT_WON);
+    rede.get = () => ({
+      status: 200,
+      data: {
+        id: 30, name: 'Cliente - Inventario', status: 'WON', closeDate: '2026-08-01T10:00:00.000Z',
+        stage: { id: 179386 }, activities: [], entityCustomFields: CF_DADOS,
+      },
+    });
+    await atualizarNegocioMoskit(30, DADOS, 7, { chatId: CHAT_WON, condicoesValorEnviadas: true });
+    const put = de('PUT', '/deals/30')[0]?.corpo;
+    igual('negocio GANHO continua ganho depois do PUT', put?.status, 'WON');
+    igual('   closeDate preservado', put?.closeDate, '2026-08-01T10:00:00.000Z');
+  }
+  {
+    limpar();
+    const CHAT_LOST = '5511955550002';
+    semear(CHAT_LOST);
+    rede.get = () => ({
+      status: 200,
+      data: {
+        id: 31, name: 'Cliente - Inventario', status: 'LOST', closeDate: '2026-08-02T10:00:00.000Z',
+        lostReason: { id: 126146 }, stage: { id: 179385 }, activities: [], entityCustomFields: CF_DADOS,
+      },
+    });
+    await atualizarNegocioMoskit(31, DADOS, 7, { chatId: CHAT_LOST, condicoesValorEnviadas: true });
+    const put = de('PUT', '/deals/31')[0]?.corpo;
+    igual('negocio PERDIDO continua perdido', put?.status, 'LOST');
+    igual('   motivo da perda preservado', put?.lostReason?.id, 126146);
+  }
+  {
+    // O caminho comum nao muda: negocio aberto segue aberto, sem closeDate inventado.
+    limpar();
+    const CHAT_OPEN = '5511955550003';
+    semear(CHAT_OPEN);
+    rede.get = () => ({
+      status: 200,
+      data: { id: 32, name: 'Cliente - Inventario', status: 'OPEN', stage: { id: 179388 }, activities: [], entityCustomFields: CF_DADOS },
+    });
+    await atualizarNegocioMoskit(32, DADOS, 7, { chatId: CHAT_OPEN, condicoesValorEnviadas: true });
+    const put = de('PUT', '/deals/32')[0]?.corpo;
+    igual('negocio aberto segue OPEN', put?.status, 'OPEN');
+    igual('   e sem closeDate', put?.closeDate, undefined);
+  }
+
+  // ============================================================
+  console.log('\n=== Janela do atendimento: indices ABSOLUTOS ===');
+  // O corte esconde o atendimento anterior do modelo, mas nao pode renumerar mensagem: msg_idx e
+  // validado contra o array `messages` inteiro (src/evidencia.js), e reindexar faria toda observacao
+  // apontar para outra mensagem.
+  {
+    const msgs = [
+      { role: 'cliente', text: 'caso velho do FIES', timestamp: '2026-08-01T10:00:00Z' },
+      { role: 'equipe', text: BLOCO_CONDICOES_PAGA, timestamp: '2026-08-01T10:05:00Z' },
+      { role: 'cliente', text: 'caso novo de despejo', timestamp: '2026-08-19T10:00:00Z' },
+    ];
+    const comJanela = montarHistorico(msgs, { inicio: 2 });
+    checar('janela esconde o atendimento anterior', !comJanela.includes('FIES'), comJanela);
+    checar('   e mantem o indice absoluto da mensagem', comJanela.includes('[2] Cliente: caso novo'), comJanela);
+    checar('sem janela, a conversa inteira aparece', montarHistorico(msgs).includes('[0] Cliente: caso velho'));
+
+    // A cobranca recomeca do zero: o bloco que a equipe mandou no atendimento anterior nao pode tornar
+    // a consulta nova paga sem ninguem ter cobrado.
+    igual('bloco de condicoes do atendimento anterior nao conta', equipeEnviouCondicoesDeValor(msgs, { inicio: 2 }), false);
+    igual('   ...e sem janela continua contando', equipeEnviouCondicoesDeValor(msgs), true);
+  }
+  {
+    // janelaAtendimento tolera coluna ausente/lixo: sem migracao, o corte e 0 (a conversa inteira), que
+    // e exatamente o comportamento de antes desta funcionalidade existir.
+    igual('linha sem coluna → corte 0', janelaAtendimento({}), 0);
+    igual('linha com NULL → corte 0', janelaAtendimento({ atendimento_inicio_msg_idx: null }), 0);
+    igual('valor valido e respeitado', janelaAtendimento({ atendimento_inicio_msg_idx: 4 }), 4);
+  }
+
+  // ============================================================
+  console.log('\n=== Cliente que volta: o ciclo do corte e o ciclo seguinte ===');
+  {
+    const CHAT_RET = '5586999990001';
+    const DEAL_ANTIGO = 9001;
+    const DEAL_NOVO = 9002;
+    // Timestamps relativos ao relogio, nao datas fixas: "a consulta ja aconteceu" e uma comparacao com
+    // agora, e uma data cravada faria este teste passar hoje e falhar no ano que vem.
+    const agora = Date.now();
+    const atras = (h) => new Date(agora - h * 3600 * 1000).toISOString();
+    const consultaIso = atras(48);
+    const eventoNaive = instanteParaNaiveLocal(consultaIso);
+    const TEXTO_CASO_NOVO = 'recebi uma notificacao de despejo do imovel que eu alugo, o prazo e de 15 dias';
+    const TEXTO_TERCEIRO = 'fui demitido sem justa causa e nao recebi as verbas rescisorias';
+    const MSGS_RET = [
+      { role: 'cliente', text: 'oi, quero falar do abatimento do meu FIES', timestamp: atras(72) },
+      { role: 'equipe', text: BLOCO_CONDICOES_PAGA, timestamp: atras(71) },
+      // Dentro da folga (consulta + 1h de duracao + 2h): ainda e o MESMO atendimento.
+      { role: 'cliente', text: 'obrigado pela consulta, doutor!', timestamp: atras(47) },
+      { role: 'cliente', text: `Doutor, ${TEXTO_CASO_NOVO}`, timestamp: atras(24) },
+    ];
+    const LAST_DATA_ANTIGO = JSON.stringify({
+      nome: 'Lia', assunto: 'Abatimento do FIES', area_direito: 'Direito Educacional',
+      advogado_responsavel: 'Iury', tipo_consulta: 'consulta paga', origem: 'Instagram',
+      _casoDescritoValidado: true,
+    });
+    const semearRetorno = () => {
+      db.prepare('DELETE FROM conversations WHERE chat_id = ?').run(CHAT_RET);
+      db.prepare('INSERT OR REPLACE INTO moskit_contacts (phone, moskit_id, name) VALUES (?,?,?)').run(CHAT_RET, 4242, 'Lia');
+      salvarFila([]);
+      return semear(CHAT_RET, {
+        contact_name: 'Lia', deal_id: DEAL_ANTIGO, last_data: LAST_DATA_ANTIGO, last_action: 'nota',
+        messages: JSON.stringify(MSGS_RET),
+        evento_calendar_criado: 1, evento_calendar_id: 'ev-antigo', evento_calendar_data: eventoNaive,
+        atividade_moskit_id: 777, bloco_condicoes_enviado: 1, bloco_condicoes_msg_idx: 1,
+        contrato_zapsign_criado: 1, contrato_zapsign_doc_token: 'tok-antigo', contrato_zapsign_status: 'signed',
+        campos_travados: JSON.stringify([CF.AREA_DIREITO]), custom_fields_bot: JSON.stringify({ [CF.AREA_DIREITO]: [228780] }),
+        briefing_added: 1, briefing_hash: 'hash-antigo', briefing_versao: 3, briefing_refresh_para: eventoNaive,
+        campos_nota_hash: 'hash-campos', agendamento_apuracao: '{}', agendamento_pendente_hash: 'hash-pend',
+        vinculo_falhas: 2,
+      });
+    };
+
+    const CLASSIFICACAO_OK = { classificacao: 'criar_negocio', justificativa: 'cliente antigo com caso novo' };
+    const extracaoCasoNovo = (acao) => ({
+      acao,
+      justificativa: 'caso novo de despejo',
+      confianca: 9,
+      dados: {
+        nome: 'Lia', assunto: 'Notificacao de despejo', area_direito: 'Direito Imobiliario',
+        advogado_responsavel: 'Bruno', tipo_consulta: 'consulta paga', origem: 'Instagram',
+      },
+      observacoes: [{ tipo: 'cliente_descreveu_caso', msg_idx: 3, trecho: TEXTO_CASO_NOVO }],
+    });
+
+    // ---- ciclo 1: reconhece o retorno, abre o atendimento e NAO escreve caso nenhum no CRM ----
+    limpar();
+    semearRetorno();
+    openai.respostas = [CLASSIFICACAO_OK, extracaoCasoNovo('atualizar_campos')];
+    openai.prompts = [];
+    await processarConversaDirect(CHAT_RET);
+
+    const depoisDoCorte = linha(CHAT_RET);
+    igual('corte gravado na primeira mensagem apos a consulta', depoisDoCorte.atendimento_inicio_msg_idx, 3);
+    igual('   e o atendimento virou o 2o', depoisDoCorte.atendimento_num, 2);
+    igual('   o negocio antigo sai da conversa (nao e reaproveitado)', depoisDoCorte.deal_id, null);
+    checar('   ...mas fica registrado em deals_anteriores', lerDealsAnteriores(depoisDoCorte)[0]?.deal_id === DEAL_ANTIGO, depoisDoCorte.deals_anteriores);
+    igual('   assunto do atendimento anterior guardado para a nota', lerDealsAnteriores(depoisDoCorte)[0]?.assunto, 'Abatimento do FIES');
+
+    // O estado grudado: e isto que fazia a consulta nova nascer paga, o contrato nao ser gerado e a
+    // agenda antiga passar por "consulta ja lancada".
+    igual('   bloco de condicoes zerado', depoisDoCorte.bloco_condicoes_enviado, 0);
+    igual('   msg do bloco zerada', depoisDoCorte.bloco_condicoes_msg_idx, null);
+    igual('   agenda antiga desligada', depoisDoCorte.evento_calendar_criado, 0);
+    igual('   evento antigo esquecido', depoisDoCorte.evento_calendar_id, null);
+    igual('   horario antigo esquecido', depoisDoCorte.evento_calendar_data, null);
+    igual('   atividade antiga esquecida', depoisDoCorte.atividade_moskit_id, null);
+    igual('   contrato zerado', depoisDoCorte.contrato_zapsign_criado, 0);
+    igual('   token do contrato esquecido', depoisDoCorte.contrato_zapsign_doc_token, null);
+    igual('   campos travados liberados', depoisDoCorte.campos_travados, null);
+    igual('   autoria de campos zerada', depoisDoCorte.custom_fields_bot, null);
+    igual('   briefing recomeca', depoisDoCorte.briefing_added, 0);
+    igual('   versao do briefing recomeca', depoisDoCorte.briefing_versao, 0);
+    igual('   apuracao de agendamento esquecida', depoisDoCorte.agendamento_apuracao, null);
+    igual('   pendencia de agendamento esquecida', depoisDoCorte.agendamento_pendente_hash, null);
+    igual('   contador de falhas de vinculo zerado', depoisDoCorte.vinculo_falhas, 0);
+    igual('   last_data limpo (o caso antigo nao classifica o novo)', depoisDoCorte.last_data, null);
+
+    // Nada foi escrito no negocio antigo alem da nota — nenhum PUT e o que garante que o GANHO segue
+    // ganho e que a classificacao do caso encerrado nao foi sobrescrita.
+    igual('nenhum PUT no negocio antigo', dealsAtualizados().length, 0);
+    igual('nenhum negocio criado neste ciclo', dealsCriados().length, 0);
+    checar('nota de retorno no negocio antigo', notas().some((n) => (n.corpo.description || '').includes('caso novo')), notas().map((n) => n.corpo.description));
+    checar('Telegram avisa o escritorio', telegrams().some((t) => (t.corpo.text || '').includes('Cliente de retorno')), telegrams().map((t) => t.corpo.text));
+
+    // Conversa muda nunca e reprocessada sozinha: sem reenfileirar, o atendimento novo ficaria aberto e
+    // vazio ate o cliente escrever de novo.
+    checar('conversa reenfileirada para o ciclo seguinte', lerFila().some((i) => i.chatId === CHAT_RET), lerFila());
+
+    // ---- ciclo 2: com a janela limpa, o segundo negocio nasce do zero ----
+    limpar();
+    openai.respostas = [CLASSIFICACAO_OK, extracaoCasoNovo('criar')];
+    openai.prompts = [];
+    rede.get = (url) => (url.includes('/deals/') ? { status: 200, data: { id: DEAL_NOVO, status: 'OPEN', stage: { id: 179388 }, activities: [], entityCustomFields: [] } } : { status: 200, data: [] });
+    rede.post = (url) => {
+      if (url.includes('/deals')) return { status: 200, data: { id: DEAL_NOVO } };
+      if (url.includes('/activities')) return { status: 200, data: { id: ID_ATIVIDADE } };
+      return { status: 200, data: {} };
+    };
+    await processarConversaDirect(CHAT_RET);
+
+    const criados = dealsCriados();
+    igual('o ciclo seguinte cria UM negocio novo', criados.length, 1);
+    igual('   e a conversa passa a apontar para ele', linha(CHAT_RET).deal_id, DEAL_NOVO);
+    igual('   o corte continua onde estava', linha(CHAT_RET).atendimento_inicio_msg_idx, 3);
+    // A regra de cobranca e a mesma de sempre — e "sempre" agora comeca no atendimento novo.
+    igual('consulta nova nasce cortesia (o bloco antigo ficou fora da janela)', criados[0]?.corpo?.price, 0);
+    igual('   tipo de consulta = gratis', String((criados[0]?.corpo?.entityCustomFields || []).find((c) => c.id === CF.TIPO_CONSULTA)?.options), String([OPCAO.gratis]));
+    // Responsavel pela AREA, como em qualquer lead (decisao do escritorio): Imobiliario → Bruno.
+    igual('   responsavel derivado da area nova', String((criados[0]?.corpo?.entityCustomFields || []).find((c) => c.id === CF.RESPONSAVEL)?.options), String([OPCAO.bruno]));
+    checar('   e o nome do negocio e do caso NOVO', (criados[0]?.corpo?.name || '').includes('despejo'), criados[0]?.corpo?.name);
+
+    // O prompt e a prova de que o modelo nao viu mais o caso encerrado — a contaminacao que fazia o
+    // caso novo herdar area e assunto do anterior.
+    const promptExtracao = openai.prompts[1] || '';
+    // 'FIES' sozinho nao serve: o proprio PROMPT tem uma regra fixa sobre financiamento estudantil. O que
+        // nao pode aparecer e a MENSAGEM do atendimento anterior.
+        checar('o modelo nao ve mais o caso do atendimento anterior', !promptExtracao.includes('abatimento do meu FIES'), promptExtracao.slice(0, 200));
+    checar('   e ve o caso novo', promptExtracao.includes('despejo'));
+
+    checar('o negocio novo cita o anterior', notas().some((n) => (n.corpo.description || '').includes(`Negócio anterior: ${DEAL_ANTIGO}`)), notas().map((n) => n.corpo.description));
+
+    // ---- terceiro atendimento: nao ha teto ----
+    // Cliente de escritorio volta mais de uma vez. Uma guarda de "so se ainda nao houve corte" faria o
+    // 3o caso cair de novo dentro do negocio do 2o — exatamente o defeito que esta funcionalidade
+    // existe para impedir, so uma volta mais tarde.
+    limpar();
+    const MSGS_3 = MSGS_RET.concat([
+      // atras(21) e nao atras(20): a consulta do 2o atendimento fica em atras(23) e o fim com folga cai
+      // em atras(20) — em cima do limite. `evento_calendar_data` tem precisao de MINUTO
+      // (instanteParaNaiveLocal corta os segundos), entao um timestamp exatamente na borda decidiria por
+      // fracao de segundo. A mensagem de agradecimento e do MESMO atendimento; o teste diz isso sem
+      // depender de arredondamento.
+      { role: 'cliente', text: 'obrigado pela consulta de hoje!', timestamp: atras(21) },
+      { role: 'cliente', text: `Doutor, ${TEXTO_TERCEIRO}`, timestamp: atras(2) },
+    ]);
+    db.prepare('UPDATE conversations SET messages = ?, evento_calendar_data = ?, evento_calendar_criado = 1, last_data = ? WHERE chat_id = ?').run(
+      JSON.stringify(MSGS_3),
+      instanteParaNaiveLocal(atras(23)),
+      JSON.stringify({ nome: 'Lia', assunto: 'Notificacao de despejo', area_direito: 'Direito Imobiliario', advogado_responsavel: 'Bruno', tipo_consulta: 'consulta paga', origem: 'Instagram', _casoDescritoValidado: true }),
+      CHAT_RET,
+    );
+    openai.respostas = [CLASSIFICACAO_OK, {
+      acao: 'atualizar_campos', justificativa: 'terceiro caso', confianca: 9,
+      dados: { nome: 'Lia', assunto: 'Rescisao de contrato de trabalho', area_direito: 'Direito do Trabalho', advogado_responsavel: 'Iury', tipo_consulta: 'consulta paga', origem: 'Instagram' },
+      observacoes: [{ tipo: 'cliente_descreveu_caso', msg_idx: 5, trecho: TEXTO_TERCEIRO }],
+    }];
+    await processarConversaDirect(CHAT_RET);
+
+    const terceiro = linha(CHAT_RET);
+    igual('o 3o atendimento tambem e reconhecido', terceiro.atendimento_num, 3);
+    igual('   com corte depois do corte anterior', terceiro.atendimento_inicio_msg_idx, 5);
+    igual('   e o negocio do 2o atendimento sai da conversa', terceiro.deal_id, null);
+    igual('   os dois anteriores ficam registrados', lerDealsAnteriores(terceiro).length, 2);
+    igual('   o mais recente e o do 2o atendimento', lerDealsAnteriores(terceiro)[1]?.deal_id, DEAL_NOVO);
+    igual('   e nada foi escrito no negocio do 2o', dealsAtualizados().length, 0);
+  }
+
+  // ============================================================
+  console.log('\n=== Cliente que volta: quando o bot NAO decide ===');
+  {
+    const CHAT_AMB = '5586999990002';
+    const agora = Date.now();
+    const atras = (h) => new Date(agora - h * 3600 * 1000).toISOString();
+    const TEXTO = 'ainda estou com aquele problema do abatimento do FIES, a faculdade nao respondeu';
+    const MSGS = [
+      { role: 'cliente', text: 'oi, quero falar do abatimento do meu FIES', timestamp: atras(72) },
+      { role: 'cliente', text: `Doutor, ${TEXTO}`, timestamp: atras(24) },
+    ];
+    const semearAmbiguo = () => {
+      db.prepare('DELETE FROM conversations WHERE chat_id = ?').run(CHAT_AMB);
+      db.prepare('INSERT OR REPLACE INTO moskit_contacts (phone, moskit_id, name) VALUES (?,?,?)').run(CHAT_AMB, 4243, 'Lia');
+      return semear(CHAT_AMB, {
+        contact_name: 'Lia', deal_id: 9010, last_action: 'nota',
+        last_data: JSON.stringify({ nome: 'Lia', assunto: 'Abatimento do FIES', area_direito: 'Direito Educacional', advogado_responsavel: 'Iury', tipo_consulta: 'consulta paga', origem: 'Instagram', _casoDescritoValidado: true }),
+        messages: JSON.stringify(MSGS),
+        evento_calendar_criado: 1, evento_calendar_data: instanteParaNaiveLocal(atras(48)),
+      });
+    };
+    const extracaoMesmoCaso = {
+      acao: 'nota',
+      justificativa: 'cliente falando do mesmo caso',
+      confianca: 9,
+      dados: {
+        nome: 'Lia', assunto: 'Abatimento do FIES', area_direito: 'Direito Educacional',
+        advogado_responsavel: 'Iury', tipo_consulta: 'consulta paga', origem: 'Instagram',
+        resumo_atendimento: 'Cliente cobrando andamento do mesmo caso.',
+      },
+      observacoes: [{ tipo: 'cliente_descreveu_caso', msg_idx: 1, trecho: TEXTO }],
+    };
+
+    // Mesmo assunto e mesma area depois da consulta e indistinguivel de "cliente completando o caso de
+    // sempre" — que e o que acontece na maioria das conversas apos uma consulta. Ambiguo NAO abre
+    // negocio, NAO corta a conversa e NAO reclassifica nada; so avisa.
+    limpar();
+    semearAmbiguo();
+    openai.respostas = [{ classificacao: 'criar_negocio', justificativa: 'cliente cobrando andamento' }, extracaoMesmoCaso];
+    await processarConversaDirect(CHAT_AMB);
+
+    const depois = linha(CHAT_AMB);
+    igual('ambiguo nao corta a conversa', depois.atendimento_inicio_msg_idx, null);
+    igual('   nao abre atendimento novo', depois.atendimento_num, 1);
+    igual('   nao solta o negocio atual', depois.deal_id, 9010);
+    igual('   nao escreve no CRM', dealsAtualizados().length + dealsCriados().length, 0);
+    checar('   avisa que precisa de olho humano', telegrams().some((t) => (t.corpo.text || '').includes('é caso novo?')), telegrams().map((t) => t.corpo.text));
+    checar('   e grava o hash do aviso', !!depois.retorno_aviso_hash, depois.retorno_aviso_hash);
+
+    // Segundo ciclo identico: o mesmo veredito nao vira um segundo aviso. Aviso repetido a cada ciclo
+    // afoga justamente o caso que importa.
+    limpar();
+    openai.respostas = [{ classificacao: 'criar_negocio', justificativa: 'cliente cobrando andamento' }, extracaoMesmoCaso];
+    await processarConversaDirect(CHAT_AMB);
+    igual('aviso identico nao e repetido', telegrams().length, 0);
+  }
+  {
+    // Consulta AINDA NAO realizada: o cliente descrevendo o caso antes da consulta e o fluxo normal, e
+    // nada disso pode disparar.
+    const CHAT_FUT = '5586999990003';
+    const agora = Date.now();
+    const daqui = (h) => new Date(agora + h * 3600 * 1000).toISOString();
+    const TEXTO = 'tenho um problema de despejo, recebi a notificacao ontem';
+    limpar();
+    db.prepare('DELETE FROM conversations WHERE chat_id = ?').run(CHAT_FUT);
+    db.prepare('INSERT OR REPLACE INTO moskit_contacts (phone, moskit_id, name) VALUES (?,?,?)').run(CHAT_FUT, 4244, 'Novo');
+    semear(CHAT_FUT, {
+      contact_name: 'Novo', deal_id: 9020, last_action: 'nota',
+      last_data: JSON.stringify({ nome: 'Novo', assunto: 'Consulta jurídica', tipo_consulta: 'consulta paga', origem: 'Instagram' }),
+      messages: JSON.stringify([{ role: 'cliente', text: `Doutor, ${TEXTO}`, timestamp: new Date(agora - 3600 * 1000).toISOString() }]),
+      evento_calendar_criado: 1, evento_calendar_data: instanteParaNaiveLocal(daqui(24)),
+    });
+    rede.get = () => ({ status: 200, data: { id: 9020, status: 'OPEN', stage: { id: 179388 }, activities: [], entityCustomFields: [] } });
+    openai.respostas = [
+      { classificacao: 'criar_negocio', justificativa: 'lead novo' },
+      {
+        acao: 'nota', justificativa: 'primeiro atendimento', confianca: 9,
+        dados: { nome: 'Novo', assunto: 'Notificacao de despejo', area_direito: 'Direito Imobiliario', advogado_responsavel: 'Bruno', tipo_consulta: 'consulta paga', origem: 'Instagram', resumo_atendimento: 'Caso de despejo.' },
+        observacoes: [{ tipo: 'cliente_descreveu_caso', msg_idx: 0, trecho: TEXTO }],
+      },
+    ];
+    await processarConversaDirect(CHAT_FUT);
+    igual('consulta futura: nada de atendimento novo', linha(CHAT_FUT).atendimento_inicio_msg_idx, null);
+    igual('   negocio segue o mesmo', linha(CHAT_FUT).deal_id, 9020);
+    igual('   e nenhum aviso de retorno', telegrams().filter((t) => (t.corpo.text || '').includes('retorno')).length, 0);
+  }
+
+  // ============================================================
+  console.log('\n=== A reconciliacao tambem respeita a janela ===');
+  // reconciliarClassificacao recalcula a cobranca a partir das MENSAGENS (a coluna nasceu depois de
+  // muitas conversas existirem). Sem a janela, ela reintroduziria o bloco do atendimento anterior e
+  // subiria o preco de um negocio que nunca viu bloco nenhum.
+  {
+    const CHAT_REC2 = '5586999990004';
+    const MSGS = JSON.stringify([
+      { role: 'equipe', text: BLOCO_CONDICOES_PAGA, timestamp: '2026-08-01T10:00:00Z' },
+      { role: 'cliente', text: 'obrigado', timestamp: '2026-08-01T11:00:00Z' },
+      { role: 'cliente', text: 'agora tenho um caso de despejo', timestamp: '2026-08-19T10:00:00Z' },
+    ]);
+    const LAST = JSON.stringify({ nome: 'Lia', assunto: 'Despejo', area_direito: 'Direito Imobiliario', advogado_responsavel: 'Bruno', tipo_consulta: 'consulta gratis' });
+    const dealRec2 = () => ({
+      status: 200,
+      data: { id: 80, name: 'Lia - Despejo', status: 'OPEN', stage: { id: 179388 }, activities: [], entityCustomFields: [cf(CF.TIPO_CONSULTA, OPCAO.gratis), cf(CF.AREA_DIREITO, moskitIds.AREA_DIREITO['direito imobiliario']), cf(CF.RESPONSAVEL, OPCAO.bruno)] },
+    });
+
+    limpar();
+    db.prepare('DELETE FROM conversations').run();
+    semear(CHAT_REC2, { deal_id: 80, last_data: LAST, messages: MSGS, bloco_condicoes_enviado: 0, atendimento_inicio_msg_idx: 2 });
+    rede.get = () => dealRec2();
+    const comJanela = await reconciliarClassificacao({});
+    igual('com a janela: a cobranca do atendimento novo nao e recalculada do bloco antigo', comJanela.bloco_recalculado.length, 0);
+
+    // Controle: a MESMA conversa sem corte volta a enxergar o bloco — prova que a assercao acima mede a
+    // janela, e nao um detector que simplesmente parou de funcionar.
+    limpar();
+    db.prepare('DELETE FROM conversations').run();
+    semear(CHAT_REC2, { deal_id: 80, last_data: LAST, messages: MSGS, bloco_condicoes_enviado: 0 });
+    rede.get = () => dealRec2();
+    const semJanela = await reconciliarClassificacao({});
+    igual('sem janela: o bloco e detectado (controle)', semJanela.bloco_recalculado.length, 1);
   }
 
   db.close();

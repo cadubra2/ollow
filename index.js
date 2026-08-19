@@ -19,6 +19,7 @@ const { montarPayloadAtividade, horarioNaiveParaInstante } = require('./src/ativ
 const MOSKIT_IDS = require('./src/moskit-ids');
 const zapsign = require('./src/zapsign');
 const notasReuniao = require('./src/notas-reuniao');
+const clienteRetorno = require('./src/cliente-retorno');
 const briefing = require('./src/briefing');
 
 // ------------------------------------------------------------
@@ -200,6 +201,25 @@ const NOTAS_MAX_TENTATIVAS = Number(process.env.NOTAS_MAX_TENTATIVAS) || 3;
 // que tem a mesma cara de "nao houve reuniao", "o token morreu" e "o Google mudou o formato do
 // assunto". Sem esse aviso, a falha mais provavel da rotina e tambem a unica invisivel.
 const NOTAS_SILENCIO_DIAS = Number(process.env.NOTAS_SILENCIO_DIAS) || 10;
+
+// ---- Cliente que volta: segundo atendimento ---------------------------------------------------
+// Cliente que ja teve consulta e volta com um caso NOVO continua na mesma conversa e no mesmo
+// negocio, herdando bloco de condicoes, contrato, agenda e classificacao do caso anterior (ver
+// src/cliente-retorno.js). Quando esta rotina reconhece o retorno, ela ABRE um atendimento novo: o
+// negocio antigo fica intacto e o proximo ciclo cria o segundo negocio do zero.
+//
+// Nasce DESLIGADO e, quando ligado, nasce em dry-run — mesmo padrao de NOTAS_REUNIAO_*, porque o
+// efeito aqui e criar negocio no CRM. As duas flags sao independentes de proposito: ATIVO=true com
+// DRY_RUN=true e o modo de medicao (decide, loga, avisa no Telegram, nao grava nada).
+const CLIENTE_RETORNO_ATIVO = process.env.CLIENTE_RETORNO_ATIVO === 'true';
+const CLIENTE_RETORNO_DRY_RUN = process.env.CLIENTE_RETORNO_DRY_RUN !== 'false';
+// Folga depois do FIM da consulta antes de aceitar que uma descricao de caso e um caso NOVO. Mensagem
+// durante a reuniao ou logo depois ("esqueci de dizer que tenho o contrato X") e o mesmo atendimento.
+const RETORNO_FOLGA_HORAS = Number(process.env.RETORNO_FOLGA_HORAS) || clienteRetorno.FOLGA_HORAS_PADRAO;
+// O ciclo que detecta o retorno nao cria o negocio (a IA acabou de ler o historico do caso ANTIGO):
+// ele abre o atendimento e reagenda. Sem esse reagendamento a conversa fica muda e nunca volta — o
+// mesmo defeito que exigiu reconciliarPendenciasAgendamento.
+const RETORNO_REPROCESSO_MS = Number(process.env.RETORNO_REPROCESSO_MS) || 30 * 1000;
 
 // ---- Anexo do Doc do Gemini na aba "Arquivos" do negocio -------------------------------------
 // O POST /deals/{id}/attachments NAO aceita upload: o corpo e {"url": "..."} e quem baixa o arquivo
@@ -422,6 +442,20 @@ try { db.exec("ALTER TABLE conversations ADD COLUMN vinculo_falhas INTEGER DEFAU
 try { db.exec("ALTER TABLE conversations ADD COLUMN vinculo_desistiu INTEGER DEFAULT 0"); } catch {}
 try { db.exec("ALTER TABLE conversations ADD COLUMN vinculo_backoff_ate INTEGER"); } catch {}
 try { db.exec("ALTER TABLE conversations ADD COLUMN vinculo_aviso_hash TEXT"); } catch {}
+// Segundo atendimento do MESMO telefone (ver src/cliente-retorno.js). A conversa e uma linha por
+// chat_id para sempre: sem uma fronteira, o atendimento novo herda o bloco de condicoes, o contrato, a
+// agenda e a classificacao do anterior.
+//   atendimento_inicio_msg_idx — indice ABSOLUTO da primeira mensagem do atendimento atual. Absoluto
+//     porque observacoes.msg_idx e validado contra o array `messages` inteiro (src/evidencia.js):
+//     reindexar a janela faria toda observacao apontar para a mensagem errada.
+//   deals_anteriores — JSON com os negocios ja encerrados desta conversa, para a nota do negocio novo
+//     poder citar o anterior sem nenhuma chamada ao CRM.
+//   retorno_aviso_hash — dedup do aviso do caminho ambiguo, por LINHA (mesmo padrao de
+//     vinculo_aviso_hash): sem ele o mesmo "confira se e caso novo" volta a cada ciclo.
+try { db.exec("ALTER TABLE conversations ADD COLUMN atendimento_inicio_msg_idx INTEGER"); } catch {}
+try { db.exec("ALTER TABLE conversations ADD COLUMN atendimento_num INTEGER DEFAULT 1"); } catch {}
+try { db.exec("ALTER TABLE conversations ADD COLUMN deals_anteriores TEXT"); } catch {}
+try { db.exec("ALTER TABLE conversations ADD COLUMN retorno_aviso_hash TEXT"); } catch {}
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_contrato_zapsign_doc_token ON conversations(contrato_zapsign_doc_token)"); } catch {}
 
 db.exec(`
@@ -778,8 +812,8 @@ function buscarIdOpcao(mapeamento, valor, opcoes = {}) {
 // 3 de estrutura), avaliada por mensagem e sobre a concatenacao do que a equipe escreveu. O detector
 // antigo era um punhado de regex soltas e uma delas ("informacoes sobre o atendimento") procurava
 // uma frase que nao existe mais no bloco em uso, entao bloco parcial passava como cortesia.
-function equipeEnviouCondicoesDeValor(mensagens) {
-  return detectarBlocoCondicoes(mensagens).enviado;
+function equipeEnviouCondicoesDeValor(mensagens, opcoes = {}) {
+  return detectarBlocoCondicoes(mensagens, opcoes).enviado;
 }
 
 // Campo MULTIPLE_OPTION: pode ter mais de uma opcao marcada. Regra conservadora — so e gratis se a
@@ -1002,10 +1036,16 @@ function montarReferenciaDeDatas(isoAncora) {
 // `observacoes.msg_idx`, e e por ele que o codigo confere o role de quem falou (ver src/evidencia.js).
 // Efeito colateral util: um cliente que digite "Equipe do escritório: ..." dentro da propria mensagem
 // aparece embaixo do indice DELE, sem indice proprio — nao ganha mais o mesmo peso visual.
-function montarHistorico(mensagens) {
+// `inicio` e a JANELA DO ATENDIMENTO (conversations.atendimento_inicio_msg_idx): num segundo
+// atendimento do mesmo telefone, o modelo nao pode ver o caso ANTIGO — era assim que a area e o
+// assunto do caso encerrado classificavam o caso novo. O indice impresso continua ABSOLUTO no array
+// de mensagens: e ele que o modelo cita em observacoes.msg_idx e que src/evidencia.js confere contra
+// `mensagens[msg_idx]`, que segue sendo o array inteiro.
+function montarHistorico(mensagens, { inicio = 0 } = {}) {
   const linhas = [];
   let diaAnterior = null;
-  for (let i = 0; i < mensagens.length; i++) {
+  const primeira = Number.isFinite(inicio) && inicio > 0 ? inicio : 0;
+  for (let i = primeira; i < mensagens.length; i++) {
     const m = mensagens[i];
     const label = m.role === 'equipe' ? 'Equipe do escritório' : m.role === 'sistema' ? 'Sistema' : 'Cliente';
     const d = m.timestamp ? new Date(m.timestamp) : null;
@@ -1426,6 +1466,21 @@ async function atualizarNegocioMoskit(dealId, dados, contactId, opcoes = {}) {
       // atendido acabava impedido de receber qualquer atualizacao no CRM. `putDealComVerificacao`
       // nunca sofreu disso porque envia o corpo do GET inteiro; esta linha alinha os dois caminhos.
       if (Array.isArray(atualRes.data?.activities)) payload.activities = atualRes.data.activities;
+
+      // Status/fechamento: montarPayloadMoskit sempre monta `status: 'OPEN'` e o PUT e full replace —
+      // sem preservar aqui, qualquer atualizacao de campo REABRE um negocio ganho e apaga
+      // closeDate/lostReason. Atinge justamente os negocios bem atendidos, e o caminho mais provavel
+      // de acontecer e o cliente antigo que volta a escrever (ver src/cliente-retorno.js).
+      // Fechar/reabrir e decisao exclusiva de fecharNegocioSeAplicavel, que por sua vez se recusa a
+      // tocar em deal fora de OPEN: o caminho de campos nao pode fazer pelas costas o que a funcao de
+      // fechamento se proibe de fazer.
+      const statusAtual = atualRes.data?.status;
+      if (statusAtual && statusAtual !== payload.status) {
+        console.log(`  🔒 status do deal ${dealId} preservado ("${statusAtual}") — atualizacao de campos nao reabre negocio`);
+        payload.status = statusAtual;
+      }
+      if (atualRes.data?.closeDate) payload.closeDate = atualRes.data.closeDate;
+      if (atualRes.data?.lostReason) payload.lostReason = atualRes.data.lostReason;
 
       if (dealEhConsultaGratis(atualRes.data)) {
         const novoTipo = payload.entityCustomFields.find((c) => c.id === CF_TIPO_CONSULTA);
@@ -2784,6 +2839,9 @@ OU
   E o cliente esta ACEITANDO ou ALTERANDO um horario ("pode ser", "confirmado", "prefiro sexta").
   Nesse caso classifique "criar_negocio": e exatamente essa mensagem que fecha o agendamento, e
   descarta-la deixa a consulta travada sem a confirmacao do cliente.
+  TAMBEM NAO vale quando o CONTEXTO DO CRM diz que o cliente JA FOI ATENDIDO e ele volta contando um
+  caso NOVO ou pedindo outra consulta. Cliente antigo com problema novo e o lead mais qualificado que
+  existe: classifique "criar_negocio".
 - Membro da equipe falando de trabalho interno ("Passa pra Layla", "cria tarefa no astrea")
 - Lead dizendo "ja resolvi", "obrigado" sem contexto
 - Conversa muito curta/sem contexto (1 msg generica)
@@ -2815,6 +2873,12 @@ Cliente: "Estou a caminho"
 Cliente: "Ok"
 Cliente: "Cheguei"
 Resposta: {"classificacao": "inviavel", "justificativa": "cliente existente apenas confirmando horario de consulta, nao e lead novo"}
+
+--- criar_negocio (cliente antigo, caso NOVO) ---
+CONTEXTO DO CRM: negocio 48292471 ja existe no CRM; este cliente JA FOI ATENDIDO (consulta em 14/08/2026 15:30)
+Cliente: "Doutor, bom dia! Aquela questao do FIES ficou resolvida, obrigado."
+Cliente: "Agora apareceu outra coisa: recebi uma notificacao de despejo do imovel que eu alugo, o prazo e de 15 dias. Da pra marcar outra consulta?"
+Resposta: {"classificacao": "criar_negocio", "justificativa": "cliente ja atendido voltou com um caso NOVO (despejo) e pediu outra consulta"}
 
 --- inviavel (sem interesse) ---
 Cliente: "Obrigado."
@@ -3156,6 +3220,197 @@ async function finalizarCiclo({ dealId, dados, dadosMesclados, chatId, row, apur
 }
 
 // ------------------------------------------------------------
+// Cliente que volta: abertura do segundo atendimento
+// ------------------------------------------------------------
+// Os prepares abaixo sao PREGUICOSOS, e isso nao e estilo: as colunas de atendimento entram por
+// ALTER TABLE dentro de try {} catch {} como todo o boot, e um prepare no carregamento do modulo
+// transformaria esse catch numa armadilha — migracao falhando por qualquer motivo que nao "coluna ja
+// existe" (disco cheio, banco travado, arquivo corrompido) mataria o require com "no such column", o
+// processo sairia com exit 1 e o pm2 entraria em loop de restart: WhatsApp, agenda e CRM fora do ar
+// por causa de uma funcionalidade que nasce DESLIGADA. Mesmo motivo de stmtNotaPorAnexoToken().
+let _stmtAbrirAtendimento = null;
+function stmtAbrirAtendimento() {
+  if (!_stmtAbrirAtendimento) {
+    // Uma UPDATE so: o estado do atendimento anterior tem que sair inteiro ou nao sair. Meia limpeza
+    // (deal_id novo com bloco_condicoes_enviado antigo) e pior que nenhuma — a consulta nova nasceria
+    // paga sem a equipe ter mandado bloco nenhum.
+    _stmtAbrirAtendimento = db.prepare(`
+      UPDATE conversations SET
+        atendimento_inicio_msg_idx = ?, atendimento_num = ?, deals_anteriores = ?,
+        retorno_aviso_hash = NULL,
+        deal_id = NULL, last_data = NULL, last_action = 'aguardar',
+        bloco_condicoes_enviado = 0, bloco_condicoes_msg_idx = NULL,
+        evento_calendar_criado = 0, evento_calendar_id = NULL, evento_calendar_data = NULL,
+        atividade_moskit_id = NULL,
+        contrato_zapsign_criado = 0, contrato_zapsign_doc_token = NULL, contrato_zapsign_status = NULL,
+        contrato_zapsign_pendente_hash = NULL, contrato_zapsign_erro_hash = NULL,
+        custom_fields_bot = NULL, campos_travados = NULL,
+        briefing_added = 0, briefing_hash = NULL, briefing_versao = 0, briefing_refresh_para = NULL,
+        campos_nota_hash = NULL,
+        agendamento_pendente_hash = NULL, agendamento_erro_hash = NULL, agendamento_apuracao = NULL,
+        agendamento_divergencia_hash = NULL, agendamento_pendencia_avisada = NULL,
+        opcao_invalida_hash = NULL,
+        vinculo_falhas = 0, vinculo_desistiu = 0, vinculo_backoff_ate = NULL, vinculo_aviso_hash = NULL,
+        last_processed_at = datetime('now')
+      WHERE chat_id = ?
+    `);
+  }
+  return _stmtAbrirAtendimento;
+}
+
+let _stmtRetornoAvisoHash = null;
+function stmtRetornoAvisoHash() {
+  if (!_stmtRetornoAvisoHash) {
+    _stmtRetornoAvisoHash = db.prepare('UPDATE conversations SET retorno_aviso_hash = ? WHERE chat_id = ?');
+  }
+  return _stmtRetornoAvisoHash;
+}
+
+let _stmtNotaReuniaoDoDeal = null;
+function stmtNotaReuniaoDoDeal() {
+  if (!_stmtNotaReuniaoDoDeal) {
+    _stmtNotaReuniaoDoDeal = db.prepare(
+      "SELECT assunto FROM notas_reuniao WHERE deal_id = ? AND estado = 'CONCLUIDO' ORDER BY criado_em DESC LIMIT 1"
+    );
+  }
+  return _stmtNotaReuniaoDoDeal;
+}
+
+// Janela do atendimento atual. Coluna ausente (migracao que nao rodou) vira 0 — a conversa inteira,
+// que e exatamente o comportamento de antes desta funcionalidade existir.
+function janelaAtendimento(row) {
+  const i = Number(row?.atendimento_inicio_msg_idx);
+  return Number.isFinite(i) && i > 0 ? i : 0;
+}
+
+function lerDealsAnteriores(row) {
+  try {
+    const lista = JSON.parse(row?.deals_anteriores || '[]');
+    return Array.isArray(lista) ? lista : [];
+  } catch {
+    return [];
+  }
+}
+
+// A consulta deste atendimento ja aconteceu? Duas fontes locais, zero rede (ver
+// src/cliente-retorno.js). A segunda e a nota do Gemini: ela so existe se a reuniao ocorreu de fato, e
+// cobre a consulta marcada direto no CRM, que nunca passou por evento_calendar_data.
+function consultaDoAtendimento(row) {
+  let notaReuniaoEm = null;
+  if (row?.deal_id) {
+    try {
+      const nota = stmtNotaReuniaoDoDeal().get(row.deal_id);
+      const parsed = nota?.assunto ? notasReuniao.parseAssuntoGemini(nota.assunto) : null;
+      // O assunto do Gemini traz a DATA da reuniao, sem hora — entao vale o FIM do dia do escritorio.
+      // Cortar mais tarde no maximo perde um retorno; cortar mais cedo abriria negocio novo no meio de
+      // um atendimento ainda em curso, que e o erro caro.
+      if (parsed?.dataIso) notaReuniaoEm = `${parsed.dataIso}T23:59:59`;
+    } catch {}
+  }
+  return clienteRetorno.consultaJaRealizada({
+    eventoCalendarData: row?.evento_calendar_data || null,
+    notaReuniaoEm,
+    agora: new Date().toISOString(),
+    timeZone: TZ_ESCRITORIO,
+    folgaHoras: RETORNO_FOLGA_HORAS,
+  });
+}
+
+function textoConsultaAnterior(retorno) {
+  const naive = retorno?.consulta?.quando ? instanteParaNaiveLocal(retorno.consulta.quando) : null;
+  return formatarHorarioEscritorio(naive) || 'data desconhecida';
+}
+
+// Dedup por LINHA, nao por texto: o mesmo veredito volta a cada ciclo enquanto a conversa nao mudar, e
+// um aviso repetido a cada 5 min afoga justamente o caso que importa (a mesma licao de
+// agendamento_pendente_hash e vinculo_aviso_hash).
+async function avisarRetornoUmaVez({ chatId, row, retorno, nota, telegrama }) {
+  const hash = crypto.createHash('sha1')
+    .update([retorno.decisao, retorno.motivo, retorno.consulta?.quando || '', retorno.assuntoNovo || '', String(row?.deal_id || '')].join('|'))
+    .digest('hex');
+  if (row?.retorno_aviso_hash === hash) {
+    console.log('  ⏭️ aviso de retorno identico ao ultimo — nao repetido');
+    return false;
+  }
+  if (nota && row?.deal_id) {
+    try { await criarNotaMoskit(row.deal_id, nota); } catch (e) { console.error(`  ⚠️ nota de retorno falhou: ${e.message}`); }
+  }
+  if (telegrama) await enviarTelegram(telegrama);
+  try { stmtRetornoAvisoHash().run(hash, chatId); } catch (e) { console.error(`  ⚠️ nao gravei retorno_aviso_hash: ${e.message}`); }
+  return true;
+}
+
+// Abre o atendimento NOVO: empilha o negocio atual em deals_anteriores, corta a janela de mensagens e
+// zera todo o estado herdado. NAO cria o negocio novo aqui, de proposito — nesta rodada a IA leu o
+// historico do caso ANTIGO, e o que ela extraiu esta contaminado por ele. Quem cria e o ciclo seguinte,
+// com a janela limpa; por isso a conversa e reagendada em vez de ficar esperando mensagem nova.
+//
+// Devolve true quando o atendimento foi realmente aberto (o ciclo atual precisa parar ali).
+async function abrirNovoAtendimento({ chatId, row, retorno, dados, dadosAnteriores }) {
+  const consultaTexto = textoConsultaAnterior(retorno);
+  const numero = (Number(row?.atendimento_num) || 1) + 1;
+  const assuntoAntigo = retorno.assuntoAnterior || 'não identificado';
+  const assuntoNovo = retorno.assuntoNovo || 'não identificado ainda';
+  const porque = clienteRetorno.descreverMotivo(retorno.motivo);
+  const quem = dados?.nome || dadosAnteriores?.nome || row?.contact_name || 'nao informado';
+
+  const telegrama = [
+    '🔁 *Cliente de retorno*',
+    `Cliente: ${quem} (\`${chatId}\`)`,
+    `Consulta anterior: ${consultaTexto}`,
+    `Negócio anterior: \`${row?.deal_id}\` — ${assuntoAntigo}`,
+    `Caso novo: ${assuntoNovo} (${porque})`,
+    '',
+    CLIENTE_RETORNO_DRY_RUN
+      ? '🤖 [dry-run] nada foi alterado — o atendimento novo NÃO foi aberto.'
+      : `${numero}º atendimento aberto. O negócio novo é criado no próximo ciclo; o anterior fica intacto.`,
+  ].join('\n');
+
+  if (CLIENTE_RETORNO_DRY_RUN) {
+    console.log(`  🤖 [dry-run] abriria o ${numero}o atendimento (corte na msg ${retorno.corteMsgIdx}, ${porque}) — nada gravado`);
+    await avisarRetornoUmaVez({
+      chatId, row, retorno,
+      nota: `🤖 [dry-run] Cliente de retorno: caso novo detectado depois da consulta de ${consultaTexto} (${porque}). Um negócio novo SERIA criado — revisão manual necessária (CLIENTE_RETORNO_DRY_RUN ativo).`,
+      telegrama,
+    });
+    return false;
+  }
+
+  const anteriores = lerDealsAnteriores(row);
+  anteriores.push({
+    deal_id: row.deal_id,
+    assunto: retorno.assuntoAnterior || null,
+    area: dadosAnteriores?.area_direito || null,
+    consulta_em: retorno.consulta?.quando || null,
+    encerrado_em: new Date().toISOString(),
+  });
+
+  stmtAbrirAtendimento().run(retorno.corteMsgIdx, numero, JSON.stringify(anteriores), chatId);
+  console.log(`  🔁 ${numero}o atendimento aberto para ${chatId} — corte na msg ${retorno.corteMsgIdx} (${porque}); negocio ${row.deal_id} preservado`);
+
+  // Best-effort: a nota e o aviso nao podem desfazer o corte que ja esta no banco, entao falha aqui
+  // nunca lanca — o pior caso e a equipe descobrir o segundo negocio pelo funil.
+  try {
+    await criarNotaMoskit(
+      row.deal_id,
+      `🔁 Cliente voltou com um caso novo depois da consulta de ${consultaTexto} (${porque}). Este negócio foi encerrado para o bot: o caso novo ("${assuntoNovo}") vai para um negócio separado, e nada aqui será sobrescrito.`
+    );
+  } catch (e) {
+    console.error(`  ⚠️ nota de retorno no deal ${row.deal_id} falhou: ${e.message}`);
+  }
+  try { await enviarTelegram(telegrama); } catch (e) { console.error(`  ⚠️ Telegram de retorno falhou: ${e.message}`); }
+
+  // Conversa muda NUNCA e reprocessada por conta propria (nada aqui reprocessa so porque o tempo
+  // passou): sem este reagendamento o atendimento novo ficaria aberto e vazio ate o cliente escrever.
+  if (process.env.WORKER_MODE) {
+    try { enfileirar(chatId); } catch (e) { console.error(`  ⚠️ nao consegui enfileirar ${chatId}: ${e.message}`); }
+  } else {
+    agendarProcessamento(chatId, RETORNO_REPROCESSO_MS);
+  }
+  return true;
+}
+
+// ------------------------------------------------------------
 // Pipeline principal
 // ------------------------------------------------------------
 async function processarConversaDirect(chatId) {
@@ -3193,12 +3448,24 @@ async function processarConversaDirect(chatId) {
     const contatoMoskit = stmtMoskitGet.get(phoneClean);
     const infoCliente = contatoMoskit ? `Sim — ${contatoMoskit.name}` : 'Nao';
 
-    const historico = montarHistorico(mensagens);
+    // JANELA DO ATENDIMENTO. Cliente que ja foi atendido e voltou com um caso novo continua nesta
+    // MESMA linha (uma por chat_id, para sempre), e a fronteira gravada por abrirNovoAtendimento e o
+    // que impede o atendimento novo de herdar o caso e a cobranca do anterior. Sem coluna (ou sem
+    // migracao) o corte e 0, que e a conversa inteira — o comportamento de antes desta funcionalidade.
+    // Os indices seguem ABSOLUTOS: e por eles que src/evidencia.js confere `mensagens[msg_idx]`.
+    const inicioAtendimento = janelaAtendimento(row);
+    if (inicioAtendimento > 0) {
+      console.log(`  🔁 ${row.atendimento_num || 2}o atendimento desta conversa — lendo a partir da msg ${inicioAtendimento} de ${mensagens.length}`);
+    }
+
+    const historico = montarHistorico(mensagens, { inicio: inicioAtendimento });
 
     // CHECKPOINT da cobranca. Calculado uma vez e passado pra todos os payloads desta rodada
     // (ver montarPayloadMoskit). `viradaCobranca` marca a rodada em que o bloco apareceu pela
     // primeira vez — e nela que um deal ja criado como cortesia precisa ser corrigido pra R$350.
-    const bloco = detectarBlocoCondicoes(mensagens);
+    // A janela e o que faz a cobranca recomecar do zero no atendimento novo: sem ela, o bloco que a
+    // equipe mandou no atendimento ANTERIOR tornaria a consulta nova paga sem ninguem ter cobrado.
+    const bloco = detectarBlocoCondicoes(mensagens, { inicio: inicioAtendimento });
     const blocoJaRegistrado = row.bloco_condicoes_enviado === 1;
     const viradaCobranca = bloco.enviado && !blocoJaRegistrado;
     // chatId viaja no mesmo objeto porque criarNegocioMoskit/atualizarNegocioMoskit precisam saber
@@ -3213,7 +3480,7 @@ async function processarConversaDirect(chatId) {
       // "aguardar", o deal ja existente precisa ser corrigido de cortesia pra paga.
       await aplicarViradaCobranca(chatId, row, dadosAnteriores, opcoesPayload, phone);
     } else if (!bloco.enviado) {
-      const anexos = contarAnexosIlegiveisEquipe(mensagens);
+      const anexos = contarAnexosIlegiveisEquipe(mensagens, { inicio: inicioAtendimento });
       console.log(`  🆓 Checkpoint: bloco de condicoes nunca enviado — tratando como cortesia${anexos ? ` (⚠️ ${anexos} anexo(s) da equipe ilegivel(is))` : ''}`);
     }
 
@@ -3221,10 +3488,15 @@ async function processarConversaDirect(chatId) {
     console.log('  Classificando lead...');
     // Sem este contexto, a regra "cliente existente so confirmando horario => inviavel" descartava a
     // propria mensagem que fecha a dupla confirmacao, e a conversa parava antes da extracao.
+    // A consulta ja realizada entra no contexto porque a regra "cliente existente so avisando que
+    // chegou => inviavel" engolia justamente o cliente antigo trazendo um caso NOVO — que e o lead
+    // mais qualificado que existe (ver src/cliente-retorno.js).
+    const consultaAnterior = consultaDoAtendimento(row);
     const contextoCrm = [
       temDeal ? `negocio ${row.deal_id} ja existe no CRM` : 'nenhum negocio criado ainda',
       row.evento_calendar_criado ? 'consulta JA lancada na agenda' : 'consulta ainda NAO lancada na agenda',
-    ].join('; ');
+      consultaAnterior.realizada ? `este cliente JA FOI ATENDIDO (consulta em ${textoConsultaAnterior({ consulta: consultaAnterior })})` : '',
+    ].filter(Boolean).join('; ');
     const classificacao = await classificarConversa(historico, contextoCrm);
     console.log('  Classificacao:', JSON.stringify(classificacao));
 
@@ -3247,7 +3519,15 @@ async function processarConversaDirect(chatId) {
 
     // Valida as observacoes contra as mensagens reais ANTES de deixar qualquer uma influenciar a
     // agenda. Observacao que cita indice inexistente, papel errado ou trecho inventado e descartada.
-    const { validas: obsValidas, rejeitadas: obsRejeitadas } = validarObservacoes(result.observacoes, mensagens);
+    // `mensagens` INTEIRO, sempre: e o array contra o qual msg_idx faz sentido. O filtro da janela vem
+    // depois — o modelo nao viu as mensagens do atendimento anterior, entao citar uma delas e sinal de
+    // indice chutado, e uma confirmacao de horario da consulta passada nao pode reabrir agendamento no
+    // atendimento novo.
+    const { validas: obsTodas, rejeitadas: obsRejeitadas } = validarObservacoes(result.observacoes, mensagens);
+    const obsValidas = inicioAtendimento > 0 ? obsTodas.filter((o) => o.msg_idx >= inicioAtendimento) : obsTodas;
+    for (const o of obsTodas) {
+      if (!obsValidas.includes(o)) console.log(`  🚫 observacao fora da janela do atendimento (msg ${o.msg_idx} < ${inicioAtendimento}): ${o.tipo}`);
+    }
     for (const r of obsRejeitadas) {
       console.log(`  🚫 observacao descartada (${r.motivo}): ${JSON.stringify(r.obs)}`);
     }
@@ -3353,6 +3633,48 @@ async function processarConversaDirect(chatId) {
     }
     const { casoDescrito } = sanitizarClassificacao(dados, obsValidas);
 
+    // CLIENTE QUE VOLTA (ver src/cliente-retorno.js). Roda aqui, DEPOIS de sanitizarClassificacao (que
+    // e quem deixa `dados.assunto` comparavel) e ANTES de todo ramo de escrita: e o unico ponto em que
+    // ainda da pra impedir o caso novo de sobrescrever a classificacao do negocio anterior.
+    // Sem teto de atendimentos: cliente de escritorio volta mais de uma vez, e todo sinal usado aqui
+    // se refere ao atendimento ATUAL (evento_calendar_data e last_data foram zerados no corte anterior,
+    // e obsValidas ja esta filtrado pela janela). O corte novo cai sempre depois do atual.
+    if (CLIENTE_RETORNO_ATIVO && row.deal_id) {
+      const retorno = clienteRetorno.decidirRetorno({
+        consulta: consultaAnterior, mensagens, obsValidas, dadosAnteriores, dados,
+      });
+      console.log(`  🔁 Retorno: ${retorno.decisao} — ${clienteRetorno.descreverMotivo(retorno.motivo)}`);
+
+      if (retorno.decisao === 'novo_atendimento') {
+        const aberto = await abrirNovoAtendimento({ chatId, row, retorno, dados, dadosAnteriores });
+        // Aberto = este ciclo para aqui. O que a IA extraiu nesta rodada esta contaminado pelo caso
+        // ANTIGO (ela leu o historico inteiro), e e o ciclo reagendado, com a janela ja cortada, que
+        // cria o negocio novo. Em dry-run nada foi gravado e o fluxo segue como sempre foi.
+        if (aberto) return;
+      } else if (retorno.decisao === 'ambiguo') {
+        const consultaTexto = textoConsultaAnterior(retorno);
+        await avisarRetornoUmaVez({
+          chatId, row, retorno,
+          nota: `🔁 Caso descrito depois da consulta de ${consultaTexto}, mas ${clienteRetorno.descreverMotivo(retorno.motivo)} — o bot não sabe dizer se é um caso NOVO ou a continuação deste. Nada foi reclassificado; se for caso novo, abra o negócio na mão.`,
+          telegrama: [
+            '🔁 *Cliente antigo escreveu de novo — é caso novo?*',
+            `Cliente: ${dados?.nome || dadosAnteriores?.nome || row?.contact_name || 'nao informado'} (\`${chatId}\`)`,
+            `Negócio: \`${row.deal_id}\` — consulta em ${consultaTexto}`,
+            `Motivo da dúvida: ${clienteRetorno.descreverMotivo(retorno.motivo)}`,
+            '',
+            'O bot NÃO reclassificou nada. Se for um caso novo, abra o negócio manualmente.',
+          ].join('\n'),
+        });
+        // Caso novo suspeito nao reescreve a classificacao do caso ANTIGO enquanto a equipe nao decide
+        // — mesma tecnica de aplicarGateCasoDescrito, e pelo mesmo motivo: campo em branco a equipe
+        // preenche, campo com o dado do caso errado ninguem descobre lendo.
+        dados.area_direito = null;
+        dados.advogado_responsavel = null;
+        dados.assunto = null;
+        acao = 'aguardar';
+      }
+    }
+
     const jsonDados = JSON.stringify(dados);
     const confianca = result.confianca ?? 0;
 
@@ -3418,6 +3740,19 @@ async function processarConversaDirect(chatId) {
         const deal = await criarNegocioMoskit(dadosMesclados, contactId, opcoesPayload);
         dealId = deal.id;
         console.log(`  ✅ Novo Deal ${dealId} criado`);
+        // Segundo atendimento do mesmo cliente: o negocio novo nasce citando o anterior, sem nenhuma
+        // chamada ao CRM (deals_anteriores e local). E o que permite a quem abre este negocio saber que
+        // existe historico — o CRM nao liga os dois sozinho.
+        const anteriores = lerDealsAnteriores(row);
+        if (anteriores.length) {
+          const anterior = anteriores[anteriores.length - 1];
+          const quando = anterior.consulta_em ? formatarHorarioEscritorio(instanteParaNaiveLocal(anterior.consulta_em)) : null;
+          await criarNotaMoskit(dealId, [
+            `🔁 Cliente de retorno — ${anteriores.length + 1}º atendimento.`,
+            `Negócio anterior: ${anterior.deal_id}${anterior.assunto ? ` ("${anterior.assunto}")` : ''}${quando ? `, consulta em ${quando}` : ''}.`,
+            'Este negócio é do caso novo; o anterior fica como está.',
+          ].join('\n'));
+        }
       }
 
       // Se o deal foi recriado com outro id, o banco precisa saber agora — o briefing e o
@@ -4911,7 +5246,7 @@ function camposClassificacaoDe(dados, condicoesValorEnviadas) {
 
 async function reconciliarClassificacao({ aplicar = false, incluirLegado = false, limite = 100 } = {}) {
   const linhas = db.prepare(`
-    SELECT chat_id, deal_id, last_data, bloco_condicoes_enviado, messages
+    SELECT chat_id, deal_id, last_data, bloco_condicoes_enviado, messages, atendimento_inicio_msg_idx
     FROM conversations
     WHERE deal_id IS NOT NULL AND last_data IS NOT NULL
       AND (updated_at IS NULL OR updated_at >= datetime('now', ?))
@@ -4937,7 +5272,12 @@ async function reconciliarClassificacao({ aplicar = false, incluirLegado = false
     // massa (13 deals na varredura de 12/08/2026). As mensagens estao no banco: e delas que sai a
     // verdade. Se o recalculo discordar da coluna, a coluna e corrigida de passagem.
     const mensagens = parseJsonSeguro(linha.messages, null) || [];
-    const blocoRecalculado = mensagens.length ? detectarBlocoCondicoes(mensagens).enviado : linha.bloco_condicoes_enviado === 1;
+    // A janela do atendimento vale aqui tambem: sem ela, a reconciliacao recalcularia a cobranca do
+    // negocio NOVO a partir do bloco de condicoes que a equipe mandou no atendimento ANTERIOR, e
+    // rebaixaria/subiria o preco de um deal que nunca viu bloco nenhum.
+    const blocoRecalculado = mensagens.length
+      ? detectarBlocoCondicoes(mensagens, { inicio: janelaAtendimento(linha) }).enviado
+      : linha.bloco_condicoes_enviado === 1;
     if (blocoRecalculado !== (linha.bloco_condicoes_enviado === 1)) {
       relatorio.bloco_recalculado.push({ chat_id: linha.chat_id, coluna: linha.bloco_condicoes_enviado, mensagens: blocoRecalculado ? 1 : 0 });
       console.log(`  💳 ${linha.chat_id}: bloco de condicoes recalculado das mensagens (coluna dizia ${linha.bloco_condicoes_enviado}, agora ${blocoRecalculado ? 1 : 0})`);
@@ -6703,6 +7043,53 @@ app.get('/notas-reuniao/amostrar', exigeAdmin, rota(async (req, res) => {
   res.json(r);
 }));
 
+// Quantos clientes de retorno existem, e o que a decisao veria em cada um. SO LEITURA e SEM IA: e o
+// jeito de medir a prevalencia (e a taxa de acerto) antes de ligar CLIENTE_RETORNO_ATIVO em producao,
+// no mesmo espirito de /notas-reuniao/amostrar. Sem obsValidas nao ha veredito final — o que a rota
+// mostra e o que o pipeline vai encontrar: consulta realizada e mensagens depois dela.
+app.get('/clientes-retorno/amostrar', exigeAdmin, rota(async (req, res) => {
+  const limite = Math.min(Number(req.query.limite) || 20, 100);
+  const linhas = db.prepare(
+    'SELECT chat_id, contact_name, deal_id, messages, last_data, evento_calendar_data FROM conversations ' +
+    'WHERE deal_id IS NOT NULL AND evento_calendar_data IS NOT NULL ORDER BY last_processed_at DESC LIMIT ?'
+  ).all(limite * 5);
+
+  const candidatos = [];
+  for (const linha of linhas) {
+    const consulta = consultaDoAtendimento(linha);
+    if (!consulta.realizada) continue;
+    const mensagens = parseJsonSeguro(linha.messages, null) || [];
+    const corte = clienteRetorno.primeiraMensagemApos(mensagens, consulta.fimComFolga);
+    if (corte === null) continue;
+    const dados = parseJsonSeguro(linha.last_data, null) || {};
+    candidatos.push({
+      chat_id: linha.chat_id,
+      contato: linha.contact_name || null,
+      deal_id: linha.deal_id,
+      consulta_em: consulta.quando,
+      consulta_fonte: consulta.fonte,
+      assunto_atual: dados.assunto || null,
+      area_atual: dados.area_direito || null,
+      msgs_depois_da_consulta: mensagens.length - corte,
+      corte_seria_na_msg: corte,
+      // O veredito depende de observacao validada de caso descrito DEPOIS da consulta, que so existe
+      // dentro de um ciclo (custa OpenAI). Aqui fica o que falta para o pipeline decidir.
+      falta: 'observacao validada de caso descrito depois da consulta + assunto/area diferentes',
+    });
+    if (candidatos.length >= limite) break;
+  }
+
+  res.json({
+    ok: true,
+    ativo: CLIENTE_RETORNO_ATIVO,
+    dry_run: CLIENTE_RETORNO_DRY_RUN,
+    folga_horas: RETORNO_FOLGA_HORAS,
+    varridas: linhas.length,
+    candidatos: candidatos.length,
+    itens: candidatos,
+  });
+}));
+
 app.post('/notas-reuniao/sincronizar', exigeAdmin, rota(async (req, res) => {
   const r = await sincronizarNotasReuniao({ dryRun: req.query.aplicar === '1' ? false : NOTAS_REUNIAO_DRY_RUN });
   res.json(r);
@@ -7046,6 +7433,12 @@ module.exports = {
   processarConversa,
   processarConversaDirect,
   equipeEnviouCondicoesDeValor,
+  // Cliente que volta (ver src/cliente-retorno.js) — exportados para test-pipeline.js.
+  janelaAtendimento,
+  consultaDoAtendimento,
+  lerDealsAnteriores,
+  abrirNovoAtendimento,
+  avisarRetornoUmaVez,
   dealEhConsultaGratis,
   extrairDadosAtendimento,
   classificarConversa,

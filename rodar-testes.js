@@ -32,6 +32,8 @@ const TESTES = [
   'test-transcricao.js',
   'test-zapsign.js',
   'test-notas-reuniao.js',
+  'test-cliente-retorno.js',
+  'test-cliente-retorno-flags.js',
 ];
 
 const TZ_TESTES = process.env.TZ_TESTES || 'UTC';

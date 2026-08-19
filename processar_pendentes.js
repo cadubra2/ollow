@@ -1,4 +1,9 @@
 // Processamento direto de conversas pendentes (sem depender do bot web)
+// ATENCAO — este script NAO conhece o segundo atendimento (src/cliente-retorno.js). Ele escreve no
+// negocio que estiver em conversations.deal_id, e a decisao de "cliente voltou com caso novo" vive
+// dentro de processarConversaDirect. Religando uma conversa de cliente que ja foi atendido, confira
+// antes se o deal_id da linha e o do atendimento ATUAL.
+
 require('dotenv').config();
 const https = require('https');
 const Database = require('better-sqlite3');
