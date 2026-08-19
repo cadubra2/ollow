@@ -78,6 +78,20 @@ function pedirCorpo(porta, caminho, corpo) {
   });
 }
 
+// GET que devolve corpo e cabecalhos, nao so o status: a rota de anexo se prova pelo que ENTREGA
+// (bytes do PDF, Content-Type), e um 200 sozinho nao distingue o PDF certo de uma pagina de erro.
+function baixar(porta, caminho) {
+  return new Promise((resolve) => {
+    const req = http.request({ host: '127.0.0.1', port: porta, path: caminho, method: 'GET' }, (res) => {
+      const pedacos = [];
+      res.on('data', (d) => pedacos.push(d));
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, corpo: Buffer.concat(pedacos) }));
+    });
+    req.on('error', () => resolve({ status: 'ERRO', headers: {}, corpo: Buffer.alloc(0) }));
+    req.end();
+  });
+}
+
 const subir = (app, porta) => new Promise((r) => { const s = app.listen(porta, '127.0.0.1', () => r(s)); });
 
 const AUTORIZADO = { 'X-Admin-Token': 'token-de-teste' };
@@ -155,6 +169,57 @@ console.log('\n=== Webhook em periodo de tolerancia (sem WEBHOOK_SECRET) ===');
     db.close();
   }
 
+  console.log('\n=== GET /arquivo-nota/:token/:nome (publica, serve o PDF para o Moskit) ===');
+  {
+    // Esta rota e a UNICA sem autenticacao alem do health check, e por um motivo forte: o
+    // POST /deals/{id}/attachments nao aceita upload — quem baixa o arquivo e o servidor do Moskit,
+    // que nao tem como mandar ADMIN_TOKEN. O que segura a porta e o token de 256 bits + o TTL.
+    const db = new Database(process.env.DB_PATH);
+    const pdf = Buffer.from('%PDF-1.4\n% teste de anexo\n%%EOF\n', 'latin1');
+    const arq = path.join(DIR, 'notas-reuniao-2026-08-14-abcd1234.pdf');
+    fs.writeFileSync(arq, pdf);
+
+    const tokenBom = 'a'.repeat(64);
+    const tokenVelho = 'b'.repeat(64);
+    const tokenSemArquivo = 'c'.repeat(64);
+    const inserir = db.prepare(`
+      INSERT INTO notas_reuniao (gmail_message_id, estado, deal_id, anexo_token, anexo_caminho, anexo_nome, anexo_expira_em)
+      VALUES (?, 'CONCLUIDO', 48292471, ?, ?, ?, ?)
+    `);
+    const daquiUmaHora = new Date(Date.now() + 3600e3).toISOString().replace('T', ' ').slice(0, 19);
+    inserir.run('m-bom', tokenBom, arq, 'notas-reuniao-2026-08-14-abcd1234.pdf', daquiUmaHora);
+    inserir.run('m-velho', tokenVelho, arq, 'notas-reuniao-2026-08-14-abcd1234.pdf', new Date(Date.now() - 3600e3).toISOString().replace('T', ' ').slice(0, 19));
+    inserir.run('m-sem-arq', tokenSemArquivo, path.join(DIR, 'nao-existe.pdf'), 'x.pdf', daquiUmaHora);
+    db.close();
+
+    const ok = await baixar(PORTA, `/arquivo-nota/${tokenBom}/notas-reuniao-2026-08-14-abcd1234.pdf`);
+    checar('token valido devolve 200', ok.status, 200);
+    checar('  Content-Type e PDF', ok.headers['content-type'], 'application/pdf');
+    checar('  bytes entregues sao o PDF', ok.corpo.equals(pdf), true);
+    checar('  nao vai para cache de intermediario', /no-store/.test(ok.headers['cache-control'] || ''), true);
+    checar('  nao entra em indice de busca', /noindex/.test(ok.headers['x-robots-tag'] || ''), true);
+    // O filename sai do BANCO, nunca de req.params: e o mesmo nome que a deduplicacao procura depois
+    // em GET /deals/{id}/attachments.
+    checar('  filename vem do banco', /filename="notas-reuniao-2026-08-14-abcd1234\.pdf"/.test(ok.headers['content-disposition'] || ''), true);
+
+    // O :nome e decorativo — trocar so ele nao pode mudar o arquivo servido, senao viraria seletor.
+    const outroNome = await baixar(PORTA, `/arquivo-nota/${tokenBom}/qualquer-outro-nome.pdf`);
+    checar('nome diferente, mesmo token → mesmo arquivo', outroNome.corpo.equals(pdf), true);
+
+    // Os tres desfechos negativos respondem IGUAL. Distinguir "expirado" de "inexistente" contaria a
+    // quem sondasse que aquele token ja existiu — e quando.
+    checar('token expirado → 404', (await baixar(PORTA, `/arquivo-nota/${tokenVelho}/x.pdf`)).status, 404);
+    checar('token desconhecido → 404', (await baixar(PORTA, `/arquivo-nota/${'d'.repeat(64)}/x.pdf`)).status, 404);
+    checar('token valido mas arquivo sumido → 404', (await baixar(PORTA, `/arquivo-nota/${tokenSemArquivo}/x.pdf`)).status, 404);
+    checar('token fora do formato hex → 404', (await baixar(PORTA, '/arquivo-nota/curto/x.pdf')).status, 404);
+
+    // Path traversal: o :nome NUNCA entra num path.join. Se um dia entrar, este teste cai.
+    const traversal = await baixar(PORTA, `/arquivo-nota/${tokenBom}/${encodeURIComponent('../../../.env')}`);
+    checar('traversal no :nome nao vaza outro arquivo', traversal.corpo.equals(pdf), true);
+    const traversalToken = await baixar(PORTA, `/arquivo-nota/${encodeURIComponent('../../.env')}/x.pdf`);
+    checar('traversal no :token → 404', traversalToken.status, 404);
+  }
+
   server.close();
 
   // As constantes de auth sao lidas no load do modulo, entao cada configuracao precisa do seu
@@ -229,6 +294,48 @@ console.log('\n=== Webhook em periodo de tolerancia (sem WEBHOOK_SECRET) ===');
     checar('POST /webhook continua respondendo (tolerancia)', r.webhook, 200);
   }
 
+
+  console.log('\n=== O bot SOBE mesmo se a migracao do anexo falhar ===');
+  {
+    // O defeito que este teste tranca: `stmtNotaPorAnexoToken` era um `db.prepare` no TOPO do
+    // modulo. Os ALTER TABLE que criam `anexo_token` vivem em `try {} catch {}` como todo o boot —
+    // e esse prepare transformava o catch numa armadilha. Migracao falhando por qualquer motivo que
+    // nao "coluna ja existe" (disco cheio, banco travado, arquivo corrompido) fazia o `require`
+    // lancar `no such column`, o processo morrer com exit 1 e o pm2 entrar em loop de restart.
+    // O bot INTEIRO — WhatsApp, agenda, CRM — caía por causa de uma coluna de uma funcionalidade
+    // que nasce desligada. Medido antes da correcao: exit code 1.
+    //
+    // A simulacao usa uma VIEW chamada `notas_reuniao`: o `CREATE TABLE IF NOT EXISTS` pula em
+    // silencio (ja existe objeto com o nome) e o `ALTER TABLE` falha de verdade ("Cannot add a
+    // column to a view"), reproduzindo exatamente "as colunas nao existem e nao da para cria-las".
+    const dbQuebrado = path.join(DIR, 'migracao-impossivel.db');
+    const d = new Database(dbQuebrado);
+    d.exec('CREATE TABLE base (gmail_message_id TEXT PRIMARY KEY, estado TEXT)');
+    d.exec('CREATE VIEW notas_reuniao AS SELECT * FROM base');
+    d.close();
+
+    let subiu = true;
+    let r = null;
+    try {
+      r = emSubprocesso(
+        { WORKER_MODE: '1', ADMIN_TOKEN: 't', WEBHOOK_SECRET: '', DB_PATH: dbQuebrado },
+        `${CLIENTE_HTTP(3995)}
+         const { app }=require('./index.js');
+         const s=app.listen(3995,'127.0.0.1',async()=>{
+           console.log(JSON.stringify({
+             saude: await p('/','GET'),
+             anexo: await p('/arquivo-nota/${'a'.repeat(64)}/x.pdf','GET'),
+           }));
+           s.close(); process.exit(0);
+         });`
+      );
+    } catch { subiu = false; }
+
+    checar('o processo SOBE com a migracao impossivel', subiu, true);
+    checar('   e o resto do bot continua servindo', r && r.saude, 200);
+    // O pior caso vira um 404 nesta rota — o mesmo que ela ja responde para token invalido.
+    checar('   a rota de anexo degrada para 404, nao derruba nada', r && r.anexo, 404);
+  }
 
   console.log(`\n${falhou === 0 ? '✅' : '❌'} ${passou} passaram, ${falhou} falharam\n`);
   process.exit(falhou === 0 ? 0 : 1);

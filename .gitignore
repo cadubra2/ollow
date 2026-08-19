@@ -30,6 +30,11 @@ ngrok.log
 # Comprovantes de pagamento baixados dos clientes.
 comprovantes/
 
+# PDFs das notas de reuniao, servidos temporariamente para o Moskit baixar. Sao transcricoes de
+# consulta juridica: nunca podem ir para o repositorio. A rotina os apaga assim que o Moskit
+# confirma a copia (ou quando o TTL vence), entao a pasta costuma estar vazia.
+notas-reuniao/
+
 # URL publica do tunel — muda a cada boot e nao deve ser versionada.
 tunnel_url.txt
 

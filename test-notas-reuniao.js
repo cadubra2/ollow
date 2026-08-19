@@ -17,6 +17,7 @@ const {
   prepararTextoFonte,
   validarExtracao,
   marcadorNota,
+  nomeAnexoNota,
   montarTextoNota,
 } = require('./src/notas-reuniao');
 
@@ -509,6 +510,56 @@ console.log('\n=== Marcador e texto da nota ===');
   checar('truncagem avisada na nota', texto.includes('TRECHO INICIAL foi omitido'));
   checar('ausencia de transcricao avisada', texto.includes('Sem transcrição literal'));
   checar('aviso de ancoragem chega ao rodape', texto.includes('R$ 9.900,00'), texto);
+}
+
+// ------------------------------------------------------------
+console.log('\n=== Nome do anexo (PDF na aba Arquivos) ===');
+
+{
+  // O determinismo NAO e detalhe estetico: o POST /deals/{id}/attachments so aceita uma url, sem
+  // lugar para marcador dentro do arquivo. Depois de um crash entre "vou anexar" e "anexei", a unica
+  // pergunta possivel ao CRM e "existe anexo com este nome?". Nome instavel = resposta sempre "nao"
+  // = segunda copia da transcricao no prontuario do cliente.
+  const marcador = marcadorNota('msg-abc', 'doc-xyz');
+  const a = nomeAnexoNota(marcador, '2026-08-14');
+  const b = nomeAnexoNota(marcadorNota('msg-abc', 'doc-xyz'), '2026-08-14');
+  checar('nome do anexo e estavel entre execucoes', a === b, a);
+  checar('termina em .pdf', a.endsWith('.pdf'), a);
+  checar('carrega a data da reuniao', a.includes('2026-08-14'), a);
+
+  const hash = marcador.match(/\[ollow-notas:([a-f0-9]+)\]/)[1];
+  checar('sufixo e o MESMO hash do marcador da nota', a.includes(hash), a);
+
+  // Origem diferente tem que produzir nome diferente, senao a nota de um cliente encontraria o anexo
+  // de outro na deduplicacao e o PDF certo nunca subiria.
+  const outro = nomeAnexoNota(marcadorNota('msg-zzz', 'doc-xyz'), '2026-08-14');
+  checar('origem diferente => nome diferente', a !== outro, { a, outro });
+
+  // Mesma origem, dias diferentes: duas consultas do mesmo cliente sao dois arquivos.
+  const outroDia = nomeAnexoNota(marcador, '2026-08-15');
+  checar('data diferente => nome diferente', a !== outroDia, { a, outroDia });
+
+  // Entradas degeneradas nao podem gerar caminho estranho — o nome vai para dentro de um
+  // Content-Disposition e para a comparacao com o filename devolvido pelo Moskit.
+  const semNada = nomeAnexoNota(null, null);
+  checar('sem marcador/data ainda produz nome valido', /^notas-reuniao-[\w-]+\.pdf$/.test(semNada), semNada);
+  checar('nome nunca contem separador de caminho', !/[\\/]/.test(nomeAnexoNota('lixo', '../../etc')), nomeAnexoNota('lixo', '../../etc'));
+}
+
+{
+  const base = {
+    extracao: { resumo_caso: 'x', teses_estrategia: '', documentos_solicitados: [], proposta_valores: '', dados_criticos: '', proximos_passos: [] },
+    avisos: [],
+    marcador: marcadorNota('m3', 'd3'),
+  };
+  const com = montarTextoNota({ ...base, meta: { anexado: true } });
+  const sem = montarTextoNota({ ...base, meta: { anexado: false } });
+
+  checar('rodape anuncia o anexo quando ele existe', com.includes('anexada na aba Arquivos'), com);
+  // O silencio e o ponto: prometer um arquivo que nao subiu manda o advogado procurar o que nao esta
+  // la — pior que nao mencionar nada.
+  checar('rodape NAO promete anexo quando ele falhou', !sem.includes('anexada na aba Arquivos'), sem);
+  checar('sem anexo, o resto da nota fica igual', sem.includes('Resumo gerado por IA'));
 }
 
 // ------------------------------------------------------------
