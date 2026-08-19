@@ -123,7 +123,7 @@ const {
   descreverAncora, somarMinutosNaive, formatarHorarioEscritorio,
   stmtsNotas, registrarFalhaNota, conferirSilencioNotas, processarNotaReuniao,
   anexarDocNoDeal, anexoComNomeExiste, retomarAnexosPendentes, limparAnexosExpirados,
-  enviarTelegram, baixarParaArquivo,
+  enviarTelegram, baixarParaArquivo, montarHeadersAnexo, ehHostZernio,
   garantirDealExiste, importarContatosMoskit,
   sincronizarAtividadesMoskit, comSufixoDealId, comMarcadorDeal,
   processarConversaDirect, montarHistorico, equipeEnviouCondicoesDeValor,
@@ -2414,6 +2414,32 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     }
     igual('nenhuma requisicao foi feita', rede.chamadas.length, 0);
     igual('   e nenhum arquivo foi criado', fs.existsSync(destino), false);
+  }
+
+  console.log('\n=== Download de anexo: qual credencial vai junto ===');
+  // MEDIDO em 19/08/2026 contra a API real, mesma rota e mesma chave, so trocando o esquema:
+  //   Authorization: Bearer -> 200 | apikey -> 401
+  // baixarParaArquivo era a UNICA chamada ao Zernio do arquivo que mandava `apikey`, e por isso a
+  // unica que falhava: 113 erros 401 no log e nenhum comprovante verificado desde 24/07 — a foto do
+  // PIX nunca chegava na IA de visao, o negocio nao avancava, o Telegram nao avisava que o cliente
+  // pagou, e o audio do cliente parou de ser transcrito pelo mesmo caminho.
+  {
+    const headersDe = (url) => montarHeadersAnexo(new URL(url)).headers;
+    const zernio = headersDe('https://zernio.com/api/v1/whatsapp/media/123');
+
+    checar('URL do Zernio leva Authorization: Bearer', /^Bearer /.test(zernio.Authorization || ''), zernio);
+    checar('   e NAO leva o header apikey (o esquema que a API recusa com 401)', !('apikey' in zernio), zernio);
+    checar('subdominio do Zernio tambem leva a credencial', /^Bearer /.test(headersDe('https://cdn.zernio.com/x').Authorization || ''));
+
+    // A URL vem do webhook: link assinado de CDN nao precisa de auth, e mandar a chave do escritorio
+    // para um host de terceiro e vazamento de credencial. Era o que o codigo fazia com `apikey`.
+    const meta = headersDe('https://lookaside.fbsbx.com/whatsapp_business/attachments/?mid=abc');
+    igual('CDN de terceiro NAO recebe credencial nenhuma', Object.keys(meta).length, 0);
+    // Sufixo sem ponto: "malzernio.com" nao e o Zernio, e um endsWith ingenuo entregaria a chave.
+    igual('host que so TERMINA em zernio.com nao recebe a chave', Object.keys(headersDe('https://malzernio.com/x')).length, 0);
+    checar('ehHostZernio: exato e subdominio sim, sufixo colado nao',
+      ehHostZernio('zernio.com') && ehHostZernio('api.zernio.com') && !ehHostZernio('malzernio.com') && !ehHostZernio(''),
+      [ehHostZernio('zernio.com'), ehHostZernio('api.zernio.com'), ehHostZernio('malzernio.com')]);
   }
 
   console.log('\n=== Anexo do Doc do Gemini na aba "Arquivos" ===');
