@@ -123,7 +123,7 @@ const {
   descreverAncora, somarMinutosNaive, formatarHorarioEscritorio,
   stmtsNotas, registrarFalhaNota, conferirSilencioNotas, processarNotaReuniao,
   anexarDocNoDeal, anexoComNomeExiste, retomarAnexosPendentes, limparAnexosExpirados,
-  enviarTelegram, baixarParaArquivo, montarHeadersAnexo, ehHostZernio,
+  enviarTelegram, baixarParaArquivo, montarHeadersAnexo, ehHostZernio, resolverUrlAnexo,
   garantirDealExiste, importarContatosMoskit,
   sincronizarAtividadesMoskit, comSufixoDealId, comMarcadorDeal,
   processarConversaDirect, montarHistorico, equipeEnviouCondicoesDeValor,
@@ -2440,6 +2440,24 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     checar('ehHostZernio: exato e subdominio sim, sufixo colado nao',
       ehHostZernio('zernio.com') && ehHostZernio('api.zernio.com') && !ehHostZernio('malzernio.com') && !ehHostZernio(''),
       [ehHostZernio('zernio.com'), ehHostZernio('api.zernio.com'), ehHostZernio('malzernio.com')]);
+  }
+
+  console.log('\n=== Download de anexo: a URL da midia vem RELATIVA ===');
+  // MEDIDO em 19/08/2026 contra a API real: 9 de 9 anexos das conversas recentes vieram como
+  // "/api/v1/whatsapp/media/<id>?accountId=...". `new URL()` recusa isso, entao o download morria em
+  // "URL invalida" ANTES da rede — e por isso sincronizarConversas, a rede de seguranca do webhook,
+  // nunca baixou comprovante nem audio nenhum.
+  {
+    const resolvida = resolverUrlAnexo('/api/v1/whatsapp/media/1756300478897860?accountId=6a60a6');
+    igual('caminho /api/ vira URL absoluta do Zernio', resolvida, 'https://zernio.com/api/v1/whatsapp/media/1756300478897860?accountId=6a60a6');
+    checar('   e a resolvida leva a credencial (host do Zernio)', /^Bearer /.test(montarHeadersAnexo(new URL(resolvida)).headers.Authorization || ''));
+    igual('URL absoluta passa intacta', resolverUrlAnexo('https://zernio.com/x'), 'https://zernio.com/x');
+
+    // Resolver QUALQUER string contra a base transformaria lixo em requisicao. Estes continuam
+    // recusados sem tocar a rede (o bloco anterior ja afirma isso ponta a ponta).
+    igual('caminho local NAO e resolvido', resolverUrlAnexo('/caminho/local'), '/caminho/local');
+    igual('texto solto NAO e resolvido', resolverUrlAnexo('nao-e-url'), 'nao-e-url');
+    igual('vazio NAO e resolvido', resolverUrlAnexo(undefined), '');
   }
 
   console.log('\n=== Anexo do Doc do Gemini na aba "Arquivos" ===');

@@ -801,8 +801,16 @@ comportamento não mediria o status quo.
   de terceiro é vazamento de credencial — e era o que o código fazia, para qualquer URL que chegasse.
   A comparação é por hostname exato ou sufixo **com ponto**, porque `endsWith('zernio.com')` ingênuo
   entregaria a chave para `malzernio.com` (tem regressão). Daqui para a frente, `401`/`403` em host do
-  Zernio significa chave inválida de verdade; em CDN de terceiro, link expirado. Regressões em
-  `test-pipeline.js`.
+  Zernio significa chave inválida de verdade; em CDN de terceiro, link expirado.
+  **E a URL da mídia vem RELATIVA.** MEDIDO no mesmo dia: 9 de 9 anexos das conversas recentes
+  chegaram como `/api/v1/whatsapp/media/<id>?accountId=...`. `new URL()` recusa isso, então o
+  download morria em "Anexo com URL inválida" **antes** de tocar a rede — por isso
+  `sincronizarConversas`, que é a rede de segurança para o que o webhook perde, nunca baixou nada.
+  Os dois caminhos estavam quebrados por motivos diferentes, com o mesmo sintoma de "nada acontece":
+  o webhook entrega a mídia absoluta e caía no 401; o polling entrega relativa e caía no parse.
+  `resolverUrlAnexo` resolve **apenas** caminho que começa em `/api/` contra `https://zernio.com` —
+  resolver qualquer string contra a base transformaria lixo em requisição, e `"/caminho/local"` e
+  `"nao-e-url"` continuam recusados sem tocar a rede. Regressões em `test-pipeline.js`.
 
 ## Environment
 
