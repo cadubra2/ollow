@@ -661,6 +661,24 @@ A nota traz o resumo; o Doc que o Gemini gera vira **anexo** no mesmo negócio (
   varrido tudo. Ver `listarAtividadesMoskit`. Atenção: em `/contacts` quem pagina é o
   `x-moskit-listing-next-page-token` (`buscarOuCriarContato`) — o mecanismo **difere por endpoint**,
   não assuma. `deal.status` só aceita `OPEN`/`WON`/`LOST`.
+  **`PUT /deals/{id}` tem que reenviar `activities`, senão o Moskit recusa o negócio inteiro.** MEDIDO
+  em 19/08/2026 no deal 48441223: o PUT é *full replace*, e **omitir** `activities` significa para o
+  Moskit "desvincule estas atividades" — o que ele recusa quando alguma já foi concluída, devolvendo
+  `422 {"messageError":"Completed activity cannot be updated","field":"oldActivities"}`. O campo
+  `oldActivities` não existe em nenhum payload nosso: é o nome interno com que ele compara o corpo
+  recebido contra o estado atual. Experimento controlado (mesmo payload, só trocando a presença do
+  campo): **422 sem, 200 com**. O sintoma em produção: a consulta de 13/08 foi marcada concluída na
+  mão em 17/08 e, a partir dali, **toda** atualização daquele negócio falhou — o chat 553799437737
+  queimou as 3 tentativas da fila e foi descartado em silêncio. Não é caso raro: consulta concluída é
+  o caminho **normal** de sucesso, então o defeito atingia justamente os negócios bem atendidos.
+  `putDealComVerificacao` nunca sofreu disso porque envia o corpo do `GET` inteiro;
+  `atualizarNegocioMoskit` monta o payload do zero e por isso precisa preservar o campo à mão, como já
+  fazia com `name` e `stage`. Regressão em `test-pipeline.js`.
+  **Rate limit: 6 req/s e 240/min** (documentado em "Limite de requisições"), com headers
+  `X-RateLimit-Remaining-Second`/`-Minute` que **nenhum código nosso lê ainda**. O 429 aparece com
+  facilidade — bastaram três requisições quase simultâneas numa sondagem de leitura. É por isso que
+  toda varredura tem pausa entre itens (`VINCULO_PAUSA_MS`, `SYNC_ATIVIDADES_PAUSA_MS`,
+  `NOTAS_ANEXO_PAUSA_MS`).
   **Autoria dos campos personalizados**: o bot guarda em `custom_fields_bot` o último valor que ele
   mesmo escreveu; se o CRM divergir disso, alguém corrigiu na mão — o campo entra em
   `campos_travados` e o bot nunca mais o sobrescreve (`filtrarCamposPorAutoria`). `TIPO_CONSULTA`
@@ -669,6 +687,19 @@ A nota traz o resumo; o Doc que o Gemini gera vira **anexo** no mesmo negócio (
   interativo) — necessário para gerar link de Meet e convidar participantes por e-mail.
 - **Telegram**: notifica comprovantes recebidos e conversas descartadas da fila após
   `MAX_TENTATIVAS` falhas.
+  **O `parse_mode: 'Markdown'` é uma tentativa, não um requisito.** MEDIDO em 19/08/2026: `400` do
+  Telegram repetido nos logs de produção. Basta o texto interpolar um nome de arquivo com `_`
+  desbalanceado — e comprovante de WhatsApp se chama `comprovante_pix_18.pdf` — para o Telegram
+  recusar a **mensagem inteira**. O aviso de comprovante recebido, que é o único jeito de o escritório
+  saber que o cliente pagou, sumia em silêncio. `enviarTelegram` agora reenvia sem formatação quando
+  o erro é `400`; `401`/`403` (token errado, bot bloqueado) **não** são reenviados, porque tirar o
+  Markdown não conserta credencial. Regressão em `test-pipeline.js`.
+- **Download de anexo do WhatsApp** (`baixarParaArquivo`): valida a URL **antes** do axios e o log
+  identifica o **host** (nunca a URL inteira — é mídia de cliente) mais o status. MEDIDO em
+  19/08/2026: 118 ocorrências de `Erro ao baixar anexo: 401` em produção, nenhuma dizendo de onde —
+  impossível saber se era `ZERNIO_API_KEY` errada ou link assinado da Meta que expirou, que pedem
+  consertos opostos. `401`/`403` em URL de mídia costuma ser link expirado; em host do Zernio, suspeite
+  da chave. A causa raiz dos 118 continua **em aberto** — depende de uma ocorrência com o log novo.
 
 ## Environment
 

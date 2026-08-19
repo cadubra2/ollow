@@ -219,6 +219,12 @@ const NOTAS_ANEXO_TTL_HORAS = Number(process.env.NOTAS_ANEXO_TTL_HORAS) || 24;
 // Mesmo teto e mesmo motivo de NOTAS_MAX_TENTATIVAS: falha permanente (deal apagado, Doc sem
 // permissao) nao pode reprocessar para sempre em silencio.
 const NOTAS_ANEXO_MAX_TENTATIVAS = Number(process.env.NOTAS_ANEXO_MAX_TENTATIVAS) || 3;
+// Pausa entre anexos de uma mesma varredura, no mesmo espirito de VINCULO_PAUSA_MS. MEDIDO em
+// 19/08/2026 contra a API real: o limite e 6 req/s (240/min) e o 429 aparece com FACILIDADE — bastaram
+// tres requisicoes quase simultaneas numa sondagem de leitura. Cada anexo custa 1 GET de dedup + 1
+// POST + ate 3 GETs de conferencia, entao uma varredura sem pausa e exatamente o tipo de rajada que
+// derruba a rotina inteira em 429.
+const NOTAS_ANEXO_PAUSA_MS = Number(process.env.NOTAS_ANEXO_PAUSA_MS) || 400;
 
 let googleOAuthClientNotas = null;
 function getGoogleAuthClientNotas() {
@@ -1405,6 +1411,21 @@ async function atualizarNegocioMoskit(dealId, dados, contactId, opcoes = {}) {
       // que moverParaEstagio/a equipe tinham avancado.
       const stageAtual = atualRes.data?.stage?.id;
       if (stageAtual) payload.stage = { id: stageAtual };
+
+      // Atividades: reenviadas COMO VIERAM do GET. O PUT e full replace, e omitir `activities`
+      // significa para o Moskit "desvincule estas atividades" — o que ele RECUSA quando alguma ja foi
+      // concluida, derrubando o PUT inteiro com 422 `field: oldActivities`.
+      //
+      // MEDIDO em 19/08/2026 no deal 48441223: a consulta de 13/08 foi marcada como concluida na mao
+      // (`doneDate` 17/08, `doneSource: MANUAL`) e, a partir dali, TODA atualizacao daquele negocio
+      // passou a falhar — o chat 553799437737 queimou as 3 tentativas da fila e foi descartado sem
+      // que ninguem soubesse. Experimento controlado (mesmo payload, so trocando a presenca deste
+      // campo): 422 sem, 200 com.
+      //
+      // Nao e caso raro — consulta concluida e o caminho NORMAL de sucesso. Ou seja: todo negocio bem
+      // atendido acabava impedido de receber qualquer atualizacao no CRM. `putDealComVerificacao`
+      // nunca sofreu disso porque envia o corpo do GET inteiro; esta linha alinha os dois caminhos.
+      if (Array.isArray(atualRes.data?.activities)) payload.activities = atualRes.data.activities;
 
       if (dealEhConsultaGratis(atualRes.data)) {
         const novoTipo = payload.entityCustomFields.find((c) => c.id === CF_TIPO_CONSULTA);
@@ -5498,7 +5519,39 @@ async function backfillDeals() {
 
 // Transporte comum do download de anexos da Zernio (comprovante e audio): streama para o disco e
 // devolve o caminho do arquivo, ou null se nao conseguiu baixar.
+// MEDIDO em 19/08/2026: 118 ocorrencias de "Erro ao baixar anexo: 401" nos logs de producao, e nem
+// uma delas dizia QUAL url, de que host, ou se a chave tinha sido enviada — o erro era impossivel de
+// diagnosticar sem reproduzir. Tambem havia "Invalid URL", que e o axios recebendo algo que nem e
+// endereco.
+//
+// O host importa mais que a url: se o anexo vem de CDN da Meta/WhatsApp, mandar o header `apikey` do
+// Zernio nao ajuda e a url e assinada e curta — 401 ali significa "expirou", nao "credencial errada".
+// Se vem do proprio Zernio, 401 aponta para a chave. Sao consertos opostos, e o log agora distingue.
+//
+// A url NAO vai inteira para o log de proposito: ela e um link direto para midia de cliente.
+function descreverUrlAnexo(url) {
+  try {
+    const u = new URL(String(url));
+    return `${u.host}${u.pathname.length > 40 ? u.pathname.slice(0, 40) + '…' : u.pathname}`;
+  } catch {
+    return '(url invalida)';
+  }
+}
+
 async function baixarParaArquivo(url, caminho) {
+  // Barra antes do axios: sem isto o unico sintoma era "Invalid URL", sem dizer o que chegou.
+  let alvo;
+  try {
+    alvo = new URL(String(url));
+  } catch {
+    console.error(`  ❌ Anexo com URL invalida (${JSON.stringify(String(url).slice(0, 60))}) — nada a baixar`);
+    return null;
+  }
+  if (!/^https?:$/.test(alvo.protocol)) {
+    console.error(`  ❌ Anexo com protocolo inesperado (${alvo.protocol}) — nao vou buscar`);
+    return null;
+  }
+
   try {
     const response = await axios({
       method: 'GET',
@@ -5514,7 +5567,14 @@ async function baixarParaArquivo(url, caminho) {
     });
     return caminho;
   } catch (e) {
-    console.error(`  ❌ Erro ao baixar anexo: ${e.message}`);
+    const status = e.response?.status;
+    const comChave = ZERNIO_API_KEY ? 'com apikey' : 'SEM apikey';
+    console.error(
+      `  ❌ Erro ao baixar anexo de ${descreverUrlAnexo(url)} (${status ? `HTTP ${status}` : e.message}, ${comChave})` +
+      (status === 401 || status === 403
+        ? ' — 401/403 em URL de midia costuma ser link assinado que EXPIROU; em host do Zernio, suspeite da ZERNIO_API_KEY'
+        : '')
+    );
     return null;
   }
 }
@@ -5821,29 +5881,46 @@ async function exportarPdfDoDoc(drive, docId) {
 // Pagina com `?start=`: medido em 16/08/2026, /deals/{id}/notes devolve 10 por pagina e ignora
 // `limit`. O deal da Lia ja tinha 40 notas — olhar so a primeira pagina responderia "nao achei" para
 // uma nota que existe.
-async function notaComMarcadorExiste(dealId, marcador) {
-  let vistas = 0;
+// Paginador das rotas de coleção de um deal (`/notes`, `/attachments`).
+//
+// Existe para ser UM lugar só: o `?start=` é a única paginação que estas rotas respeitam (medido em
+// 16/08/2026 — `limit` é ignorado e a página é sempre 10), e a regra "página incompleta = fim" é a
+// mesma nas duas. Antes eram duas cópias linha-a-linha; a diferença real cabia em três linhas.
+//
+// Devolve o item achado, ou `null`. Bater no teto de páginas **lança**: "não achei" e "não terminei
+// de procurar" levam a ações opostas, e confundir os dois é exatamente como se duplica uma nota ou
+// um anexo no prontuário do cliente.
+async function acharEmColecaoDoDeal({ rota, achar, descricao }) {
+  let vistos = 0;
 
   for (let pagina = 0; pagina < NOTAS_MAX_PAGINAS_BUSCA; pagina++) {
-    const res = await axios.get(`${MOSKIT_BASE}/deals/${dealId}/notes`, {
-      params: { start: vistas },
+    const res = await axios.get(`${MOSKIT_BASE}${rota}`, {
+      params: { start: vistos },
       headers: apiHeaders,
       validateStatus: (s) => s < 500,
     });
     if (res.status < 200 || res.status >= 300) {
-      throw new Error(`GET /deals/${dealId}/notes devolveu HTTP ${res.status}`);
+      throw new Error(`GET ${rota} devolveu HTTP ${res.status}`);
     }
 
     const lote = Array.isArray(res.data) ? res.data : [];
-    if (lote.some((n) => String(n?.description || '').includes(marcador))) return true;
+    const achado = lote.find(achar);
+    if (achado) return achado;
 
-    vistas += lote.length;
-    if (lote.length < 10) return false; // pagina incompleta = fim da lista
+    vistos += lote.length;
+    if (lote.length < 10) return null; // pagina incompleta = fim da lista
   }
 
-  // Chegou ao teto sem achar. NAO devolve false: "nao achei" e "nao terminei de procurar" levam a
-  // acoes opostas, e confundir os dois e como se duplicaria a nota.
-  throw new Error(`busca do marcador no deal ${dealId} atingiu o teto de ${NOTAS_MAX_PAGINAS_BUSCA} paginas`);
+  throw new Error(`${descricao} atingiu o teto de ${NOTAS_MAX_PAGINAS_BUSCA} paginas`);
+}
+
+async function notaComMarcadorExiste(dealId, marcador) {
+  const achado = await acharEmColecaoDoDeal({
+    rota: `/deals/${dealId}/notes`,
+    achar: (n) => String(n?.description || '').includes(marcador),
+    descricao: `busca do marcador no deal ${dealId}`,
+  });
+  return !!achado;
 }
 
 // Procura, na aba Arquivos do negocio, um anexo com este nome exato.
@@ -5856,30 +5933,12 @@ async function notaComMarcadorExiste(dealId, marcador) {
 // Pagina por `start`, o unico parametro que a doc declara para esta rota. Em /activities foi medido
 // que `page`, `offset` e afins sao ignorados EM SILENCIO, devolvendo a primeira pagina de novo — um
 // loop errado aqui reler os mesmos 10 registros e pareceria ter varrido tudo.
-async function anexoComNomeExiste(dealId, nome) {
-  let vistos = 0;
-
-  for (let pagina = 0; pagina < NOTAS_MAX_PAGINAS_BUSCA; pagina++) {
-    const res = await axios.get(`${MOSKIT_BASE}/deals/${dealId}/attachments`, {
-      params: { start: vistos },
-      headers: apiHeaders,
-      validateStatus: (s) => s < 500,
-    });
-    if (res.status < 200 || res.status >= 300) {
-      throw new Error(`GET /deals/${dealId}/attachments devolveu HTTP ${res.status}`);
-    }
-
-    const lote = Array.isArray(res.data) ? res.data : [];
-    const achado = lote.find((a) => a?.filename === nome);
-    if (achado) return achado;
-
-    vistos += lote.length;
-    if (lote.length < 10) return null; // pagina incompleta = fim da lista
-  }
-
-  // Mesma regra da busca de nota: "nao achei" e "nao terminei de procurar" levam a acoes OPOSTAS, e
-  // confundir as duas e exatamente como se anexa a transcricao duas vezes no mesmo negocio.
-  throw new Error(`busca do anexo no deal ${dealId} atingiu o teto de ${NOTAS_MAX_PAGINAS_BUSCA} paginas`);
+function anexoComNomeExiste(dealId, nome) {
+  return acharEmColecaoDoDeal({
+    rota: `/deals/${dealId}/attachments`,
+    achar: (a) => a?.filename === nome,
+    descricao: `busca do anexo no deal ${dealId}`,
+  });
 }
 
 // Anexa o PDF do Doc do Gemini na aba "Arquivos" do negocio.
@@ -6089,7 +6148,11 @@ async function retomarAnexosPendentes({ stmts, drive, dryRun, limite = 5 }) {
   const pendentes = stmts.anexosPendentes.all({ maxTentativas: NOTAS_ANEXO_MAX_TENTATIVAS, limite });
   let resolvidos = 0;
 
-  for (const linha of pendentes) {
+  for (const [i, linha] of pendentes.entries()) {
+    // Pausa ENTRE os itens (nunca antes do primeiro): o limite do Moskit e 6 req/s e cada anexo custa
+    // varias chamadas. Sem isto a varredura viraria uma rajada e o 429 mataria os itens seguintes.
+    if (i > 0) await new Promise((r) => setTimeout(r, NOTAS_ANEXO_PAUSA_MS));
+
     const r = await anexarDocNoDeal({
       dealId: linha.deal_id,
       docId: linha.doc_id,
@@ -6645,19 +6708,46 @@ app.post('/notas-reuniao/sincronizar', exigeAdmin, rota(async (req, res) => {
   res.json(r);
 }));
 
+// Aviso e o unico canal pelo qual o escritorio descobre comprovante recebido, orfao de nota e
+// remarcacao travada. Perder um por formatacao e pior que manda-lo feio.
+//
+// MEDIDO em 19/08/2026: 400 do Telegram aparecendo repetidas vezes nos logs de producao. A causa e o
+// `parse_mode: 'Markdown'` — basta o texto interpolar um nome de arquivo com `_` desbalanceado (e
+// comprovante de WhatsApp se chama `comprovante_pix_18.pdf`) para o Telegram recusar a mensagem
+// inteira. O aviso simplesmente nao chegava, e o unico rastro era esta linha de erro.
+//
+// Agora o Markdown e uma TENTATIVA: recusada, o mesmo texto vai como plain text. Alerta feio chega;
+// alerta nenhum, nao.
 async function enviarTelegram(texto) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
   if (!token || !chatId) return;
+
+  const enviar = (comMarkdown) => axios.post(`https://api.telegram.org/bot${token}/sendMessage`, {
+    chat_id: chatId,
+    text: texto,
+    ...(comMarkdown ? { parse_mode: 'Markdown' } : {}),
+  });
+
   try {
-    await axios.post(`https://api.telegram.org/bot${token}/sendMessage`, {
-      chat_id: chatId,
-      text: texto,
-      parse_mode: 'Markdown',
-    });
-    console.log(`  ✅ Notificacao enviada ao Telegram`);
+    await enviar(true);
+    console.log('  ✅ Notificacao enviada ao Telegram');
+    return;
   } catch (e) {
-    console.error(`  ❌ Erro ao notificar Telegram: ${e.message}`);
+    // Só 400 é problema de formatação. 401/403 (token errado, bot bloqueado) e falha de rede não se
+    // resolvem tirando o Markdown — reenviar ali seria só gastar uma segunda chamada para o mesmo erro.
+    if (e.response?.status !== 400) {
+      console.error(`  ❌ Erro ao notificar Telegram: ${e.message}`);
+      return;
+    }
+    console.error(`  ⚠️ Telegram recusou o Markdown (${e.response?.data?.description || '400'}) — reenviando como texto puro`);
+  }
+
+  try {
+    await enviar(false);
+    console.log('  ✅ Notificacao enviada ao Telegram (sem formatacao)');
+  } catch (e) {
+    console.error(`  ❌ Erro ao notificar Telegram, mesmo sem formatacao: ${e.message}`);
   }
 }
 
@@ -6963,6 +7053,9 @@ module.exports = {
   mergeDados,
   montarPayloadMoskit,
   enviarTelegram, // worker.js avisa quando desiste de uma conversa
+  // Exportado para regressao: a guarda de URL invalida e o log que identifica o host sao o que
+  // tornou os 401 de download diagnosticaveis.
+  baixarParaArquivo,
   // Exportadas para teste (test-pipeline.js / test-guards-internos.js). Sao as funcoes novas dos
   // Lotes 1 e 2 que nao tinham nenhuma cobertura. registrarAgendamentoPendente fica de fora de
   // proposito: e totalmente observavel atraves de handleAgendamentoCalendar.

@@ -86,6 +86,7 @@ const {
   descreverAncora, somarMinutosNaive, formatarHorarioEscritorio,
   stmtsNotas, registrarFalhaNota, conferirSilencioNotas, processarNotaReuniao,
   anexarDocNoDeal, anexoComNomeExiste, retomarAnexosPendentes, limparAnexosExpirados,
+  enviarTelegram, baixarParaArquivo,
   garantirDealExiste, importarContatosMoskit,
   sincronizarAtividadesMoskit, comSufixoDealId, comMarcadorDeal,
 } = require('./index');
@@ -221,6 +222,40 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     igual('campo realmente pegou → resolve', erro, null);
     igual('   fez 2 GET (leitura de merge + 1 conferencia)', de('GET', '/deals/20').length, 2);
     igual('   fez 1 PUT', de('PUT', '/deals/20').length, 1);
+  }
+  {
+    // MEDIDO em 19/08/2026 no deal 48441223: o PUT e full replace, e OMITIR `activities` significa
+    // para o Moskit "desvincule estas atividades". Ele recusa quando alguma ja foi concluida e
+    // derruba o PUT inteiro com 422 `field: oldActivities`.
+    //
+    // O caso real: a consulta de 13/08 foi marcada como concluida na mao em 17/08, e a partir dali
+    // TODA atualizacao daquele negocio falhou — o chat 553799437737 queimou as 3 tentativas da fila
+    // e foi descartado em silencio. E consulta concluida e o caminho NORMAL de sucesso, ou seja o
+    // defeito atingia justamente os negocios bem atendidos.
+    limpar();
+    const ATIVIDADES = [{ id: 79974205 }];
+    let seq = [
+      { id: 24, name: 'Cliente sem nome', stage: { id: 179388 }, entityCustomFields: [], activities: ATIVIDADES },
+      { id: 24, entityCustomFields: CF_AREA },
+    ];
+    rede.get = () => ({ status: 200, data: seq.shift() });
+    const erro = await esperarErro(() => atualizarNegocioMoskit(24, DADOS_AREA, 555, {}));
+    igual('deal com atividade → resolve', erro, null);
+    const corpo = de('PUT', '/deals/24')[0]?.corpo;
+    checar('   o PUT REENVIA activities (senao o Moskit devolve 422)', JSON.stringify(corpo?.activities) === JSON.stringify(ATIVIDADES), corpo?.activities);
+  }
+  {
+    // Deal sem atividade nenhuma: o campo nao deve ser inventado. Mandar `activities: []` seria
+    // dizer "desvincule tudo" — a mesma frase que causa o 422, agora por excesso de zelo.
+    limpar();
+    let seq = [
+      { id: 25, name: 'Cliente sem nome', stage: { id: 179388 }, entityCustomFields: [] },
+      { id: 25, entityCustomFields: CF_AREA },
+    ];
+    rede.get = () => ({ status: 200, data: seq.shift() });
+    await esperarErro(() => atualizarNegocioMoskit(25, DADOS_AREA, 555, {}));
+    const corpo = de('PUT', '/deals/25')[0]?.corpo;
+    igual('   GET sem activities → o PUT nao inventa o campo', corpo && 'activities' in corpo, false);
   }
   {
     // Exatamente o sintoma do deal 48423360: Moskit aceita o PUT (2xx) mas a area do direito nunca
@@ -2281,6 +2316,62 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
 
 
   // ------------------------------------------------------------
+  console.log('\n=== Telegram: aviso nao se perde por formatacao ===');
+  {
+    // MEDIDO em producao (19/08/2026): 400 do Telegram repetidas vezes. Causa: `parse_mode: Markdown`
+    // com nome de arquivo interpolado fora de backticks — `comprovante_pix_18.pdf` tem `_`
+    // desbalanceado e o Telegram recusa a mensagem INTEIRA. O aviso de comprovante recebido, que e o
+    // unico jeito de o escritorio saber que o cliente pagou, sumia em silencio.
+    limpar();
+    let tentativas = [];
+    rede.post = (url, corpo) => {
+      if (!url.includes('api.telegram.org')) return { status: 200, data: {} };
+      tentativas.push(corpo.parse_mode || '(sem parse_mode)');
+      if (corpo.parse_mode === 'Markdown') {
+        const e = new Error('Request failed with status code 400');
+        e.response = { status: 400, data: { description: "can't parse entities" } };
+        throw e;
+      }
+      return { status: 200, data: {} };
+    };
+
+    await enviarTelegram('📸 Arquivo: comprovante_pix_18.pdf');
+    igual('Markdown recusado → reenvia', tentativas.length, 2);
+    igual('   a 1a tentativa usou Markdown', tentativas[0], 'Markdown');
+    igual('   a 2a foi texto puro', tentativas[1], '(sem parse_mode)');
+    igual('   e o aviso CHEGOU', telegrams().length, 2);
+  }
+  {
+    // 401/403 não é formatação: token errado ou bot bloqueado não melhora sem Markdown, e reenviar
+    // seria só gastar uma segunda chamada para o mesmo erro.
+    limpar();
+    let n = 0;
+    rede.post = (url) => {
+      if (!url.includes('api.telegram.org')) return { status: 200, data: {} };
+      n++;
+      const e = new Error('Request failed with status code 401');
+      e.response = { status: 401, data: {} };
+      throw e;
+    };
+    await enviarTelegram('qualquer aviso');
+    igual('401 nao vira reenvio (nao e formatacao)', n, 1);
+  }
+
+  console.log('\n=== Download de anexo: URL invalida nao chega ao axios ===');
+  {
+    // MEDIDO: 118 "Erro ao baixar anexo: 401" em producao, nenhum dizendo de que host — impossivel
+    // saber se era chave errada do Zernio ou link assinado expirado da Meta. E "Invalid URL", que era
+    // o axios recebendo algo que nem e endereco.
+    limpar();
+    const destino = path.join(DIR, 'nao-deve-existir.bin');
+    for (const ruim of [undefined, null, '', 'nao-e-url', '/caminho/local', 'file:///etc/passwd', 'ftp://host/x']) {
+      const r = await baixarParaArquivo(ruim, destino);
+      checar(`   ${JSON.stringify(String(ruim).slice(0, 22))} recusada sem tocar a rede`, r === null, r);
+    }
+    igual('nenhuma requisicao foi feita', rede.chamadas.length, 0);
+    igual('   e nenhum arquivo foi criado', fs.existsSync(destino), false);
+  }
+
   console.log('\n=== Anexo do Doc do Gemini na aba "Arquivos" ===');
 
   // Um PDF de verdade: exportarPdfDoDoc CONFERE a assinatura %PDF- antes de aceitar os bytes, porque
