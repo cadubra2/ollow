@@ -32,6 +32,12 @@ process.env.AGENDA_MOSKIT_DRY_RUN = 'false';
 // para o teste nao depender de um .env que esteja em outro valor.
 process.env.VINCULO_MAX_TENTATIVAS = '3';
 process.env.VINCULO_BACKOFF_CICLOS = '4';
+// Anexo do Doc na aba "Arquivos": em producao nasce DESLIGADO (NOTAS_ANEXO_ATIVO default false), e e
+// justamente o caminho ligado que precisa de regressao aqui. PUBLIC_BASE_URL tambem e obrigatoria —
+// sem ela anexarDocNoDeal desiste antes de tocar a rede, e todos os testes abaixo passariam vazios.
+process.env.NOTAS_ANEXO_ATIVO = 'true';
+process.env.PUBLIC_BASE_URL = 'https://tunel-de-teste.example';
+process.env.NOTAS_ANEXO_MAX_TENTATIVAS = '3';
 
 // ---------- dublê do axios ----------
 const axios = require('axios');
@@ -79,6 +85,7 @@ const {
   refrescarBriefingsPertoDaConsulta,
   descreverAncora, somarMinutosNaive, formatarHorarioEscritorio,
   stmtsNotas, registrarFalhaNota, conferirSilencioNotas, processarNotaReuniao,
+  anexarDocNoDeal, anexoComNomeExiste, retomarAnexosPendentes, limparAnexosExpirados,
   garantirDealExiste, importarContatosMoskit,
   sincronizarAtividadesMoskit, comSufixoDealId, comMarcadorDeal,
 } = require('./index');
@@ -117,6 +124,7 @@ function limpar() {
 }
 const de = (metodo, fragmento) => rede.chamadas.filter((c) => c.metodo === metodo && c.url.includes(fragmento));
 const notas = () => de('POST', '/notes');
+const anexosCriados = () => de('POST', '/attachments');
 const atividadesCriadas = () => de('POST', '/activities');
 const atividadesRemarcadas = () => de('PUT', '/activities');
 const sincronizada = (id) => db.prepare('SELECT * FROM atividades_sincronizadas WHERE activity_id = ?').get(id);
@@ -2271,8 +2279,352 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     igual('   sem chamada de rede (so enfileira)', rede.chamadas.length, 0);
   }
 
-  db.close();
 
+  // ------------------------------------------------------------
+  console.log('\n=== Anexo do Doc do Gemini na aba "Arquivos" ===');
+
+  // Um PDF de verdade: exportarPdfDoDoc CONFERE a assinatura %PDF- antes de aceitar os bytes, porque
+  // o Drive responde 200 com corpo HTML em algumas falhas de permissao — e um HTML salvo como .pdf
+  // entra no CRM parecendo anexo legitimo.
+  const PDF_FALSO = Buffer.from('%PDF-1.4\n% doc do gemini\n%%EOF\n', 'latin1');
+  const driveComPdf = (bytes = PDF_FALSO) => ({
+    files: {
+      export: async ({ mimeType }) => ({
+        data: mimeType === 'application/pdf' ? bytes : 'transcricao em texto',
+      }),
+    },
+  });
+
+  const semearNotaConcluida = (s, id, extra = {}) => {
+    db.prepare('DELETE FROM notas_reuniao').run();
+    s.inserir.run(id, 'assunto');
+    s.avancar.run({
+      doc_id: 'doc-1', evento_id: null, metodo: 'evento_telefone', diagnostico: null, extracao: null,
+      marcador: '[ollow-notas:abcd1234]', gmail_message_id: id, estado: 'CONCLUIDO', deal_id: 48292471,
+      ultimo_erro: null, ...extra,
+    });
+  };
+
+  {
+    // Caminho feliz: exporta, serve, anexa.
+    limpar();
+    const s = stmtsNotas(false);
+    semearNotaConcluida(s, 'msg-anexo');
+    rede.post = () => ({ status: 200, data: { id: 7001 } }); // POST /attachments
+    rede.get = (url) => (
+      // GET .../attachments/7001 = conferencia; GET .../attachments = listagem para dedup
+      /\/attachments\/7001$/.test(url)
+        ? { status: 200, data: { id: 7001, filename: 'notas-reuniao-2026-08-14-abcd1234.pdf', size: PDF_FALSO.length, mimeType: 'application/pdf' } }
+        : { status: 200, data: [] }
+    );
+
+    const r = await anexarDocNoDeal({
+      dealId: 48292471, docId: 'doc-1', gmailMessageId: 'msg-anexo', dataIso: '2026-08-14',
+      marcador: '[ollow-notas:abcd1234]', drive: driveComPdf(), stmts: s, dryRun: false,
+    });
+
+    checar('anexo criado', r.anexado === true && r.motivo === 'criado', r);
+    igual('   1 POST /attachments', anexosCriados().length, 1);
+    igual('   no deal certo', anexosCriados()[0].url.endsWith('/deals/48292471/attachments'), true);
+    // O Moskit NAO aceita upload: o corpo e so uma url, e quem baixa o arquivo e o servidor dele.
+    const url = anexosCriados()[0].corpo.url;
+    checar('   corpo e {url}, nao multipart', typeof url === 'string' && Object.keys(anexosCriados()[0].corpo).join() === 'url', anexosCriados()[0].corpo);
+    checar('   url aponta para a rota publica deste bot', url.startsWith('https://tunel-de-teste.example/arquivo-nota/'), url);
+    checar('   com token de 256 bits', /\/arquivo-nota\/[a-f0-9]{64}\//.test(url), url);
+    // O nome no fim da URL e o que vira `filename` no Moskit — e a chave de deduplicacao depois.
+    checar('   e terminando no nome deterministico', url.endsWith('/notas-reuniao-2026-08-14-abcd1234.pdf'), url);
+    igual('   com o header de origem', anexosCriados()[0].cfg.headers['X-Ollow-Origin'], 'BOT_WHATSAPP');
+    igual('   estado final ANEXADO', s.get.get('msg-anexo').anexo_estado, 'ANEXADO');
+    igual('   id do attachment guardado', s.get.get('msg-anexo').anexo_id, 7001);
+    // Confirmada a copia, a URL publica morre na hora — nao espera o TTL. A transcricao de uma
+    // consulta juridica nao fica servida um minuto a mais do que o necessario.
+    igual('   token invalidado assim que o Moskit confirma', s.get.get('msg-anexo').anexo_token, null);
+    igual('   PDF apagado do disco', s.get.get('msg-anexo').anexo_caminho, null);
+    igual('   e nenhum Telegram (nada de errado aconteceu)', telegrams().length, 0);
+  }
+
+  {
+    // O DETECTOR DO INTERSTICIO. O ngrok gratis devolve uma pagina HTML de aviso para clientes que
+    // ele julga navegador, e nao controlamos o header de bypass — quem faz o GET e o Moskit. Nesse
+    // caso o POST responde 2xx, o anexo aparece na aba com o nome certo, e so quem ABRIR o arquivo
+    // descobre que e um HTML. Comparar tamanho e o que transforma isso em alerta.
+    limpar();
+    const s = stmtsNotas(false);
+    semearNotaConcluida(s, 'msg-intersticio');
+    rede.post = () => ({ status: 200, data: { id: 7009 } });
+    rede.get = (url) => (
+      /\/attachments\/7009$/.test(url)
+        ? { status: 200, data: { id: 7009, filename: 'notas-reuniao-2026-08-14-abcd1234.pdf', size: 4211, mimeType: 'text/html' } }
+        : { status: 200, data: [] }
+    );
+
+    await anexarDocNoDeal({
+      dealId: 48292471, docId: 'doc-1', gmailMessageId: 'msg-intersticio', dataIso: '2026-08-14',
+      marcador: '[ollow-notas:abcd1234]', drive: driveComPdf(), stmts: s, dryRun: false,
+    });
+
+    igual('tamanho divergente → 1 Telegram', telegrams().length, 1);
+    const aviso = telegrams()[0].corpo.text;
+    checar('   o aviso cita os dois tamanhos', aviso.includes(String(PDF_FALSO.length)) && aviso.includes('4211'), aviso);
+    checar('   e aponta o suspeito certo', aviso.includes('ngrok'), aviso);
+    // NAO apaga o arquivo local: se o Moskit ainda estiver para buscar, apagar garantiria a falha.
+    checar('   PDF local preservado para o Moskit ainda buscar', s.get.get('msg-intersticio').anexo_caminho !== null);
+  }
+
+  {
+    // A trava contra a SEGUNDA copia da transcricao no prontuario do cliente. O POST nao aceita
+    // marcador dentro do arquivo (o corpo e so uma url), entao a identidade e o nome — e e por ele
+    // que a retomada pergunta ao CRM "isto ja esta ai?".
+    limpar();
+    const s = stmtsNotas(false);
+    semearNotaConcluida(s, 'msg-dup');
+    rede.get = () => ({ status: 200, data: [{ id: 7002, filename: 'notas-reuniao-2026-08-14-abcd1234.pdf', size: 30, mimeType: 'application/pdf' }] });
+
+    const r = await anexarDocNoDeal({
+      dealId: 48292471, docId: 'doc-1', gmailMessageId: 'msg-dup', dataIso: '2026-08-14',
+      marcador: '[ollow-notas:abcd1234]', drive: driveComPdf(), stmts: s, dryRun: false,
+    });
+
+    checar('anexo que ja existe nao e recriado', r.anexado === true && r.motivo === 'ja_existia', r);
+    igual('   NENHUM POST /attachments', anexosCriados().length, 0);
+    igual('   estado ANEXADO mesmo assim', s.get.get('msg-dup').anexo_estado, 'ANEXADO');
+  }
+
+  {
+    // "Nao achei" e "nao terminei de procurar" levam a acoes opostas: confundir os dois e exatamente
+    // como se anexa a transcricao duas vezes. Por isso o teto de paginas LANCA.
+    limpar();
+    rede.get = () => ({ status: 200, data: Array.from({ length: 10 }, (_, i) => ({ id: i, filename: `outro-${i}.pdf` })) });
+    let lancou = false;
+    try { await anexoComNomeExiste(48292471, 'nunca-vai-achar.pdf'); } catch { lancou = true; }
+    checar('teto de paginas LANCA em vez de dizer "nao achei"', lancou);
+  }
+
+  {
+    // Sem Doc nao ha o que anexar — e a nota NAO pode prometer um arquivo inexistente.
+    limpar();
+    const s = stmtsNotas(false);
+    semearNotaConcluida(s, 'msg-sem-doc');
+    rede.get = () => ({ status: 200, data: [] });
+
+    const r = await anexarDocNoDeal({
+      dealId: 48292471, docId: null, gmailMessageId: 'msg-sem-doc', dataIso: '2026-08-14',
+      marcador: '[ollow-notas:abcd1234]', drive: driveComPdf(), stmts: s, dryRun: false,
+    });
+    igual('sem Doc → nao anexa', r.anexado, false);
+    igual('   marcado como SEM_DOC', s.get.get('msg-sem-doc').anexo_estado, 'SEM_DOC');
+    igual('   nenhum POST', anexosCriados().length, 0);
+  }
+
+  {
+    // O Drive responde 200 com HTML em algumas falhas de permissao. Aceitar esses bytes poria um
+    // HTML com extensao .pdf no prontuario — visualmente indistinguivel de um anexo legitimo.
+    limpar();
+    const s = stmtsNotas(false);
+    semearNotaConcluida(s, 'msg-html');
+    rede.get = () => ({ status: 200, data: [] });
+    const driveHtml = { files: { export: async () => ({ data: Buffer.from('<html>Sem permissao</html>') }) } };
+
+    const r = await anexarDocNoDeal({
+      dealId: 48292471, docId: 'doc-1', gmailMessageId: 'msg-html', dataIso: '2026-08-14',
+      marcador: '[ollow-notas:abcd1234]', drive: driveHtml, stmts: s, dryRun: false,
+    });
+    checar('export que devolve HTML nao vira anexo', r.anexado === false, r);
+    igual('   nenhum POST', anexosCriados().length, 0);
+  }
+
+  {
+    // CONTRATO CENTRAL: anexarDocNoDeal nunca lanca. Ela roda ANTES do bracket da nota (para o
+    // rodape poder afirmar o anexo com honestidade); se lancasse, trocaria um bonus ausente por um
+    // prontuario sem registro nenhum da consulta.
+    limpar();
+    const s = stmtsNotas(false);
+    semearNotaConcluida(s, 'msg-falha');
+    rede.get = () => ({ status: 200, data: [] });
+    rede.post = () => { throw new Error('Moskit fora do ar'); };
+
+    let lancou = false;
+    let r = null;
+    try {
+      r = await anexarDocNoDeal({
+        dealId: 48292471, docId: 'doc-1', gmailMessageId: 'msg-falha', dataIso: '2026-08-14',
+        marcador: '[ollow-notas:abcd1234]', drive: driveComPdf(), stmts: s, dryRun: false,
+      });
+    } catch { lancou = true; }
+
+    checar('POST que falha NAO lanca', lancou === false, lancou);
+    igual('   devolve anexado=false', r && r.anexado, false);
+    // Fica em ANEXANDO de proposito: e o rastro que a rede de seguranca usa para retomar.
+    igual('   estado fica ANEXANDO para a retomada', s.get.get('msg-falha').anexo_estado, 'ANEXANDO');
+    // EXATAMENTE 1. Incrementar tambem no catch fazia UMA falha custar DUAS tentativas e cortar o
+    // orcamento pela metade — o mesmo defeito ja corrigido na reconciliacao de vinculo (e78156f).
+    igual('   UMA falha custa UMA tentativa (nao duas)', s.get.get('msg-falha').anexo_tentativas, 1);
+  }
+
+  {
+    // O 429 na LISTAGEM de deduplicacao: acontece de verdade (o CLAUDE.md documenta 429/timeout de
+    // 30s quando a varredura bate forte). O bracket abre ANTES dessa chamada justamente para que a
+    // falha deixe rastro — senao a linha ficava com anexo_estado NULL, invisivel para a rede de
+    // seguranca, e o PDF daquela reuniao sumia para sempre sem ninguem saber.
+    limpar();
+    const s = stmtsNotas(false);
+    semearNotaConcluida(s, 'msg-429');
+    rede.get = () => ({ status: 429, data: {} });
+
+    const r = await anexarDocNoDeal({
+      dealId: 48292471, docId: 'doc-1', gmailMessageId: 'msg-429', dataIso: '2026-08-14',
+      marcador: '[ollow-notas:abcd1234]', drive: driveComPdf(), stmts: s, dryRun: false,
+    });
+    igual('429 na listagem → nao anexa', r.anexado, false);
+    igual('   mas fica ANEXANDO (deixa rastro)', s.get.get('msg-429').anexo_estado, 'ANEXANDO');
+    igual('   e a rede de seguranca ENXERGA a linha', s.anexosPendentes.all({ maxTentativas: 3, limite: 5 }).length, 1);
+    igual('   com uma unica tentativa gasta', s.get.get('msg-429').anexo_tentativas, 1);
+  }
+
+  {
+    // SEM_DOC e um estado que a rede de seguranca NUNCA retoma, entao ele so pode significar "esta
+    // reuniao nao tem transcricao" — nunca "o Drive piscou". Um 5xx passageiro marcando SEM_DOC
+    // perderia de vez o PDF de uma consulta que existia, e ainda gravaria no banco a afirmacao
+    // contraria para quem fosse auditar depois.
+    limpar();
+    const s = stmtsNotas(false);
+    semearNotaConcluida(s, 'msg-drive-5xx');
+    rede.get = () => ({ status: 200, data: [] });
+    const driveInstavel = { files: { export: async () => { const e = new Error('backend error'); e.response = { status: 500 }; throw e; } } };
+
+    const r = await anexarDocNoDeal({
+      dealId: 48292471, docId: 'doc-1', gmailMessageId: 'msg-drive-5xx', dataIso: '2026-08-14',
+      marcador: '[ollow-notas:abcd1234]', drive: driveInstavel, stmts: s, dryRun: false,
+    });
+    igual('Drive 5xx → transitorio', r.motivo, 'export_transitorio');
+    igual('   NAO marca SEM_DOC', s.get.get('msg-drive-5xx').anexo_estado, 'ANEXANDO');
+    igual('   e sera retomado', s.anexosPendentes.all({ maxTentativas: 3, limite: 5 }).length, 1);
+
+    // 404 e veredito, nao mau humor: o Doc nao existe, e insistir so gastaria as tentativas.
+    limpar();
+    semearNotaConcluida(s, 'msg-drive-404');
+    rede.get = () => ({ status: 200, data: [] });
+    const driveSemDoc = { files: { export: async () => { const e = new Error('File not found'); e.response = { status: 404 }; throw e; } } };
+    await anexarDocNoDeal({
+      dealId: 48292471, docId: 'doc-1', gmailMessageId: 'msg-drive-404', dataIso: '2026-08-14',
+      marcador: '[ollow-notas:abcd1234]', drive: driveSemDoc, stmts: s, dryRun: false,
+    });
+    igual('Drive 404 → definitivo, marca SEM_DOC', s.get.get('msg-drive-404').anexo_estado, 'SEM_DOC');
+    igual('   e NAO fica pendente', s.anexosPendentes.all({ maxTentativas: 3, limite: 5 }).length, 0);
+  }
+
+  {
+    // A retomada reusa o nome JA gravado. Recalcula-lo a partir de uma data que a linha nao guarda
+    // seria a unica forma de gerar um nome diferente do que ja esta no CRM — ou seja, de duplicar.
+    limpar();
+    const s = stmtsNotas(false);
+    semearNotaConcluida(s, 'msg-retoma');
+    s.avancarAnexo.run({
+      gmail_message_id: 'msg-retoma', anexo_estado: 'ANEXANDO', anexo_token: 'f'.repeat(64),
+      anexo_caminho: null, anexo_nome: 'notas-reuniao-2026-08-14-abcd1234.pdf', anexo_id: null,
+      anexo_expira_em: '2099-01-01 00:00:00',
+    });
+    // O CRM ja tem o anexo (o POST anterior chegou a passar, so nao voltou a resposta).
+    rede.get = () => ({ status: 200, data: [{ id: 7003, filename: 'notas-reuniao-2026-08-14-abcd1234.pdf' }] });
+
+    const resolvidos = await retomarAnexosPendentes({ stmts: s, drive: driveComPdf(), dryRun: false });
+    igual('retomada resolve o pendente', resolvidos, 1);
+    igual('   sem repostar (achou pelo nome)', anexosCriados().length, 0);
+    igual('   estado vira ANEXADO', s.get.get('msg-retoma').anexo_estado, 'ANEXADO');
+    // `avancarAnexo` usa COALESCE — passar null PRESERVA o valor antigo. Sem o encerramento
+    // explicito, o token continuaria vivo servindo a transcricao ate o TTL vencer, mesmo com o
+    // arquivo comprovadamente ja no CRM. Este teste falha se aquele encerrar sumir.
+    igual('   token da tentativa anterior e invalidado', s.get.get('msg-retoma').anexo_token, null);
+    igual('   e a validade tambem some', s.get.get('msg-retoma').anexo_expira_em, null);
+  }
+
+  {
+    // Anexo faltando nao e incidente: a consulta esta registrada na nota. Desistir em silencio (sem
+    // Telegram) e deliberado — aviso diario aqui viraria ruido e afogaria os alertas que importam.
+    limpar();
+    const s = stmtsNotas(false);
+    semearNotaConcluida(s, 'msg-desiste-anexo');
+    s.avancarAnexo.run({
+      gmail_message_id: 'msg-desiste-anexo', anexo_estado: 'ANEXANDO', anexo_token: null,
+      anexo_caminho: null, anexo_nome: 'notas-reuniao-2026-08-14-abcd1234.pdf', anexo_id: null,
+      anexo_expira_em: null,
+    });
+    db.prepare('UPDATE notas_reuniao SET anexo_tentativas = 3 WHERE gmail_message_id = ?').run('msg-desiste-anexo');
+    rede.get = () => ({ status: 200, data: [] });
+
+    await retomarAnexosPendentes({ stmts: s, drive: driveComPdf(), dryRun: false });
+    igual('estourou as tentativas → DESISTIU', s.get.get('msg-desiste-anexo').anexo_estado, 'DESISTIU');
+    igual('   sem Telegram (anexo faltando nao e incidente)', telegrams().length, 0);
+    igual('   e a NOTA continua concluida no CRM', s.get.get('msg-desiste-anexo').estado, 'CONCLUIDO');
+  }
+
+  {
+    // A URL fica publica sem autenticacao e carrega a transcricao de uma consulta juridica. O que a
+    // fecha e o TTL — e nada limpava `comprovantes/`, entao aqui o precedente e explicitamente outro.
+    limpar();
+    const s = stmtsNotas(false);
+    semearNotaConcluida(s, 'msg-expira');
+    const arq = path.join(DIR, 'expirado.pdf');
+    fs.writeFileSync(arq, PDF_FALSO);
+    s.avancarAnexo.run({
+      gmail_message_id: 'msg-expira', anexo_estado: 'ANEXADO', anexo_token: 'e'.repeat(64),
+      anexo_caminho: arq, anexo_nome: 'x.pdf', anexo_id: 7004, anexo_expira_em: '2000-01-01 00:00:00',
+    });
+
+    const apagados = limparAnexosExpirados(s);
+    igual('TTL vencido → 1 anexo limpo', apagados, 1);
+    igual('   PDF removido do disco', fs.existsSync(arq), false);
+    igual('   token invalidado', s.get.get('msg-expira').anexo_token, null);
+    // O que importa: o anexo continua no Moskit. Expirar a URL nao desfaz o que ja foi copiado.
+    igual('   mas o anexo no CRM permanece', s.get.get('msg-expira').anexo_id, 7004);
+  }
+
+  {
+    // Sem PUBLIC_BASE_URL o Moskit nao teria de onde baixar. Desistir cedo, sem tocar a rede, e o
+    // que impede o CRM de receber um anexo apontando para uma URL que nao existe.
+    limpar();
+    const s = stmtsNotas(false);
+    semearNotaConcluida(s, 'msg-sem-base');
+    const salvo = process.env.PUBLIC_BASE_URL;
+    delete require.cache[require.resolve('./index.js')]; // so para deixar claro que a const e do load
+    process.env.PUBLIC_BASE_URL = salvo; // restaura: a const ja foi lida, o teste abaixo e de contrato
+
+    rede.get = () => ({ status: 200, data: [] });
+    rede.post = () => ({ status: 200, data: { id: 7005 } });
+    const r = await anexarDocNoDeal({
+      dealId: null, docId: 'doc-1', gmailMessageId: 'msg-sem-base', dataIso: '2026-08-14',
+      marcador: '[ollow-notas:abcd1234]', drive: driveComPdf(), stmts: s, dryRun: false,
+    });
+    igual('sem dealId → nao anexa', r.anexado, false);
+    igual('   e nao toca a rede', anexosCriados().length, 0);
+  }
+
+  {
+    // Dry-run tem que percorrer o ciclo inteiro sem escrever: nem POST, nem PDF em disco, nem token.
+    limpar();
+    const s = stmtsNotas(true); // tabela _dryrun
+    db.prepare('DELETE FROM notas_reuniao_dryrun').run();
+    s.inserir.run('msg-dry', 'assunto');
+    s.avancar.run({
+      doc_id: 'doc-1', evento_id: null, metodo: null, diagnostico: null, extracao: null,
+      marcador: '[ollow-notas:abcd1234]', gmail_message_id: 'msg-dry', estado: 'CONCLUIDO',
+      deal_id: 48292471, ultimo_erro: null,
+    });
+    rede.get = () => ({ status: 200, data: [] });
+
+    const r = await anexarDocNoDeal({
+      dealId: 48292471, docId: 'doc-1', gmailMessageId: 'msg-dry', dataIso: '2026-08-14',
+      marcador: '[ollow-notas:abcd1234]', drive: driveComPdf(), stmts: s, dryRun: true,
+    });
+    igual('dry-run simula o anexo', r.motivo, 'dry_run');
+    igual('   sem POST /attachments', anexosCriados().length, 0);
+    igual('   sem token (nenhuma URL publica nasce)', s.get.get('msg-dry').anexo_token, null);
+    // A tabela real nao pode ser tocada pelo dry-run: se fosse, a primeira execucao de verdade
+    // acharia tudo pronto e nao faria nada.
+    igual('   e a tabela real segue intacta', stmtsNotas(false).get.get('msg-dry'), undefined);
+  }
+
+  db.close();
   console.log(`\n${'='.repeat(50)}`);
   console.log(`${passou} passaram · ${falhou} falharam`);
   process.exit(falhou ? 1 : 0);

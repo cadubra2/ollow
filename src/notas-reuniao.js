@@ -447,6 +447,23 @@ function marcadorNota(gmailMessageId, docId) {
   return `[ollow-notas:${crypto.createHash('sha256').update(semente).digest('hex').slice(0, 8)}]`;
 }
 
+// Nome do PDF anexado na aba "Arquivos" do negocio. Cumpre DOIS papeis, e o segundo e o que obriga
+// o determinismo:
+//
+//   1. o que o advogado le no CRM — por isso a data por extenso, e nao um token hexadecimal;
+//   2. a CHAVE DE DEDUPLICACAO. O POST /deals/{id}/attachments nao aceita marcador dentro do arquivo
+//      (o corpo e so uma url), entao, depois de um crash entre "vou anexar" e "anexei", a unica
+//      forma de perguntar ao CRM "isto ja esta ai?" e procurar por este nome na listagem. Se ele
+//      variasse entre duas execucoes da mesma origem, a resposta seria sempre "nao achei" e o
+//      prontuario do cliente ganharia uma segunda copia da transcricao.
+//
+// O sufixo vem do mesmo hash de marcadorNota — mesma origem, mesmo nome, sempre.
+function nomeAnexoNota(marcador, dataIso) {
+  const hash = String(marcador || '').match(/\[ollow-notas:([a-f0-9]+)\]/)?.[1] || 'semorigem';
+  const data = /^\d{4}-\d{2}-\d{2}$/.test(String(dataIso || '')) ? dataIso : 'sem-data';
+  return `notas-reuniao-${data}-${hash}.pdf`;
+}
+
 const secao = (titulo, conteudo) => (conteudo && conteudo.length ? `${titulo}\n${conteudo}` : '');
 const lista = (itens) => (itens || []).map((i) => `• ${i}`).join('\n');
 
@@ -471,6 +488,10 @@ function montarTextoNota({ extracao, meta = {}, avisos = [], marcador }) {
     '⚠️ Resumo gerado por IA a partir das notas do Gemini. Confira antes de usar.',
     meta.truncou ? '⚠️ A transcrição era longa e o TRECHO INICIAL foi omitido na extração.' : '',
     meta.semTranscricao ? 'ℹ️ Sem transcrição literal (só o resumo do e-mail) — a transcrição não foi ativada nesta reunião.' : '',
+    // Só afirma o anexo quando ele JÁ está no CRM. O anexo é tentado antes desta nota ser montada,
+    // justamente para que esta linha possa ser verdade — uma nota que promete um arquivo inexistente
+    // manda o advogado procurar o que não está lá.
+    meta.anexado ? '📎 Transcrição completa anexada na aba Arquivos deste negócio.' : '',
     ...avisos.map((a) => `⚠️ ${a}`),
     meta.linkDoc ? `Fonte: ${meta.linkDoc}` : '',
     // Por qual porta esta nota entrou. Quando alguem achar uma nota no negocio errado, esta linha
@@ -495,6 +516,7 @@ module.exports = {
   validarExtracao,
   conferirAncoragem,
   marcadorNota,
+  nomeAnexoNota,
   montarTextoNota,
   PROMPT_SISTEMA_NOTAS,
   CAMPOS,

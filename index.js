@@ -201,6 +201,25 @@ const NOTAS_MAX_TENTATIVAS = Number(process.env.NOTAS_MAX_TENTATIVAS) || 3;
 // assunto". Sem esse aviso, a falha mais provavel da rotina e tambem a unica invisivel.
 const NOTAS_SILENCIO_DIAS = Number(process.env.NOTAS_SILENCIO_DIAS) || 10;
 
+// ---- Anexo do Doc do Gemini na aba "Arquivos" do negocio -------------------------------------
+// O POST /deals/{id}/attachments NAO aceita upload: o corpo e {"url": "..."} e quem baixa o arquivo
+// e o servidor do Moskit (medido na doc oficial em 18/08/2026). Por isso o bot precisa servir o PDF
+// numa URL que o Moskit alcance — e por isso esta funcionalidade depende de PUBLIC_BASE_URL.
+const NOTAS_ANEXO_ATIVO = process.env.NOTAS_ANEXO_ATIVO === 'true';
+// A URL publica e LIDA do ambiente, nunca derivada de tunnel_url.txt. O arquivo do tunel muda
+// sozinho a cada restart do ngrok sem dominio fixo: um anexo apontando para a URL de ontem entra no
+// CRM como link quebrado, e ninguem descobre ate abrir. URL de anexo tem que ser uma decisao, nao
+// um efeito colateral de qual tunel subiu primeiro.
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
+// O PDF fica servido por uma rota SEM autenticacao — e a unica forma de o Moskit baixar. O conteudo
+// e a transcricao de uma consulta juridica, entao o token de 256 bits nao basta sozinho: a janela
+// tambem e curta. Assim que o Moskit confirma que copiou (size/mimeType batendo), o token expira na
+// hora; este TTL e so o teto para o caso de a confirmacao nunca vir.
+const NOTAS_ANEXO_TTL_HORAS = Number(process.env.NOTAS_ANEXO_TTL_HORAS) || 24;
+// Mesmo teto e mesmo motivo de NOTAS_MAX_TENTATIVAS: falha permanente (deal apagado, Doc sem
+// permissao) nao pode reprocessar para sempre em silencio.
+const NOTAS_ANEXO_MAX_TENTATIVAS = Number(process.env.NOTAS_ANEXO_MAX_TENTATIVAS) || 3;
+
 let googleOAuthClientNotas = null;
 function getGoogleAuthClientNotas() {
   if (googleOAuthClientNotas) return googleOAuthClientNotas;
@@ -526,6 +545,29 @@ for (const tabela of ['notas_reuniao', 'notas_reuniao_dryrun']) {
     )
   `);
   try { db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_${tabela}_doc ON ${tabela}(doc_id) WHERE doc_id IS NOT NULL`); } catch {}
+
+  // Estado do ANEXO (o PDF do Doc na aba "Arquivos"), em colunas proprias.
+  //
+  // Precisa ser ALTER TABLE, nao so linha nova no CREATE acima: o CREATE e `IF NOT EXISTS`, entao em
+  // qualquer banco que ja exista — producao inclusive — ele nao roda e as colunas novas simplesmente
+  // nao apareceriam. Esta e a primeira migracao destas duas tabelas; todos os outros ALTER do arquivo
+  // sao de `conversations`.
+  //
+  // E `anexo_estado` e coluna SEPARADA de `estado` de proposito: a guarda de ESTADOS_TERMINAIS e a
+  // query `pendentes` sao a trava contra nota duplicada no prontuario do cliente, e um estado novo
+  // circulando por elas mudaria esse comportamento sem que ninguem tivesse pedido.
+  for (const coluna of [
+    'anexo_token TEXT',       // segredo da URL publica; NULL = sem URL viva
+    'anexo_caminho TEXT',     // PDF em disco, apagado assim que o Moskit confirma a copia
+    'anexo_nome TEXT',        // nome deterministico: e por ele que a deduplicacao encontra o anexo
+    'anexo_estado TEXT',      // NULL | ANEXANDO | ANEXADO | SEM_DOC | DESISTIU
+    'anexo_id INTEGER',       // id do attachment no Moskit
+    'anexo_expira_em TEXT',
+    'anexo_tentativas INTEGER DEFAULT 0',
+  ]) {
+    try { db.exec(`ALTER TABLE ${tabela} ADD COLUMN ${coluna}`); } catch {}
+  }
+  try { db.exec(`CREATE INDEX IF NOT EXISTS idx_${tabela}_anexo_token ON ${tabela}(anexo_token) WHERE anexo_token IS NOT NULL`); } catch {}
 }
 
 // Saude da rotina, uma linha so. Guarda a ultima vez que a busca no Gmail devolveu ALGUMA mensagem —
@@ -575,7 +617,82 @@ function stmtsNotas(dryRun) {
        ORDER BY criado_em
     `),
     contarPorEstado: db.prepare(`SELECT estado, COUNT(*) AS total FROM ${t} GROUP BY estado`),
+
+    // Statement proprio para o anexo, em vez de mais campos no `avancar`: aquele UPDATE exige que
+    // TODO campo nomeado exista no objeto (e o que `camposVazios()` resolve), entao cada coluna nova
+    // ali vira uma armadilha em todas as ~10 chamadas existentes.
+    avancarAnexo: db.prepare(`
+      UPDATE ${t}
+         SET anexo_estado = @anexo_estado,
+             anexo_token = COALESCE(@anexo_token, anexo_token),
+             anexo_caminho = COALESCE(@anexo_caminho, anexo_caminho),
+             anexo_nome = COALESCE(@anexo_nome, anexo_nome),
+             anexo_id = COALESCE(@anexo_id, anexo_id),
+             anexo_expira_em = COALESCE(@anexo_expira_em, anexo_expira_em),
+             atualizado_em = datetime('now')
+       WHERE gmail_message_id = @gmail_message_id
+    `),
+    // Zera a URL viva: token invalidado e PDF ja apagado do disco. O anexo continua no Moskit.
+    encerrarAnexo: db.prepare(`
+      UPDATE ${t} SET anexo_token = NULL, anexo_caminho = NULL, anexo_expira_em = NULL,
+                      atualizado_em = datetime('now')
+       WHERE gmail_message_id = ?
+    `),
+    contarTentativaAnexo: db.prepare(`
+      UPDATE ${t} SET anexo_tentativas = anexo_tentativas + 1, atualizado_em = datetime('now')
+       WHERE gmail_message_id = ?
+    `),
+    // A rede de seguranca do anexo. So olha linha cuja NOTA ja concluiu: enquanto a nota nao entrou,
+    // quem cuida da linha e o ciclo normal, e duas rotinas mexendo na mesma linha ao mesmo tempo e
+    // como nasce anexo duplicado.
+    anexosPendentes: db.prepare(`
+      SELECT * FROM ${t}
+       WHERE estado = 'CONCLUIDO' AND anexo_estado = 'ANEXANDO'
+         AND anexo_tentativas < @maxTentativas
+       ORDER BY atualizado_em
+       LIMIT @limite
+    `),
+    // Quem ja gastou as tentativas. Statement proprio em vez de reusar `anexosPendentes` com um
+    // teto absurdo: sentinela numerico e o tipo de truque que sobrevive ao autor e confunde quem
+    // vier depois — a intencao aqui e "desistiu", nao "pendente com limite alto".
+    anexosDesistentes: db.prepare(`
+      SELECT * FROM ${t}
+       WHERE estado = 'CONCLUIDO' AND anexo_estado = 'ANEXANDO'
+         AND anexo_tentativas >= @maxTentativas
+    `),
+    anexosExpirados: db.prepare(`
+      SELECT * FROM ${t}
+       WHERE anexo_token IS NOT NULL AND anexo_expira_em IS NOT NULL
+         AND anexo_expira_em < datetime('now')
+    `),
   };
+}
+
+// Busca da rota publica de download. Fora de stmtsNotas porque a rota nao tem "modo": o dry-run
+// nunca grava PDF em disco, entao nao ha o que servir da tabela de simulacao.
+//
+// PREPARADO SOB DEMANDA, NUNCA NO CARREGAMENTO DO MODULO — e o unico ponto desta funcionalidade
+// capaz de derrubar o bot inteiro, e por isso ele nao existe mais.
+//
+// O `ALTER TABLE` que cria `anexo_token` esta dentro de `try {} catch {}`, como todo o resto do boot.
+// Um `db.prepare` no topo do arquivo transformava esse catch numa armadilha: se a migracao falhasse
+// por QUALQUER motivo que nao "coluna ja existe" — disco cheio, banco travado por outro processo,
+// arquivo corrompido — o prepare lancava `no such column: anexo_token` durante o `require`, o
+// processo morria com exit 1, e o pm2 entrava em loop de restart. O bot inteiro (WhatsApp, agenda,
+// CRM) ficava fora do ar por causa de uma coluna de uma funcionalidade DESLIGADA.
+//
+// Preguicoso, o pior caso vira "a rota de anexo devolve 404" — que e exatamente o que ela ja
+// responde para token invalido. Regressao em test-rotas.js (o cenario da migracao impossivel).
+let _stmtNotaPorAnexoToken = null;
+function stmtNotaPorAnexoToken() {
+  if (!_stmtNotaPorAnexoToken) {
+    _stmtNotaPorAnexoToken = db.prepare(`
+      SELECT gmail_message_id, deal_id, anexo_token, anexo_caminho, anexo_nome, anexo_expira_em
+        FROM notas_reuniao
+       WHERE anexo_token = ? AND anexo_expira_em > datetime('now')
+    `);
+  }
+  return _stmtNotaPorAnexoToken;
 }
 
 // ------------------------------------------------------------
@@ -3557,6 +3674,64 @@ app.get('/', (req, res) => {
   res.send('Bot WhatsApp rodando via Zernio!');
 });
 
+// Serve o PDF da transcricao para que o MOSKIT possa baixa-lo.
+//
+// Por que existe uma rota sem autenticacao: POST /deals/{id}/attachments nao aceita upload — o corpo
+// e {"url": "..."} e quem busca o arquivo e o servidor do Moskit, que nao tem como mandar
+// ADMIN_TOKEN. Ou o arquivo esta acessivel por URL, ou ele nao entra na aba Arquivos.
+//
+// O conteudo e a transcricao de uma consulta juridica, entao a rota e desenhada para durar pouco:
+//   - token de 256 bits (2^256 e o espaco de busca; nao ha o que enumerar);
+//   - `anexo_expira_em` filtrado na propria consulta SQL, teto de NOTAS_ANEXO_TTL_HORAS;
+//   - o token e invalidado assim que o Moskit confirma a copia — quase sempre em segundos.
+//
+// `:nome` e DECORATIVO e nunca toca o disco. Ele existe so porque o Moskit deriva o `filename` do
+// anexo a partir da URL, e "notas-reuniao-14-08-2026.pdf" e melhor no CRM que um token hexadecimal.
+// O caminho real vem do banco. Montar caminho com pedaco de URL e o que abriria path traversal aqui.
+app.get('/arquivo-nota/:token/:nome', (req, res) => {
+  // Um unico 404 para token desconhecido, token expirado e arquivo sumido. Distinguir os tres diria
+  // a quem sondasse que aquele token JA existiu — e quando.
+  const recusar = () => res.status(404).send('Nao encontrado');
+
+  const token = String(req.params.token || '');
+  if (!/^[a-f0-9]{64}$/.test(token)) return recusar();
+
+  let linha;
+  try {
+    linha = stmtNotaPorAnexoToken().get(token);
+  } catch (e) {
+    // Banco sem as colunas do anexo (migracao nao aplicada). Antes isso derrubava o processo no
+    // boot; agora custa um 404 nesta rota e mais nada.
+    console.error(`❌ GET /arquivo-nota: consulta indisponivel (${e.message})`);
+    return recusar();
+  }
+
+  // A clausula WHERE ja casou o token, mas a comparacao explicita e de tempo constante fecha o canal
+  // lateral que a busca no indice deixa aberto.
+  if (!linha || !comparacaoSegura(token, linha.anexo_token)) return recusar();
+  if (!linha.anexo_caminho || !fs.existsSync(linha.anexo_caminho)) return recusar();
+
+  let pdf;
+  try {
+    pdf = fs.readFileSync(linha.anexo_caminho);
+  } catch (e) {
+    console.error(`❌ GET /arquivo-nota: falha ao ler ${linha.anexo_caminho}: ${e.message}`);
+    return recusar();
+  }
+
+  console.log(`  📎 anexo servido (deal ${linha.deal_id}, ${pdf.length} bytes) ua="${req.get('user-agent') || '-'}"`);
+  res.set({
+    'Content-Type': 'application/pdf',
+    'Content-Length': pdf.length,
+    // O nome vem do BANCO, nunca de req.params: e o mesmo nome que a deduplicacao procura depois.
+    'Content-Disposition': `inline; filename="${linha.anexo_nome || 'notas-reuniao.pdf'}"`,
+    // Transcricao de consulta nao deve ficar em cache de intermediario nenhum.
+    'Cache-Control': 'no-store, private',
+    'X-Robots-Tag': 'noindex, nofollow',
+  });
+  res.send(pdf);
+});
+
 // Rota para forçar processamento manual (debug)
 app.post('/processar/:chatId', exigeAdmin, (req, res) => {
   const chatId = req.params.chatId;
@@ -5599,6 +5774,46 @@ async function exportarTextoDoDoc(drive, docId) {
   }
 }
 
+// O MESMO Doc, agora em PDF, para virar anexo na aba "Arquivos" do negocio.
+//
+// Mesmo contrato de exportarTextoDoDoc — nunca lanca, devolve null — e pelo mesmo motivo, so que
+// mais forte: aqui o produto e um BONUS do bonus. A nota no CRM ja registra a consulta; se o PDF nao
+// sair, o pior desfecho aceitavel e "sem anexo". Falhar aqui nao pode custar a nota.
+//
+// Nao exige consentimento OAuth novo: `drive.readonly` (autorizar-google-notas.js) ja cobre exportar
+// em qualquer formato. Refazer o consentimento invalidaria o refresh token em uso e derrubaria o
+// agendamento — preco alto demais por um anexo.
+// Devolve `{ bytes, transitorio }`, e essa distincao NAO e detalhe de estilo: quem chama grava
+// SEM_DOC — um estado que a rede de seguranca nunca retoma — e SEM_DOC precisa significar "esta
+// reuniao nao tem transcricao", nunca "o Drive piscou". Confundir os dois perde de vez o PDF de uma
+// consulta que existia, e ainda grava no banco a afirmacao contraria, enganando quem for auditar.
+async function exportarPdfDoDoc(drive, docId) {
+  const definitivo = (bytes) => ({ bytes, transitorio: false });
+
+  if (!drive || !docId) return definitivo(null);
+  try {
+    const res = await drive.files.export(
+      { fileId: docId, mimeType: 'application/pdf' },
+      { responseType: 'arraybuffer' }
+    );
+    const bytes = Buffer.from(res.data);
+    // Confere a assinatura em vez de confiar no 200: o Drive responde 200 com corpo HTML em algumas
+    // falhas de permissao, e um HTML salvo como .pdf entra no CRM parecendo anexo legitimo.
+    if (bytes.length < 5 || bytes.subarray(0, 5).toString('latin1') !== '%PDF-') {
+      console.log(`  ⏭️ Doc ${docId}: export nao devolveu um PDF (${bytes.length} bytes) — sem anexo`);
+      return definitivo(null); // formato/permissao: retentar nao muda o resultado
+    }
+    return definitivo(bytes);
+  } catch (e) {
+    // 404/403 sao veredito: o Doc nao existe ou esta fora do alcance desta credencial. Qualquer
+    // outra coisa (5xx, 429, timeout, DNS) e o Drive de mau humor — e merece nova tentativa.
+    const status = e?.response?.status ?? e?.code;
+    const semVolta = status === 404 || status === 403;
+    console.log(`  ⏭️ Doc ${docId} nao exportado em PDF (${e.message})${semVolta ? '' : ' — tentarei de novo no proximo ciclo'}`);
+    return { bytes: null, transitorio: !semVolta };
+  }
+}
+
 // Procura o marcador nas notas ja existentes do deal. E o que decide, apos um crash no meio do POST,
 // entre "ja postei" e "preciso postar" — sem isso, so restaria repostar as cegas (nota duplicada no
 // prontuario do cliente) ou desistir sempre.
@@ -5629,6 +5844,287 @@ async function notaComMarcadorExiste(dealId, marcador) {
   // Chegou ao teto sem achar. NAO devolve false: "nao achei" e "nao terminei de procurar" levam a
   // acoes opostas, e confundir os dois e como se duplicaria a nota.
   throw new Error(`busca do marcador no deal ${dealId} atingiu o teto de ${NOTAS_MAX_PAGINAS_BUSCA} paginas`);
+}
+
+// Procura, na aba Arquivos do negocio, um anexo com este nome exato.
+//
+// E o `notaComMarcadorExiste` do anexo, e existe pelo mesmo motivo: depois de um crash entre "vou
+// anexar" e "anexei", so o CRM sabe a verdade. A diferenca e que o anexo nao tem onde carregar um
+// marcador — o POST so aceita uma url — entao a identidade E o nome do arquivo, que por isso e
+// deterministico (ver nomeAnexoNota).
+//
+// Pagina por `start`, o unico parametro que a doc declara para esta rota. Em /activities foi medido
+// que `page`, `offset` e afins sao ignorados EM SILENCIO, devolvendo a primeira pagina de novo — um
+// loop errado aqui reler os mesmos 10 registros e pareceria ter varrido tudo.
+async function anexoComNomeExiste(dealId, nome) {
+  let vistos = 0;
+
+  for (let pagina = 0; pagina < NOTAS_MAX_PAGINAS_BUSCA; pagina++) {
+    const res = await axios.get(`${MOSKIT_BASE}/deals/${dealId}/attachments`, {
+      params: { start: vistos },
+      headers: apiHeaders,
+      validateStatus: (s) => s < 500,
+    });
+    if (res.status < 200 || res.status >= 300) {
+      throw new Error(`GET /deals/${dealId}/attachments devolveu HTTP ${res.status}`);
+    }
+
+    const lote = Array.isArray(res.data) ? res.data : [];
+    const achado = lote.find((a) => a?.filename === nome);
+    if (achado) return achado;
+
+    vistos += lote.length;
+    if (lote.length < 10) return null; // pagina incompleta = fim da lista
+  }
+
+  // Mesma regra da busca de nota: "nao achei" e "nao terminei de procurar" levam a acoes OPOSTAS, e
+  // confundir as duas e exatamente como se anexa a transcricao duas vezes no mesmo negocio.
+  throw new Error(`busca do anexo no deal ${dealId} atingiu o teto de ${NOTAS_MAX_PAGINAS_BUSCA} paginas`);
+}
+
+// Anexa o PDF do Doc do Gemini na aba "Arquivos" do negocio.
+//
+// CONTRATO: nunca lanca. A nota no CRM e o produto principal; o anexo e um bonus, e o pior desfecho
+// aceitavel e "a nota entrou, sem anexo". Como esta funcao e chamada ANTES do bracket da nota (para
+// que o rodape possa afirmar o anexo com honestidade), lancar aqui derrubaria o registro da consulta
+// inteiro — trocaria um bonus ausente por um prontuario vazio.
+//
+// O bracket da nota (POSTANDO -> POSTADA) nao cobre este efeito: sao dois POSTs diferentes, em
+// recursos diferentes, e cada um precisa do seu par de commits.
+// `nomeForcado` existe para a retomada: o nome ja foi gravado em `anexo_nome` e e a chave de
+// deduplicacao, entao recalcula-lo a partir de uma data que a linha nao guarda seria a unica forma
+// de gerar um nome DIFERENTE do que ja esta no CRM — ou seja, de anexar a mesma transcricao duas vezes.
+async function anexarDocNoDeal({ dealId, docId, gmailMessageId, dataIso, marcador, drive, stmts, dryRun, nomeForcado = null }) {
+  const semAnexo = (motivo) => ({ anexado: false, motivo });
+
+  try {
+    if (!NOTAS_ANEXO_ATIVO) return semAnexo('desligado');
+    if (!dealId) return semAnexo('sem_deal');
+
+    // Sem Doc nao ha o que anexar — decisao de produto: nao geramos PDF a partir do resumo do
+    // e-mail, que ja esta inteiro dentro da propria nota.
+    if (!docId) {
+      stmts.avancarAnexo.run({
+        gmail_message_id: gmailMessageId, anexo_estado: 'SEM_DOC',
+        anexo_token: null, anexo_caminho: null, anexo_nome: null, anexo_id: null, anexo_expira_em: null,
+      });
+      return semAnexo('sem_doc');
+    }
+
+    if (!PUBLIC_BASE_URL) {
+      console.log('  ⏭️ PUBLIC_BASE_URL nao configurada — o Moskit nao teria de onde baixar o PDF; nota segue sem anexo');
+      return semAnexo('sem_url_base');
+    }
+
+    const nome = nomeForcado || notasReuniao.nomeAnexoNota(marcador, dataIso);
+
+    // O bracket abre AQUI, antes de qualquer rede, e a tentativa e contada UMA vez so.
+    //
+    // Abrir depois — so antes do POST — deixava um buraco: uma falha na listagem de deduplicacao
+    // (o Moskit responde 429/timeout de 30s quando a varredura bate forte, ver a secao de
+    // reconciliacao de vinculo) caia no catch com `anexo_estado` ainda NULL, e `anexosPendentes` so
+    // casa 'ANEXANDO' — o PDF daquela reuniao sumia para sempre, sem retry e sem rastro.
+    //
+    // E contar a tentativa aqui, e nao tambem no catch, e o que impede o mesmo defeito ja corrigido
+    // na reconciliacao de vinculo: incrementar nos dois lugares fazia UMA falha custar DUAS
+    // tentativas, cortando o orcamento pela metade.
+    stmts.avancarAnexo.run({
+      gmail_message_id: gmailMessageId, anexo_estado: 'ANEXANDO',
+      anexo_token: null, anexo_caminho: null, anexo_nome: nome, anexo_id: null, anexo_expira_em: null,
+    });
+    stmts.contarTentativaAnexo.run(gmailMessageId);
+
+    // Dedup ANTES de exportar: o export do Drive e a escrita em disco custam caro, e numa retomada o
+    // anexo mais provavel ja esta la.
+    const jaExiste = await anexoComNomeExiste(dealId, nome);
+    if (jaExiste) {
+      console.log(`  📎 anexo ja existia no deal ${dealId} (${nome}) — nao duplico`);
+      const anterior = stmts.get.get(gmailMessageId);
+      stmts.avancarAnexo.run({
+        gmail_message_id: gmailMessageId, anexo_estado: 'ANEXADO',
+        anexo_token: null, anexo_caminho: null, anexo_nome: nome, anexo_id: jaExiste.id || null, anexo_expira_em: null,
+      });
+      // `avancarAnexo` usa COALESCE: passar null PRESERVA o valor antigo. Sem este encerramento
+      // explicito, a retomada de um ANEXANDO deixaria o token vivo e o PDF no disco ate o TTL vencer
+      // — uma transcricao de consulta servida por horas sem necessidade nenhuma, ja que o arquivo
+      // comprovadamente ja esta no CRM.
+      try { if (anterior?.anexo_caminho && fs.existsSync(anterior.anexo_caminho)) fs.unlinkSync(anterior.anexo_caminho); } catch {}
+      stmts.encerrarAnexo.run(gmailMessageId);
+      return { anexado: true, motivo: 'ja_existia' };
+    }
+
+    const { bytes: pdf, transitorio } = await exportarPdfDoDoc(drive, docId); // nunca lanca
+    if (!pdf) {
+      // Transitorio fica em ANEXANDO: a rede de seguranca tenta de novo no proximo ciclo. Marcar
+      // SEM_DOC aqui gravaria "esta reuniao nao tem transcricao" por causa de um 5xx passageiro.
+      if (transitorio) return semAnexo('export_transitorio');
+      stmts.avancarAnexo.run({
+        gmail_message_id: gmailMessageId, anexo_estado: 'SEM_DOC',
+        anexo_token: null, anexo_caminho: null, anexo_nome: null, anexo_id: null, anexo_expira_em: null,
+      });
+      return semAnexo('export_falhou');
+    }
+
+    if (dryRun) {
+      console.log(`  📎 [dry-run] anexaria ${nome} (${pdf.length} bytes) no deal ${dealId} via ${PUBLIC_BASE_URL}/arquivo-nota/<token>/${nome}`);
+      stmts.avancarAnexo.run({
+        gmail_message_id: gmailMessageId, anexo_estado: 'ANEXADO',
+        anexo_token: null, anexo_caminho: null, anexo_nome: nome, anexo_id: null, anexo_expira_em: null,
+      });
+      return { anexado: true, motivo: 'dry_run' };
+    }
+
+    const pasta = path.join(__dirname, 'notas-reuniao', String(dealId));
+    fs.mkdirSync(pasta, { recursive: true });
+    const caminho = path.join(pasta, nome);
+    fs.writeFileSync(caminho, pdf);
+
+    const token = crypto.randomBytes(32).toString('hex');
+    const expiraEm = new Date(Date.now() + NOTAS_ANEXO_TTL_HORAS * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 19);
+    const url = `${PUBLIC_BASE_URL}/arquivo-nota/${token}/${nome}`;
+
+    // Continua ANEXANDO (aberto la em cima), agora com o token que torna a URL viva e o caminho do
+    // PDF — e o que a retomada e a varredura de expirados precisam para limpar o que ficou no meio.
+    stmts.avancarAnexo.run({
+      gmail_message_id: gmailMessageId, anexo_estado: 'ANEXANDO',
+      anexo_token: token, anexo_caminho: caminho, anexo_nome: nome, anexo_id: null, anexo_expira_em: expiraEm,
+    });
+
+    const post = await axios.post(
+      `${MOSKIT_BASE}/deals/${dealId}/attachments`,
+      { url },
+      { headers: { ...apiHeaders, 'X-Ollow-Origin': 'BOT_WHATSAPP' } }
+    );
+    const anexoId = post.data?.id || null;
+
+    stmts.avancarAnexo.run({
+      gmail_message_id: gmailMessageId, anexo_estado: 'ANEXADO',
+      anexo_token: null, anexo_caminho: null, anexo_nome: null, anexo_id: anexoId, anexo_expira_em: null,
+    });
+    console.log(`  📎 anexo criado no deal ${dealId}: ${nome} (attachment ${anexoId})`);
+
+    await conferirAnexoNoMoskit({ dealId, anexoId, nome, tamanho: pdf.length, gmailMessageId, caminho, stmts });
+    return { anexado: true, motivo: 'criado' };
+
+  } catch (e) {
+    // Deixa `anexo_estado` em ANEXANDO para a rede de seguranca retomar. Nao rotula, nao avisa, nao
+    // lanca: falha de anexo nao e evento digno de interromper o registro da consulta.
+    //
+    // E NAO conta tentativa aqui: ela ja foi contada uma vez, ao abrir o bracket. Incrementar nos
+    // dois lugares faria uma unica falha custar duas tentativas — o defeito que ja apareceu na
+    // reconciliacao de vinculo (commit e78156f).
+    console.log(`  ⏭️ anexo do deal ${dealId} falhou (${e.message}) — a nota segue sem ele`);
+    return semAnexo('erro');
+  }
+}
+
+// Confere o que o Moskit REALMENTE guardou e, batendo, mata a URL publica na hora.
+//
+// Nao e zelo: o transporte e uma URL baixada por um terceiro, e o modo de falha que este projeto
+// mais combate e o silencioso. Se o tunel devolver a pagina de aviso do ngrok gratis em vez do PDF,
+// o POST responde 2xx do mesmo jeito e o anexo aparece na aba com o nome certo — so quem ABRIR o
+// arquivo descobre. Comparar tamanho e mimeType e o que transforma isso em alerta.
+async function conferirAnexoNoMoskit({ dealId, anexoId, nome, tamanho, gmailMessageId, caminho, stmts }) {
+  const encerrar = () => {
+    try { if (caminho && fs.existsSync(caminho)) fs.unlinkSync(caminho); } catch {}
+    try { stmts.encerrarAnexo.run(gmailMessageId); } catch {}
+  };
+
+  if (!anexoId) { encerrar(); return; }
+
+  try {
+    // A doc avisa que a url "pode levar alguns segundos para funcionar", entao le mais de uma vez.
+    // Um GET unico, cedo demais, diria "vazio" e eu culparia o transporte a toa.
+    let guardado = null;
+    for (let i = 0; i < 3; i++) {
+      // Le PRIMEIRO, dorme depois: os metadados (size/mimeType) costumam estar prontos antes da url
+      // ficar navegavel, e dormir antes da primeira leitura so atrasaria o caminho feliz.
+      const res = await axios.get(`${MOSKIT_BASE}/deals/${dealId}/attachments/${anexoId}`, {
+        headers: apiHeaders, validateStatus: (s) => s < 500,
+      });
+      if (res.status >= 200 && res.status < 300) {
+        guardado = res.data;
+        if (guardado?.size) break;
+      }
+      if (i < 2) await new Promise((r) => setTimeout(r, 3000));
+    }
+
+    const tamanhoGuardado = Number(guardado?.size || 0);
+    const ehPdf = /pdf/i.test(guardado?.mimeType || '');
+
+    if (guardado && tamanhoGuardado === tamanho && ehPdf) {
+      encerrar(); // copiou: a URL publica nao precisa mais existir
+      return;
+    }
+
+    // Nao apaga o arquivo local aqui: se o Moskit ainda estiver para buscar, apagar garantiria a
+    // falha. A varredura de expirados limpa depois.
+    await enviarTelegram(
+      `⚠️ *Anexo de notas suspeito* (deal ${dealId})\n` +
+      `Arquivo: \`${nome}\`\n` +
+      `Enviado: ${tamanho} bytes · Guardado: ${tamanhoGuardado || '?'} bytes (${guardado?.mimeType || 'tipo desconhecido'})\n` +
+      `Se o tamanho nao bate, o que entrou no CRM provavelmente NAO e o PDF — suspeite da pagina de aviso do ngrok.\n` +
+      `Negócio: https://app.ollow.com.br/?/deal/${dealId}`
+    ).catch(() => {});
+  } catch (e) {
+    console.log(`  ⏭️ nao consegui conferir o anexo ${anexoId} do deal ${dealId}: ${e.message}`);
+  }
+}
+
+// Varre os PDFs cujo TTL venceu sem confirmacao e apaga disco + token.
+//
+// Existe porque `comprovantes/` nunca foi limpo e cresce para sempre — aqui o custo de repetir esse
+// padrao seria maior: cada arquivo e a transcricao de uma consulta juridica atras de uma URL sem
+// autenticacao. Arquivo que ninguem veio buscar nao pode ficar servido indefinidamente.
+// Rede de seguranca do anexo: linhas cuja NOTA ja concluiu mas cujo anexo ficou preso em ANEXANDO.
+//
+// So mexe em `estado = 'CONCLUIDO'` (garantido pela query): enquanto a nota nao entrou, quem cuida
+// da linha e o ciclo normal, e duas rotinas escrevendo na mesma linha e como nasce anexo duplicado.
+//
+// Nao chama OpenAI — a extracao ja esta gravada. O custo de uma tentativa aqui e um GET de listagem
+// mais, no maximo, um export do Drive.
+async function retomarAnexosPendentes({ stmts, drive, dryRun, limite = 5 }) {
+  if (!NOTAS_ANEXO_ATIVO || dryRun) return 0;
+
+  const pendentes = stmts.anexosPendentes.all({ maxTentativas: NOTAS_ANEXO_MAX_TENTATIVAS, limite });
+  let resolvidos = 0;
+
+  for (const linha of pendentes) {
+    const r = await anexarDocNoDeal({
+      dealId: linha.deal_id,
+      docId: linha.doc_id,
+      gmailMessageId: linha.gmail_message_id,
+      marcador: linha.marcador,
+      nomeForcado: linha.anexo_nome, // a chave de dedup ja escolhida; recalcular arriscaria duplicar
+      drive, stmts, dryRun,
+    });
+    if (r.anexado) resolvidos++;
+  }
+
+  // Desiste em silencio, MAS deixa rastro: diferente da nota, anexo faltando nao e incidente — a
+  // consulta esta registrada, so o PDF nao subiu. Telegram aqui viraria ruido diario.
+  const desistiram = stmts.anexosDesistentes.all({ maxTentativas: NOTAS_ANEXO_MAX_TENTATIVAS });
+  for (const l of desistiram) {
+    stmts.avancarAnexo.run({
+      gmail_message_id: l.gmail_message_id, anexo_estado: 'DESISTIU',
+      anexo_token: null, anexo_caminho: null, anexo_nome: null, anexo_id: null, anexo_expira_em: null,
+    });
+    try { if (l.anexo_caminho && fs.existsSync(l.anexo_caminho)) fs.unlinkSync(l.anexo_caminho); } catch {}
+    console.log(`  ⏭️ anexo do deal ${l.deal_id} desistiu apos ${l.anexo_tentativas} tentativas (a nota esta no CRM)`);
+  }
+
+  if (pendentes.length) console.log(`  📎 retomada de anexos: ${resolvidos}/${pendentes.length} resolvido(s)`);
+  return resolvidos;
+}
+
+function limparAnexosExpirados(stmts) {
+  let apagados = 0;
+  for (const linha of stmts.anexosExpirados.all()) {
+    try { if (linha.anexo_caminho && fs.existsSync(linha.anexo_caminho)) fs.unlinkSync(linha.anexo_caminho); } catch {}
+    try { stmts.encerrarAnexo.run(linha.gmail_message_id); apagados++; } catch {}
+  }
+  if (apagados) console.log(`  🧹 ${apagados} anexo(s) expirado(s): URL invalidada e PDF removido do disco`);
+  return apagados;
 }
 
 // ------------------------------------------------------------
@@ -5844,6 +6340,14 @@ async function processarNotaReuniao({ gmail, calendar, drive, mensagem, stmts, d
 
   // --- 4. A nota ------------------------------------------------------------
   const marcador = notasReuniao.marcadorNota(id, docId);
+
+  // O anexo vem ANTES da nota de proposito: so assim o rodape pode afirmar "transcricao anexada" e
+  // ser verdade. `anexarDocNoDeal` nunca lanca — se falhar, `anexado` volta false, a linha some do
+  // rodape e a nota entra igual.
+  const { anexado } = await anexarDocNoDeal({
+    dealId: resolucao.dealId, docId, gmailMessageId: id, dataIso, marcador, drive, stmts, dryRun,
+  });
+
   const texto = notasReuniao.montarTextoNota({
     extracao,
     avisos,
@@ -5853,6 +6357,7 @@ async function processarNotaReuniao({ gmail, calendar, drive, mensagem, stmts, d
       tituloEvento: sinais.tituloEvento || doAssunto?.tituloEvento,
       truncou,
       semTranscricao: !textoDoc,
+      anexado,
       linkDoc: docId ? `https://docs.google.com/document/d/${docId}` : '',
       metodo: resolucao.metodo,
       confianca: resolucao.confianca,
@@ -6074,6 +6579,14 @@ async function sincronizarNotasReuniao({ dryRun = NOTAS_REUNIAO_DRY_RUN, limite 
         const desistiu = await registrarFalhaNota({ stmts, gmail, id: ref.id, erro: e.message, dryRun });
         if (desistiu) relatorio.desistidas = (relatorio.desistidas || 0) + 1;
       }
+    }
+
+    // Depois do trabalho novo: o anexo e bonus, entao nunca disputa vez com a nota. Os dois nunca
+    // lancam — uma falha aqui nao pode perder o relatorio do ciclo que ja rodou.
+    if (!soAmostrar) {
+      await retomarAnexosPendentes({ stmts, drive, dryRun }).catch((e) =>
+        console.error(`  ❌ retomada de anexos falhou: ${e.message}`));
+      try { limparAnexosExpirados(stmts); } catch (e) { console.error(`  ❌ limpeza de anexos: ${e.message}`); }
     }
 
     await conferirSilencioNotas({ viuMensagem: mensagens.length > 0, dryRun }).catch(() => {});
@@ -6512,4 +7025,10 @@ module.exports = {
   conferirSilencioNotas,
   stmtsNotas,
   getGoogleAuthClientNotas,
+  // Anexo do Doc na aba "Arquivos". Exportados para as regressoes de test-pipeline.js: o bracket e a
+  // deduplicacao por nome sao o que impede uma segunda copia da transcricao no prontuario do cliente.
+  anexarDocNoDeal,
+  anexoComNomeExiste,
+  retomarAnexosPendentes,
+  limparAnexosExpirados,
 };

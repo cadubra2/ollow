@@ -52,6 +52,14 @@ Escrevem em dados reais de produção (Moskit e/ou banco real):
   `--aplicar` varre rota × variante de payload até uma ser aceita, cria a atividade DE VERDADE na
   agenda do CRM, mede qual padrão de `PUT` move o `dueDate` e apaga a atividade no fim (`--manter`
   desliga a limpeza). É o script que valida a conversão de fuso antes de mexer no agendamento.
+- `test-moskit-anexo-real.js <dealId> [--aplicar] [--url=...] [--subir-tunel] [--manter]` — mede o
+  contrato de `/deals/{id}/attachments` e, principalmente, **se o PDF atravessa o túnel intacto até o
+  Moskit**. Sem `--aplicar` é só leitura. Com `--aplicar` cria um anexo REAL num deal de teste,
+  compara `size`/`mimeType`/primeiros bytes com o PDF original, tenta também um POST multipart (não
+  documentado) e apaga tudo no fim. **`--subir-tunel` é explícito e não é o padrão**: no plano
+  gratuito o ngrok aceita UMA sessão por conta, então subir um túnel aqui pode derrubar o de produção
+  e o bot para de receber webhook do WhatsApp — sem erro nenhum neste script. Prefira `--url=` com um
+  PDF já servido publicamente.
 - `test-dedupe-agenda-real.js [--aplicar]` — prova, contra o Moskit e o Google reais, que a consulta
   não entra duas vezes na agenda: roda `POST /sincronizar-atividades` duas vezes, com e sem a linha
   em `atividades_sincronizadas`. Sem `--aplicar` é só leitura. Com `--aplicar` cria uma atividade e
@@ -102,7 +110,7 @@ Usado para `ADMIN_TOKEN`, `WEBHOOK_SECRET` e `DEPLOY_WEBHOOK_SECRET`.
 
 ## Architecture
 
-Aplicação Express monolítica: **`index.js` (~3100 linhas) contém o servidor, todas as rotas e todo o
+Aplicação Express monolítica: **`index.js` (~6600 linhas) contém o servidor, todas as rotas e todo o
 pipeline de negócio.** Não há camadas separadas de controller/service — funções são declaradas de
 cima a baixo no mesmo arquivo e chamadas diretamente. Ao navegar o código, procure por nome de função
 em vez de esperar uma estrutura de diretórios.
@@ -125,10 +133,14 @@ src/
   fila.js                fila de retry em disco para o worker (MAX_TENTATIVAS, depois desiste e avisa Telegram)
   mensagens.js           deduplicação e ordenação cronológica de mensagens do WhatsApp
   moskit-ids.js          TODOS os IDs/campos do Moskit — fonte única, ver abaixo
+  briefing.js            texto da nota de briefing pré-consulta (cabeçalho determinístico + hash)
   notas-reuniao.js       notas do Gemini → nota no negócio: parse do assunto, cascata que escolhe o
-                         deal, filtro de ancoragem sobre a saída da IA, texto da nota (tudo sem rede)
+                         deal, filtro de ancoragem sobre a saída da IA, texto da nota, nome do anexo
+                         (tudo sem rede)
   telefone.js            normalização de telefone e detecção de números internos (equipe)
   transcricao.js         transcrição de áudios do cliente via OpenAI (contrato: nunca lança)
+  zapsign.js             contrato de prestação de serviço: campos do template, valor por extenso,
+                         criação do documento e leitura do webhook de assinatura
 docs/pop/                POP oficial do processo de negócio (HTML + PDF) — fonte da verdade
 ```
 
@@ -539,6 +551,80 @@ em [src/notas-reuniao.js](src/notas-reuniao.js) (puro, sem rede); o `index.js` s
   quando o Google mudar o formato do e-mail. `POST /notas-reuniao/sincronizar?aplicar=1` força um
   ciclo real.
 
+### O PDF da transcrição na aba "Arquivos" do negócio
+
+A nota traz o resumo; o Doc que o Gemini gera vira **anexo** no mesmo negócio (`anexarDocNoDeal`,
+`index.js`). Desligado por padrão (`NOTAS_ANEXO_ATIVO`).
+
+- **O Moskit não aceita upload — ele BAIXA de uma URL que a gente dá.** Medido em 18/08/2026 na doc
+  oficial (que hoje é "Ollow API V2", `moskit.stoplight.io`): `POST /deals/{id}/attachments` tem
+  corpo `{"url": "..."}` em `application/json`, e o `Content-Type` é um enum de um valor só — não há
+  `multipart/form-data`. A doc ainda avisa que *"o arquivo não fica disponível instantaneamente"*, ou
+  seja, o Moskit copia para o storage dele de forma assíncrona. Os quatro endpoints (`GET` lista com
+  paginação por `start`, `POST`, `GET` por id, `DELETE`) usam o mesmo header `apikey` do resto.
+- **Por isso existe uma rota pública sem autenticação.** `GET /arquivo-nota/:token/:nome` serve o PDF
+  para o Moskit, que não tem como mandar `ADMIN_TOKEN`. É a única rota aberta além do health check, e
+  o conteúdo é a transcrição de uma consulta jurídica — o que a protege é token de 256 bits, TTL
+  curto (`NOTAS_ANEXO_TTL_HORAS`) e **invalidação imediata assim que o Moskit confirma a cópia**.
+  `:nome` é **decorativo e nunca toca o disco**: existe só porque o Moskit deriva o `filename` da
+  URL. O caminho real vem do banco — montar caminho com pedaço de URL é o que abriria path traversal
+  (`test-rotas.js` tem a regressão, inclusive a tentativa de `../`).
+- **O interstício do ngrok grátis é o risco principal, e é silencioso.** O plano gratuito devolve uma
+  **página HTML de aviso** para quem ele julga navegador; o bypass é o header
+  `ngrok-skip-browser-warning`, que **não controlamos** — quem faz o GET é o Moskit. Nesse caso o
+  POST responde 2xx, o anexo aparece na aba com o nome certo, e só quem **abrir** descobre que é um
+  HTML. Por isso `conferirAnexoNoMoskit` compara `size` e `mimeType` do que o CRM guardou com o PDF
+  enviado e manda Telegram na divergência. Medir antes de ligar: `test-moskit-anexo-real.js`.
+- **O nome do arquivo É a chave de deduplicação.** O POST não aceita marcador dentro do arquivo (o
+  corpo é só uma url), então, depois de um crash entre "vou anexar" e "anexei", a única pergunta
+  possível ao CRM é *"existe anexo com este nome?"*. `nomeAnexoNota` (`src/notas-reuniao.js`) deriva
+  o sufixo do mesmo hash de `marcadorNota` — mesma origem, mesmo nome, sempre. Nome instável faria a
+  resposta ser sempre "não achei" e poria uma segunda cópia da transcrição no prontuário do cliente.
+  A retomada usa o `anexo_nome` **já gravado** (`nomeForcado`), nunca recalcula.
+- **Bracket próprio.** O `POSTANDO → POSTADA` da nota não cobre este segundo efeito não-idempotente:
+  `ANEXANDO → ANEXADO`, em colunas separadas (`anexo_*`). Separadas de propósito — a guarda de
+  `ESTADOS_TERMINAIS` e a query `pendentes` são a trava contra nota duplicada, e um estado novo
+  circulando por elas mudaria esse comportamento sem ninguém ter pedido. `anexoComNomeExiste`
+  **lança** ao bater no teto de páginas, igual a `notaComMarcadorExiste` e pelo mesmo motivo.
+- **O bracket abre antes de QUALQUER rede, e a tentativa é contada uma vez só.** Abrir só antes do
+  `POST` deixava um buraco: uma falha na listagem de deduplicação — e o Moskit responde 429/timeout
+  de 30s quando a varredura bate forte, como já documentado na reconciliação de vínculo — caía no
+  `catch` com `anexo_estado` ainda `NULL`, e `anexosPendentes` só casa `'ANEXANDO'`. O PDF daquela
+  reunião sumia para sempre, sem retry e sem rastro. Pelo mesmo motivo o `catch` **não** incrementa
+  `anexo_tentativas`: contar nos dois lugares fazia UMA falha custar DUAS tentativas, o defeito já
+  corrigido em `e78156f` para `erros_transitorios`.
+- **`SEM_DOC` só pode significar "esta reunião não tem transcrição".** É um estado que a rede de
+  segurança nunca retoma, então `exportarPdfDoDoc` devolve `{ bytes, transitorio }` e separa os dois
+  mundos: 404/403 é veredito (o Doc não existe ou está fora do alcance da credencial) e vira
+  `SEM_DOC`; 5xx, 429, timeout e DNS ficam em `ANEXANDO` para nova tentativa. Sem essa distinção, um
+  Drive piscando gravaria no banco a afirmação contrária e perderia de vez o PDF de uma consulta que
+  existia — enganando também quem fosse auditar depois.
+- **`anexarDocNoDeal` NUNCA lança**, e roda **antes** do bracket da nota — é o que permite o rodapé
+  afirmar "transcrição anexada" com honestidade. Se lançasse, trocaria um bônus ausente por um
+  prontuário sem registro nenhum da consulta.
+- **Sem Doc, sem anexo.** Não geramos PDF do resumo do e-mail: ele já está inteiro dentro da nota.
+- **Desistir é silencioso.** Anexo faltando não é incidente — a consulta está registrada. Telegram a
+  cada falha viraria ruído diário; só a divergência de tamanho (o sintoma do interstício) avisa.
+- **Nenhum `db.prepare` no topo do arquivo pode depender dessa migração.** A consulta da rota pública
+  é preparada **sob demanda** (`stmtNotaPorAnexoToken()`), e isso não é estilo: os `ALTER TABLE` vivem
+  em `try {} catch {}` como todo o boot, e um prepare no carregamento do módulo transformava esse
+  catch numa armadilha. Migração falhando por qualquer motivo que não "coluna já existe" — disco
+  cheio, banco travado, arquivo corrompido — fazia o `require` lançar `no such column`, o processo
+  morrer com **exit 1** e o pm2 entrar em loop de restart: o bot inteiro (WhatsApp, agenda, CRM) fora
+  do ar por causa de uma coluna de uma funcionalidade que nasce **desligada**. Medido antes da
+  correção. Preguiçoso, o pior caso é um 404 na rota de anexo. Regressão em `test-rotas.js`, que
+  simula a migração impossível com uma VIEW chamada `notas_reuniao` (o `CREATE TABLE IF NOT EXISTS`
+  pula em silêncio e o `ALTER` falha de verdade).
+- **A migração é `ALTER TABLE`, não linha nova no `CREATE`.** As tabelas `notas_reuniao` /
+  `notas_reuniao_dryrun` usam `CREATE TABLE IF NOT EXISTS`: em banco que já existe — produção
+  inclusive — o `CREATE` não roda e as colunas novas simplesmente não apareceriam.
+- **`drive.readonly` já basta** para exportar em PDF: nenhum consentimento OAuth novo, o que evita
+  invalidar o refresh token em uso e derrubar o agendamento. `exportarPdfDoDoc` confere a assinatura
+  `%PDF-` antes de aceitar os bytes — o Drive responde 200 com corpo HTML em algumas falhas de
+  permissão, e um HTML salvo como `.pdf` entra no CRM parecendo anexo legítimo.
+- Regressões em `test-notas-reuniao.js` (nome e rodapé, puros), `test-pipeline.js` (fluxo, dedup,
+  retomada, TTL, interstício) e `test-rotas.js` (a rota pública).
+
 ### Segurança das rotas
 
 - Rotas administrativas (`/sincronizar`, `/processar/:chatId`, backfills, auditorias) exigem
@@ -549,6 +635,11 @@ em [src/notas-reuniao.js](src/notas-reuniao.js) (puro, sem rede); o `index.js` s
   `WEBHOOK_SECRET`, a rota aceita qualquer origem sem checar assinatura. A URL do webhook no
   Zernio é sempre `/webhook` (não há caminho customizado) — o mesmo segredo precisa estar
   cadastrado no painel do Zernio.
+- `GET /arquivo-nota/:token/:nome` é **pública de propósito** (ver "O PDF da transcrição na aba
+  Arquivos"): o Moskit precisa baixar o arquivo e não tem como mandar `ADMIN_TOKEN`. Quem segura a
+  porta é o token de 256 bits + `anexo_expira_em`, ambos conferidos na própria consulta SQL, mais a
+  invalidação imediata após o CRM confirmar a cópia. Token desconhecido, expirado e arquivo ausente
+  respondem **o mesmo 404** — distinguir contaria a quem sondasse que aquele token já existiu.
 - `TEAM_PHONES` (env, comparado pelos últimos 8 dígitos via `ehInterno`) nunca deve virar
   lead/deal/contato no CRM.
 - `POST /deploy-webhook` exige assinatura HMAC-SHA256 (`DEPLOY_WEBHOOK_SECRET`, header
