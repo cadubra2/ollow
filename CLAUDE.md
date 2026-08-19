@@ -785,11 +785,24 @@ comportamento não mediria o status quo.
   o erro é `400`; `401`/`403` (token errado, bot bloqueado) **não** são reenviados, porque tirar o
   Markdown não conserta credencial. Regressão em `test-pipeline.js`.
 - **Download de anexo do WhatsApp** (`baixarParaArquivo`): valida a URL **antes** do axios e o log
-  identifica o **host** (nunca a URL inteira — é mídia de cliente) mais o status. MEDIDO em
-  19/08/2026: 118 ocorrências de `Erro ao baixar anexo: 401` em produção, nenhuma dizendo de onde —
-  impossível saber se era `ZERNIO_API_KEY` errada ou link assinado da Meta que expirou, que pedem
-  consertos opostos. `401`/`403` em URL de mídia costuma ser link expirado; em host do Zernio, suspeite
-  da chave. A causa raiz dos 118 continua **em aberto** — depende de uma ocorrência com o log novo.
+  identifica o **host** (nunca a URL inteira — é mídia de cliente), o status e **qual credencial foi
+  usada**. Foi esse log que fechou o caso dos `401`.
+  **A causa raiz era o esquema de autenticação, e o sintoma era mudo.** MEDIDO em 19/08/2026 contra a
+  API real, mesma rota e mesma chave, só trocando o header: `Authorization: Bearer` responde **200** e
+  `apikey` responde **401**. `baixarParaArquivo` era a **única** chamada ao Zernio do arquivo inteiro
+  que mandava `apikey` — `sincronizarConversas` e a leitura de mensagens sempre usaram Bearer, e por
+  isso nunca falharam, o que fazia a chave parecer boa. Efeito medido em produção: 113 erros no log e
+  **nenhum comprovante verificado desde 24/07** (o último registro em `comprovantes`). A foto do PIX
+  nunca chegava na IA de visão, então o negócio não avançava para "Consulta agendada" e o Telegram não
+  avisava que o cliente pagou; áudio do cliente cai no mesmo caminho e também parou de ser transcrito.
+  Nada disso aparecia como erro de negócio — só como uma linha de log sem host.
+  **A credencial só vai para o próprio Zernio** (`montarHeadersAnexo`/`ehHostZernio`). A URL vem do
+  webhook, e link assinado de CDN (Meta) não precisa de auth: mandar a chave do escritório para um host
+  de terceiro é vazamento de credencial — e era o que o código fazia, para qualquer URL que chegasse.
+  A comparação é por hostname exato ou sufixo **com ponto**, porque `endsWith('zernio.com')` ingênuo
+  entregaria a chave para `malzernio.com` (tem regressão). Daqui para a frente, `401`/`403` em host do
+  Zernio significa chave inválida de verdade; em CDN de terceiro, link expirado. Regressões em
+  `test-pipeline.js`.
 
 ## Environment
 

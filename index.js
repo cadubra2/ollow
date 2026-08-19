@@ -5878,6 +5878,32 @@ function descreverUrlAnexo(url) {
   }
 }
 
+// Que credencial (se alguma) acompanha o download de um anexo.
+//
+// MEDIDO em 19/08/2026 contra a API real, mesma rota e mesma chave, so trocando o esquema:
+//   Authorization: Bearer <chave>  -> HTTP 200
+//   apikey: <chave>                -> HTTP 401
+// Esta funcao mandava `apikey`, e era a UNICA chamada ao Zernio no arquivo inteiro que fazia isso
+// (sincronizarConversas e a leitura de mensagens sempre usaram Bearer, e por isso nunca falharam).
+// O efeito: 113 "Erro ao baixar anexo: 401" no log e NENHUM comprovante verificado desde 24/07 —
+// a foto do PIX nunca chegava na IA de visao, entao o negocio nao avancava e o Telegram nao avisava
+// que o cliente pagou. Audio do cliente cai no mesmo caminho e tambem parou de ser transcrito.
+//
+// E a credencial so vai para o PROPRIO Zernio. A URL vem do webhook, e um link assinado de CDN
+// (Meta) nao precisa de auth nenhuma: mandar a chave do escritorio para um host de terceiro e
+// vazamento de credencial — que era exatamente o que o codigo fazia, para qualquer URL que chegasse.
+// Comparacao por hostname exato ou sufixo com ponto: "malzernio.com" NAO e o Zernio.
+function ehHostZernio(hostname) {
+  const host = String(hostname || '').toLowerCase();
+  return host === 'zernio.com' || host.endsWith('.zernio.com');
+}
+
+function montarHeadersAnexo(alvo) {
+  if (!ZERNIO_API_KEY) return { headers: {}, credencial: 'SEM credencial (ZERNIO_API_KEY ausente)' };
+  if (!ehHostZernio(alvo?.hostname)) return { headers: {}, credencial: 'sem credencial (host de terceiro)' };
+  return { headers: { Authorization: `Bearer ${ZERNIO_API_KEY}` }, credencial: 'com Bearer' };
+}
+
 async function baixarParaArquivo(url, caminho) {
   // Barra antes do axios: sem isto o unico sintoma era "Invalid URL", sem dizer o que chegou.
   let alvo;
@@ -5892,12 +5918,14 @@ async function baixarParaArquivo(url, caminho) {
     return null;
   }
 
+  const { headers: headersAnexo, credencial } = montarHeadersAnexo(alvo);
+
   try {
     const response = await axios({
       method: 'GET',
       url,
       responseType: 'stream',
-      headers: ZERNIO_API_KEY ? { apikey: ZERNIO_API_KEY } : {},
+      headers: headersAnexo,
     });
     const writer = fs.createWriteStream(caminho);
     response.data.pipe(writer);
@@ -5908,11 +5936,11 @@ async function baixarParaArquivo(url, caminho) {
     return caminho;
   } catch (e) {
     const status = e.response?.status;
-    const comChave = ZERNIO_API_KEY ? 'com apikey' : 'SEM apikey';
     console.error(
-      `  ❌ Erro ao baixar anexo de ${descreverUrlAnexo(url)} (${status ? `HTTP ${status}` : e.message}, ${comChave})` +
+      `  ❌ Erro ao baixar anexo de ${descreverUrlAnexo(url)} (${status ? `HTTP ${status}` : e.message}, ${credencial})` +
       (status === 401 || status === 403
-        ? ' — 401/403 em URL de midia costuma ser link assinado que EXPIROU; em host do Zernio, suspeite da ZERNIO_API_KEY'
+        ? ' — 401/403 em host do Zernio agora significa chave invalida (o esquema Bearer ja esta medido e correto);'
+          + ' em CDN de terceiro, e link assinado que EXPIROU'
         : '')
     );
     return null;
@@ -7449,6 +7477,10 @@ module.exports = {
   // Exportado para regressao: a guarda de URL invalida e o log que identifica o host sao o que
   // tornou os 401 de download diagnosticaveis.
   baixarParaArquivo,
+  // A decisao de credencial, exportada: e ela que impede a chave do escritorio de sair para um host
+  // que nao seja o Zernio.
+  montarHeadersAnexo,
+  ehHostZernio,
   // Exportadas para teste (test-pipeline.js / test-guards-internos.js). Sao as funcoes novas dos
   // Lotes 1 e 2 que nao tinham nenhuma cobertura. registrarAgendamentoPendente fica de fora de
   // proposito: e totalmente observavel atraves de handleAgendamentoCalendar.
