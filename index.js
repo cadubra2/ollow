@@ -5904,11 +5904,30 @@ function montarHeadersAnexo(alvo) {
   return { headers: { Authorization: `Bearer ${ZERNIO_API_KEY}` }, credencial: 'com Bearer' };
 }
 
+// A API do Zernio devolve a URL da midia RELATIVA — MEDIDO em 19/08/2026 contra a API real:
+// 9 de 9 anexos das conversas recentes vieram como "/api/v1/whatsapp/media/<id>?accountId=...".
+// `new URL()` recusa isso, entao o download morria em "Anexo com URL invalida" ANTES de tocar a rede:
+// e por isso que sincronizarConversas — a rede de seguranca que existe justamente para pegar o que o
+// webhook perdeu — nunca baixou comprovante nem audio nenhum. O webhook entrega a mesma midia em
+// forma absoluta, e aquela caia no 401 do esquema de auth errado: os dois caminhos quebrados, por
+// motivos diferentes, com o mesmo sintoma de "nada acontece".
+//
+// So caminho que comeca em `/api/` e resolvido. Resolver qualquer string contra a base transformaria
+// lixo em requisicao — "/caminho/local" e "nao-e-url" continuam sendo recusados sem tocar a rede
+// (tem regressao desde que a guarda de URL invalida existe).
+const ZERNIO_BASE = 'https://zernio.com';
+
+function resolverUrlAnexo(url) {
+  const texto = String(url ?? '');
+  return texto.startsWith('/api/') ? `${ZERNIO_BASE}${texto}` : texto;
+}
+
 async function baixarParaArquivo(url, caminho) {
   // Barra antes do axios: sem isto o unico sintoma era "Invalid URL", sem dizer o que chegou.
+  const endereco = resolverUrlAnexo(url);
   let alvo;
   try {
-    alvo = new URL(String(url));
+    alvo = new URL(endereco);
   } catch {
     console.error(`  ❌ Anexo com URL invalida (${JSON.stringify(String(url).slice(0, 60))}) — nada a baixar`);
     return null;
@@ -5923,7 +5942,7 @@ async function baixarParaArquivo(url, caminho) {
   try {
     const response = await axios({
       method: 'GET',
-      url,
+      url: endereco,
       responseType: 'stream',
       headers: headersAnexo,
     });
@@ -5937,7 +5956,7 @@ async function baixarParaArquivo(url, caminho) {
   } catch (e) {
     const status = e.response?.status;
     console.error(
-      `  ❌ Erro ao baixar anexo de ${descreverUrlAnexo(url)} (${status ? `HTTP ${status}` : e.message}, ${credencial})` +
+      `  ❌ Erro ao baixar anexo de ${descreverUrlAnexo(endereco)} (${status ? `HTTP ${status}` : e.message}, ${credencial})` +
       (status === 401 || status === 403
         ? ' — 401/403 em host do Zernio agora significa chave invalida (o esquema Bearer ja esta medido e correto);'
           + ' em CDN de terceiro, e link assinado que EXPIROU'
@@ -7481,6 +7500,7 @@ module.exports = {
   // que nao seja o Zernio.
   montarHeadersAnexo,
   ehHostZernio,
+  resolverUrlAnexo,
   // Exportadas para teste (test-pipeline.js / test-guards-internos.js). Sao as funcoes novas dos
   // Lotes 1 e 2 que nao tinham nenhuma cobertura. registrarAgendamentoPendente fica de fora de
   // proposito: e totalmente observavel atraves de handleAgendamentoCalendar.
