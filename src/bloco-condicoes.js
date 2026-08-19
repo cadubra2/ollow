@@ -76,10 +76,17 @@ function atingiuLimiar({ valor, estrutura }) {
 //
 // Duas passadas: por mensagem (caso normal, bloco colado inteiro) e sobre a concatenacao de tudo que
 // a equipe escreveu (caso do bloco fatiado em varias mensagens pelo WhatsApp).
-function detectarBlocoCondicoes(mensagens) {
+//
+// `inicio` e a JANELA DO ATENDIMENTO (conversations.atendimento_inicio_msg_idx, ver
+// src/cliente-retorno.js): cliente que ja foi atendido e voltou com um caso novo continua na MESMA
+// conversa, e o bloco de condicoes do atendimento ANTERIOR nao pode tornar a nova consulta paga sem a
+// equipe ter mandado bloco nenhum. Os indices devolvidos continuam ABSOLUTOS no array de mensagens —
+// msgIdx e gravado em bloco_condicoes_msg_idx e comparado com observacoes.msg_idx.
+function detectarBlocoCondicoes(mensagens, { inicio = 0 } = {}) {
   const msgs = Array.isArray(mensagens) ? mensagens : [];
+  const primeira = Number.isFinite(inicio) && inicio > 0 ? inicio : 0;
   const indicesEquipe = [];
-  for (let i = 0; i < msgs.length; i++) {
+  for (let i = primeira; i < msgs.length; i++) {
     if (msgs[i]?.role === 'equipe') indicesEquipe.push(i);
   }
 
@@ -108,9 +115,12 @@ function detectarBlocoCondicoes(mensagens) {
 
 // Quantos anexos a equipe mandou que o bot nao consegue ler. Se houver algum e o bloco nao tiver sido
 // detectado, a conclusao de cortesia sai com ressalva — o bloco pode ter vindo dentro da imagem.
-function contarAnexosIlegiveisEquipe(mensagens) {
+// Mesma janela de detectarBlocoCondicoes: a ressalva e sobre o atendimento ATUAL, e um anexo ilegivel
+// da consulta do ano passado nao diz nada sobre a cobranca desta.
+function contarAnexosIlegiveisEquipe(mensagens, { inicio = 0 } = {}) {
   const msgs = Array.isArray(mensagens) ? mensagens : [];
-  return msgs.filter((m) => m?.role === 'equipe' && String(m.text || '').includes(MARCADOR_ANEXO_EQUIPE)).length;
+  const primeira = Number.isFinite(inicio) && inicio > 0 ? inicio : 0;
+  return msgs.slice(primeira).filter((m) => m?.role === 'equipe' && String(m.text || '').includes(MARCADOR_ANEXO_EQUIPE)).length;
 }
 
 module.exports = {

@@ -27,7 +27,8 @@ node test-telefone.js    # roda um arquivo de teste isolado (mesmo padrão para 
 `test-telefone.js`, `test-moskit-ids.js`, `test-atividade-moskit.js`, `test-evidencia.js`,
 `test-fila.js`, `test-payload.js`, `test-rotas.js`, `test-pipeline.js`, `test-agenda-dry-run.js`,
 `test-guards-internos.js`, `test-agendamento-bloco-mensagens.js`, `test-transcricao.js`,
-`test-zapsign.js`, `test-notas-reuniao.js`. Todos usam `DB_PATH` apontando para um arquivo inexistente (banco descartável) —
+`test-zapsign.js`, `test-notas-reuniao.js`, `test-cliente-retorno.js`, `test-cliente-retorno-flags.js`.
+Todos usam `DB_PATH` apontando para um arquivo inexistente (banco descartável) —
 **nunca** deixe um teste abrir `conversations.db` de produção.
 
 **A suíte roda com `TZ=UTC`, o fuso da VPS** — é isso que o `rodar-testes.js` existe para garantir.
@@ -134,6 +135,8 @@ src/
   mensagens.js           deduplicação e ordenação cronológica de mensagens do WhatsApp
   moskit-ids.js          TODOS os IDs/campos do Moskit — fonte única, ver abaixo
   briefing.js            texto da nota de briefing pré-consulta (cabeçalho determinístico + hash)
+  cliente-retorno.js     cliente que já foi atendido e volta com caso novo: se a consulta já aconteceu,
+                         se o caso descrito é posterior a ela e se o tema mudou (tudo sem rede)
   notas-reuniao.js       notas do Gemini → nota no negócio: parse do assunto, cascata que escolhe o
                          deal, filtro de ancoragem sobre a saída da IA, texto da nota, nome do anexo
                          (tudo sem rede)
@@ -625,6 +628,84 @@ A nota traz o resumo; o Doc que o Gemini gera vira **anexo** no mesmo negócio (
 - Regressões em `test-notas-reuniao.js` (nome e rodapé, puros), `test-pipeline.js` (fluxo, dedup,
   retomada, TTL, interstício) e `test-rotas.js` (a rota pública).
 
+### Cliente que volta: o segundo atendimento do mesmo telefone
+
+A conversa é **uma linha por telefone, para sempre** — nada nela é encerrado quando o atendimento
+termina. Cliente que já foi atendido e volta meses depois com um caso NOVO caía na mesma linha, com o
+`deal_id` antigo, o histórico antigo do WhatsApp e todos os checkpoints herdados. A decisão fica em
+[src/cliente-retorno.js](src/cliente-retorno.js) (puro, sem rede); o `index.js` só busca o que ela pede.
+Desligado por padrão (`CLIENTE_RETORNO_ATIVO`) e, quando ligado, em dry-run (`CLIENTE_RETORNO_DRY_RUN`).
+**No dry-run o ciclo segue como hoje** — decide, loga, posta nota `[dry-run]` e avisa no Telegram, mas
+não corta nada e não impede a escrita no negócio antigo. Isso é de propósito: dry-run que já mudasse o
+comportamento não mediria o status quo.
+
+- **O que era estragado, em silêncio, nas quatro frentes:** o PUT reabria negócio GANHO (ver o bullet
+  do `status` em "Integrações externas"); `mesclarParaCrm` arrastava área/assunto do caso velho para o
+  caso novo (com `_casoDescritoValidado` já marcado); `bloco_condicoes_enviado = 1` do primeiro
+  atendimento tornava a consulta nova PAGA sem ninguém ter cobrado; e `contrato_zapsign_criado`,
+  `evento_calendar_*`, `atividade_moskit_id`, `campos_travados`, `briefing_*` continuavam do
+  atendimento anterior.
+- **"Já foi cliente" = consulta REALIZADA**, não contrato assinado (decisão do escritório em
+  19/08/2026). Duas fontes, ambas locais: `conversations.evento_calendar_data` no passado e a nota do
+  Gemini `CONCLUIDO` do deal (que só existe se a reunião ocorreu, e cobre a consulta marcada direto no
+  CRM). Vale a mais recente. `evento_calendar_data` é **naive** do escritório: a conversão é
+  `horarioNaiveParaInstante`, nunca `new Date()` cru — em UTC isso erraria a fronteira por 3h.
+- **A folga de `RETORNO_FOLGA_HORAS` (padrão 2) depois do fim da consulta** existe porque mensagem
+  trocada durante a reunião, ou logo depois ("esqueci de dizer que tenho o contrato X"), é o MESMO
+  atendimento.
+- **Nenhum campo novo de IA.** A evidência de caso novo são as observações que já existem e já são
+  validadas contra a mensagem real (`cliente_descreveu_caso`/`equipe_descreveu_caso`,
+  [src/evidencia.js](src/evidencia.js)); o código acrescenta *quando* elas valem (mensagem posterior ao
+  fim da consulta, pelo timestamp da própria mensagem) e a corroboração determinística: assunto **ou**
+  área diferentes. Área comparada por ID da opção do CRM — "Direito Digital" e "LGPD" são a mesma área,
+  e compará-las como texto abriria um segundo negócio para o mesmo caso.
+- **Assunto igual e área igual = `ambiguo`, e ambíguo NÃO abre negócio.** Depois de uma consulta, o
+  cliente continuar falando do mesmo caso é o comportamento *normal*; um segundo negócio para o mesmo
+  caso duplica o cliente no funil e espalha a história dele em dois lugares, sem que ninguém detecte
+  lendo — os dois parecem legítimos. No ambíguo o bot também zera `area_direito`/`advogado_responsavel`/
+  `assunto` da rodada (mesma técnica de `aplicarGateCasoDescrito`), avisa uma vez
+  (`retorno_aviso_hash`) e não reclassifica nada.
+- **O ciclo que detecta o retorno NÃO cria o negócio.** Nessa rodada a IA leu o histórico do caso
+  ANTIGO, então o que ela extraiu está contaminado por ele. `abrirNovoAtendimento` empilha o negócio em
+  `deals_anteriores`, grava o corte, zera o estado numa única `UPDATE` (meia limpeza é pior que
+  nenhuma) e **reagenda** — `agendarProcessamento`, ou `enfileirar` em `WORKER_MODE`. Sem esse
+  reagendamento a conversa ficaria muda com um atendimento aberto e vazio: nada aqui reprocessa uma
+  conversa só porque o tempo passou (o defeito do deal 48466404).
+- **A janela é um corte de exibição com índices ABSOLUTOS.** `montarHistorico(mensagens, { inicio })` e
+  `detectarBlocoCondicoes(mensagens, { inicio })` pulam o atendimento anterior mas continuam numerando
+  pelo array inteiro, porque é contra ele que `validarObservacoes` confere `mensagens[msg_idx]`.
+  Reindexar faria toda observação apontar para outra mensagem. Observação com `msg_idx` antes do corte
+  é descartada (o modelo não a viu). A janela vale também em `reconciliarClassificacao`, que recalcula
+  a cobrança das MENSAGENS — sem ela, a reconciliação reintroduzia o bloco do atendimento anterior; a
+  query de lá precisa trazer `atendimento_inicio_msg_idx`, senão a coluna chega `undefined` e o corte
+  volta a ser 0 (tem regressão com controle).
+- **Não há teto de atendimentos.** Cliente de escritório volta mais de uma vez, e todo sinal usado na
+  decisão se refere ao atendimento ATUAL (`evento_calendar_data` e `last_data` foram zerados no corte
+  anterior, e `obsValidas` já vem filtrado pela janela), então o 3º caso abre o 3º atendimento e o corte
+  novo cai sempre depois do atual. Uma guarda do tipo "só se ainda não houve corte" faria o 3º caso
+  voltar a cair dentro do negócio do 2º — o mesmo defeito, uma volta mais tarde. Regressão em
+  `test-pipeline.js`.
+- **O que NÃO é limpo:** `atividades_sincronizadas` (a linha do atendimento antigo é a trava que impede
+  um segundo evento no Google para a consulta velha) e `comprovantes` (chaveado por deal, então o
+  negócio novo já nasce sem comprovante).
+- **Responsável pela regra normal da área** (`ADVOGADO_POR_AREA_ID`), como qualquer lead — o retorno não
+  herda o advogado do caso anterior. O aviso do Telegram é que liga os dois para a equipe, e o negócio
+  novo nasce com uma nota citando o anterior (lida de `deals_anteriores`, sem chamada ao CRM).
+- **Migração e prepares preguiçosos.** As quatro colunas novas (`atendimento_inicio_msg_idx`,
+  `atendimento_num`, `deals_anteriores`, `retorno_aviso_hash`) entram por `ALTER TABLE` em
+  `try {} catch {}`, e **nenhum `db.prepare` do topo do arquivo pode depender delas** — mesmo motivo de
+  `stmtNotaPorAnexoToken()`. `janelaAtendimento` devolve 0 para coluna ausente, que é o comportamento
+  de antes desta funcionalidade existir.
+- **Inspeção:** `GET /clientes-retorno/amostrar?limite=N` (só leitura, sem IA, atrás de `exigeAdmin`)
+  lista as conversas com consulta realizada e mensagem posterior a ela. É como medir a prevalência
+  antes de ligar.
+- Regressões em `test-cliente-retorno.js` (módulo puro), `test-cliente-retorno-flags.js` (os dois modos
+  com que isto vai a produção — desligado e dry-run — cada um no seu processo, porque as flags são
+  `const` lidas no require, mesmo motivo de `test-agenda-dry-run.js` existir) e `test-pipeline.js` (o ciclo do corte, o ciclo
+  que cria o segundo negócio com `price 0`, o caminho ambíguo e o dedup do aviso). O dublê da OpenAI
+  desse arquivo (`https.request`) nasceu aqui e tapou um buraco antigo: `processarNotaReuniao` chamava a
+  OpenAI de verdade na suíte.
+
 ### Segurança das rotas
 
 - Rotas administrativas (`/sincronizar`, `/processar/:chatId`, backfills, auditorias) exigem
@@ -674,6 +755,15 @@ A nota traz o resumo; o Doc que o Gemini gera vira **anexo** no mesmo negócio (
   `putDealComVerificacao` nunca sofreu disso porque envia o corpo do `GET` inteiro;
   `atualizarNegocioMoskit` monta o payload do zero e por isso precisa preservar o campo à mão, como já
   fazia com `name` e `stage`. Regressão em `test-pipeline.js`.
+  **`status`, `closeDate` e `lostReason` também são preservados do `GET`, e por isso um PUT de campos
+  não reabre negócio fechado.** `montarPayloadMoskit` sempre monta `status: 'OPEN'` (é o payload de
+  criação), e como o PUT é full replace, qualquer atualização de campo num negócio GANHO o devolvia para
+  aberto e apagava `closeDate`/`lostReason` — atingindo justamente os negócios bem atendidos, que são os
+  que ficam fechados. O caminho mais provável de disparar isso é o cliente antigo voltando a escrever
+  (ver "Cliente que volta"). Fechar e reabrir é decisão exclusiva de `fecharNegocioSeAplicavel`, que já
+  se recusa a tocar em deal fora de `OPEN`: o caminho de campos não podia fazer pelas costas o que a
+  função de fechamento se proíbe de fazer. Regressão em `test-pipeline.js` (GANHO, PERDIDO e o caminho
+  comum de negócio aberto).
   **Rate limit: 6 req/s e 240/min** (documentado em "Limite de requisições"), com headers
   `X-RateLimit-Remaining-Second`/`-Minute` que **nenhum código nosso lê ainda**. O 429 aparece com
   facilidade — bastaram três requisições quase simultâneas numa sondagem de leitura. É por isso que
