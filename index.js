@@ -6752,9 +6752,13 @@ async function processarNotaReuniao({ gmail, calendar, drive, mensagem, stmts, d
   // --- 3. Extracao ----------------------------------------------------------
   let extracao;
   let avisos;
-  if (linha.estado === 'EXTRAIDO' && linha.extracao) {
-    // Ja pago em ciclo anterior: nao chama a OpenAI de novo.
-    ({ extracao, avisos } = JSON.parse(linha.extracao));
+  // Ja pago em ciclo anterior: nao chama a OpenAI de novo — mas so quando a extracao guardada segue
+  // o contrato de HOJE. Uma linha extraida sob um contrato antigo tem outras chaves, e montarTextoNota
+  // renderiza campo ausente como secao ausente: o negocio do cliente receberia um briefing sem uma
+  // unica secao, so cabecalho e rodape. Uma chamada de IA a mais custa menos que isso.
+  const guardada = linha.estado === 'EXTRAIDO' && linha.extracao ? parseJsonSeguro(linha.extracao, null) : null;
+  if (guardada && notasReuniao.ehExtracaoAtual(guardada.extracao)) {
+    ({ extracao, avisos } = guardada);
   } else {
     const mensagens = notasReuniao.montarMensagensExtracao(textoFonte, {
       tituloEvento: sinais.tituloEvento || doAssunto?.tituloEvento,
@@ -6774,7 +6778,7 @@ async function processarNotaReuniao({ gmail, calendar, drive, mensagem, stmts, d
     if (validado.vazia) {
       // Resumo vazio nao e "reuniao sem assunto": e falha de extracao. Uma nota vazia no negocio do
       // cliente e pior que nenhuma — parece que a reuniao nao rendeu nada.
-      stmts.avancar.run({ ...camposVazios(), gmail_message_id: id, estado: 'ERRO_PERMANENTE', ultimo_erro: 'extracao vazia (resumo_caso em branco)' });
+      stmts.avancar.run({ ...camposVazios(), gmail_message_id: id, estado: 'ERRO_PERMANENTE', ultimo_erro: 'extracao vazia (nenhum campo de sustentacao preenchido)' });
       if (!dryRun) await rotularNota(gmail, id, NOTAS_ROTULOS.erro);
       console.log(`  ⚠️ ${id}: extracao vazia — nada postado no deal ${resolucao.dealId}`);
       return { estado: 'ERRO_PERMANENTE' };
