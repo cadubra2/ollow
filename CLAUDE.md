@@ -527,8 +527,35 @@ em [src/notas-reuniao.js](src/notas-reuniao.js) (puro, sem rede); o `index.js` s
   12345678 do processo administrativo", um número que o cliente leu em voz alta, viraria vínculo de
   confiança *alta* com um negócio qualquer. A transcrição nem chega em `extrairSinais`: não existe
   parâmetro para ela, e há teste garantindo que continue assim.
+- **A nota é o "BRIEFING DE ATENDIMENTO E ALINHAMENTO ESTRATÉGICO", e o contrato de extração É a
+  estrutura dele.** Três seções, montadas por `montarTextoNota` a partir das 3 chaves de `CAMPOS`
+  ([src/notas-reuniao.js](src/notas-reuniao.js)): *1. Do objeto* (escopo formal da contratação),
+  *2. Da estratégia* (texto corrido único: via eleita e foro, fundamentação legal, superação de
+  óbices e diretrizes internas da equipe — tudo numa narrativa só) e *3. Da proposta de honorários*.
+  Não existe template em outro lugar — trocar `CAMPOS` é trocar o formato da nota.
+  **Decisão do escritório em 20/08/2026**: o briefing deixou de levar contexto/histórico do cliente
+  (perfil, histórico processual anterior, situação/urgência) — só objeto, estratégia e honorários, no
+  mesmo formato do texto de proposta já usado com clientes reais (ex.: caso do aluno de medicina com
+  mandado de segurança negado no TRF3). `estrategia` existe para fundir num parágrafo só o que antes
+  eram campos separados; documentos a juntar e combinados internos da equipe entram nela, sem campo
+  próprio.
+  **`honorarios` é lista livre de `{etapa, valor, condicao}`, não cinco campos fixos.** Campo fixo é
+  convite a preencher: perguntado sobre "Êxito Intermediário (Etapa 2)" num atendimento em que só se
+  falou de entrada, o modelo devolve um valor plausível — e número inventado no campo de honorários é
+  o pior erro que esta rotina pode cometer. As cinco etapas canônicas vivem no **prompt**, como
+  vocabulário preferido.
+  **Texto puro, sem Markdown**: o `description` do Moskit é exibido cru, então `**` e `##` virariam
+  sujeira justamente no documento que o advogado abre antes de redigir a peça.
+  `vazia` deixou de ser "resumo em branco" e passou a ser *nenhum* campo de sustentação
+  (`CAMPOS_SUSTENTACAO`, hoje `objeto`/`estrategia`) preenchido — honorários sozinho, sem objeto nem
+  estratégia, é o retrato do modelo que preencheu o formulário sem ter lido a reunião.
+  **A extração guardada é reusada só se seguir o contrato de hoje** (`ehExtracaoAtual`, conferido no
+  `index.js` antes de reaproveitar uma linha em `EXTRAIDO`). Campo ausente vira seção ausente, então
+  uma linha extraída sob contrato antigo entregaria ao cliente um briefing com cabeçalho e rodapé e
+  nada no meio; uma chamada de IA a mais custa menos que isso.
 - **Filtro de ancoragem sobre a saída da IA** (`validarExtracao`, o análogo de `src/evidencia.js`):
-  todo valor monetário, CPF/CNPJ, número CNJ e data que apareça na extração e **não** apareça no
+  todo valor monetário, CPF/CNPJ, número CNJ, **citação legal** e data que apareça na extração e
+  **não** apareça no
   texto-fonte (comparando só os dígitos, para pontuação diferente não gerar falso alarme) é **marcado
   inline** com `[⚠ não localizado no texto]` e vira aviso no rodapé. Marca em vez de apagar de
   propósito: o falso positivo é real (o valor pode ter sido dito por extenso) e apagar destruiria um
@@ -540,6 +567,13 @@ em [src/notas-reuniao.js](src/notas-reuniao.js) (puro, sem rede); o `index.js` s
   procuraria `500000` num texto que tem `5000` e marcaria um valor **certo** como não localizado.
   Falso alarme no campo de honorários é pior que nenhum aviso: ensina o advogado a ignorar o símbolo.
   Documento, processo e data continuam por dígitos, onde a identidade é a própria sequência.
+  **Citação legal entrou no filtro quando o briefing ganhou uma seção de fundamentação (hoje dentro
+  de `estrategia`).** Pedir "os dispositivos discutidos" é exatamente o convite para o modelo completar "a LDB" com
+  "(Lei 9.394/96)" de memória — o número sai perfeito, e é por isso que ninguém desconfia. A norma é
+  conferida **bloco a bloco**, nunca pela cadeia inteira: `"9.394/96"` vira `9394` e `96` (o ponto é
+  separador de milhar e sai antes; quem separa é `/` e `-`), e bloco com menos de 3 dígitos é
+  ignorado — senão `"art. 47"` seria marcado em toda peça do escritório. Sem o bloco a bloco, a fonte
+  dizendo "Lei 9.394" e o modelo acrescentando o ano fariam uma citação **certa** virar alarme.
 - **Credencial separada.** `google-oauth-token-notas.json`, cliente OAuth próprio, porta 8092
   (`autorizar-google-notas.js`). O token do bot tem escopo só de Calendar; somar Gmail/Drive a ele
   exigiria refazer o consentimento, e um consentimento refeito pode invalidar o refresh token em uso

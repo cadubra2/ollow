@@ -272,32 +272,78 @@ function prepararTextoFonte({ corpo, textoDoc, maxChars = 120000 }) {
 // Extracao: prompt e validacao
 // ------------------------------------------------------------
 
+// O contrato de extracao E a estrutura do briefing: cada chave aqui vira uma secao em montarTextoNota,
+// na ordem em que o escritorio le. Nao existe "template" em outro lugar — trocar este objeto e trocar
+// o formato da nota.
+//
+// So 3 chaves, de proposito: o escritorio decidiu (20/08/2026, a partir de um caso real ja usado como
+// exemplo) que o briefing NAO leva contexto/historico do cliente — so o que vai para a proposta:
+// objeto, estrategia e honorarios. `estrategia` funde num texto corrido unico o que antes eram 3
+// campos separados (via eleita/foro, fundamentacao legal, superacao de obices) mais diretrizes
+// internas da equipe — o prompt e quem guia essa fusao, nao um campo por assunto.
+//
+// `honorarios` e uma LISTA LIVRE de etapas, e nao cinco campos fixos (entrada / exito 1 / exito 2 /
+// exito final / mensalidade). Campo fixo e um convite a preencher: perguntado sobre "Exito
+// Intermediario (Etapa 2)" num atendimento em que so se falou de entrada, o modelo devolve um valor
+// plausivel — e numero inventado no campo de honorarios e o pior erro que esta rotina pode cometer.
+// As cinco etapas canonicas vivem no PROMPT, como vocabulario preferido, nao como formulario.
 const CAMPOS = {
-  resumo_caso: 'texto',
-  teses_estrategia: 'texto',
-  documentos_solicitados: 'lista',
-  proposta_valores: 'texto',
-  dados_criticos: 'texto',
-  proximos_passos: 'lista',
+  objeto: 'texto',
+  estrategia: 'texto',
+  honorarios: 'honorarios',
 };
 
-const PROMPT_SISTEMA_NOTAS = `Você extrai dados estruturados de notas e transcrições de reuniões de um escritório de advocacia brasileiro (Caballero, Rocha & Carvalho), para registro no CRM.
+// Os campos que SUSTENTAM a nota. Sem nenhum deles a extracao falhou — nao e "reuniao objetiva".
+// Honorarios sozinho, sem objeto nem estrategia, e o retrato de um modelo que preencheu o formulario
+// sem ter lido nada.
+const CAMPOS_SUSTENTACAO = ['objeto', 'estrategia'];
+
+// Uma extracao gravada em ciclo ANTERIOR segue o contrato de hoje? O index.js reusa a extracao da
+// tabela quando a linha ja passou por EXTRAIDO, para nao pagar OpenAI duas vezes — e uma linha
+// extraida sob o contrato antigo renderia um briefing sem uma unica secao: so cabecalho e rodape, no
+// prontuario do cliente. O predicado mora aqui para que o index.js nao carregue nome de campo dentro
+// dele, que e o mesmo motivo de CAMPOS existir.
+function ehExtracaoAtual(obj) {
+  if (!obj || typeof obj !== 'object') return false;
+  return Object.keys(CAMPOS).some((chave) => chave in obj);
+}
+
+const PROMPT_SISTEMA_NOTAS = `Você extrai dados estruturados de notas e transcrições de reuniões de um escritório de advocacia brasileiro (Caballero, Rocha & Carvalho), para montar o BRIEFING DE ATENDIMENTO E ALINHAMENTO ESTRATÉGICO no CRM.
 
 Responda SOMENTE com um objeto JSON com exatamente estas chaves:
-- "resumo_caso": texto. O caso do cliente em 3 a 6 frases: quem é, o que aconteceu, o que ele quer.
-- "teses_estrategia": texto. As teses jurídicas e a estratégia discutidas pelo advogado. Vazio se não houve.
-- "documentos_solicitados": lista de strings. Cada documento que o escritório pediu ao cliente, um por item.
-- "proposta_valores": texto. Honorários, forma de pagamento e condições, EXATAMENTE como ditos.
-- "dados_criticos": texto. Prazos, números de processo, órgãos, datas de audiência, nomes de partes.
-- "proximos_passos": lista de strings. Cada ação combinada, começando por quem a executa.
+
+1. DO OBJETO
+- "objeto": texto corrido, em redação de contrato — como a cláusula de "objeto" de um contrato de honorários. Descreva com precisão qual providência jurídica o escritório vai tomar (ação, recurso, medida específica), perante qual órgão/juízo, e com que finalidade concreta para o cliente. Não resuma numa frase genérica: escreva o parágrafo inteiro, com todos os detalhes que a reunião deu (nome da instituição, cargo, situação específica etc.).
+
+2. DA ESTRATÉGIA
+- "estrategia": texto corrido único — um parágrafo narrativo EXTENSO, não uma lista de tópicos nem uma frase solta. Funda neste único texto, com o MÁXIMO de detalhe que a reunião permitir:
+  - a medida escolhida e onde será proposta (juízo, tribunal, prevenção ou nova distribuição);
+  - os fundamentos discutidos, citando o dispositivo/tese pelo NOME que foi dito (artigo, princípio, teoria — ex.: "tese da razoabilidade e do fato consumado");
+  - como derrubar o que atrapalha (o óbice específico, o que provar, que documento juntar, que preliminar enfrentar, que erro do processo anterior corrigir);
+  - instruções que a equipe deu a si mesma na reunião (quem faz o quê, que ferramenta usar, o que confirmar com o cliente).
+  Uma frase curta e genérica ("vamos entrar com mandado de segurança") é falha de extração — reproduza o raciocínio jurídico discutido com a riqueza de um parecer, não o título de uma ação.
+
+3. DA PROPOSTA DE HONORÁRIOS
+- "honorarios": lista de objetos {"etapa","valor","condicao"}, um por parcela combinada.
+  "etapa": use, quando couber, os rótulos "Entrada / Início da Ação", "Êxito Intermediário (Etapa 1)", "Êxito Intermediário (Etapa 2)", "Êxito Final", "Manutenção / Acompanhamento Mensal".
+  "valor": o valor como foi dito (R$ 3.500,00). "condicao": o que dispara essa parcela — descreva por extenso, sem abreviar ("protocolo em 1º e 2º graus", não "protocolo").
+  Inclua SOMENTE as etapas efetivamente combinadas. Lista vazia se não se falou de dinheiro.
+
+NÍVEL DE DETALHE ESPERADO (estilo de referência — o CONTEÚDO vem sempre da reunião atual, nunca copie este exemplo):
+- objeto: "A atuação do escritório CABALLERO, ROCHA & CARVALHO consistirá nos serviços de consultoria e assessoria jurídica especializada para a propositura de Mandado de Segurança na Justiça Federal, com o objetivo de compelir a faculdade a constituir banca examinadora especial para fins de abreviação da colação de grau do CONTRATANTE, assegurando a posse em cargo público."
+- estrategia: "A estratégia compreende a propositura de mandado de segurança na Justiça Federal, com fundamento no artigo 47, parágrafo 2º, da Lei de Diretrizes e Bases da Educação, superando o óbice regimental da instituição mediante a demonstração de interesse de agir, instrução documental robusta e aplicação da tese de razoabilidade e do fato consumado."
+Repare no que torna isto detalhado: nome da instituição por extenso, o dispositivo legal específico (não só "a LDB"), e as teses/técnicas pelo nome próprio (não "vamos juntar documentos e argumentar"). Um "objeto"/"estrategia" que não chegue a este nível de especificidade, quando a reunião tinha a informação, é extração malfeita.
 
 REGRAS INEGOCIÁVEIS:
-1. Nunca invente. Valor, prazo, CPF, número de processo ou data que não esteja no texto NÃO pode aparecer na resposta. Na dúvida, omita.
-2. Campo sem informação no texto: string vazia "" ou lista vazia []. Nunca escreva "não informado", "não mencionado" ou similar.
-3. NÃO classifique a área do direito nem sugira advogado responsável. Isso é decidido em outro lugar do sistema, e uma segunda opinião aqui contradiz a primeira.
-4. Distinga o que o CLIENTE afirmou do que o ADVOGADO opinou. Use "o cliente relata que..." e "o advogado orientou que...".
-5. Preserve valores monetários no formato original do texto (R$ 3.500,00), sem converter nem arredondar.
-6. Escreva em português do Brasil, em tom objetivo de registro profissional. Sem saudação, sem conclusão, sem opinião sua.`;
+1. Nunca invente. Valor, prazo, CPF, número de processo, número de lei ou data que não esteja no texto NÃO pode aparecer na resposta. Na dúvida, omita.
+2. Só escreva número de lei, artigo ou súmula se o NÚMERO tiver sido dito na reunião. Se só o nome foi dito ("a LDB", "o CPC"), escreva o nome sem número.
+3. Seja EXTREMAMENTE DETALHADO no que foi dito: preserve todo nome de órgão, instituição, programa, cargo, prazo, condição, tese jurídica e dispositivo citado. "objeto" e "estrategia" são parágrafos completos e específicos, nunca uma frase-resumo genérica. Perder um nome, um número ou um raciocínio jurídico discutido derrota o propósito do briefing — quem lê precisa entender o caso sem ouvir a reunião de novo. A riqueza vem do texto da reunião, nunca do seu repertório.
+4. Campo sem informação no texto: string vazia "" ou lista vazia []. Nunca escreva "não informado", "não mencionado" ou similar — campo vazio é omitido do briefing automaticamente.
+5. NÃO classifique a área do direito nem sugira advogado responsável. Isso é decidido em outro lugar do sistema, e uma segunda opinião aqui contradiz a primeira.
+6. Distinga o que o CLIENTE afirmou do que o ADVOGADO opinou. Use "o cliente relata que..." e "o advogado orientou que...".
+7. NÃO inclua contexto pessoal ou histórico do cliente (profissão, processos anteriores, urgência) — o briefing cobre só objeto, estratégia e honorários.
+8. Preserve valores monetários no formato original do texto (R$ 3.500,00), sem converter nem arredondar.
+9. Escreva em português do Brasil, em tom objetivo de registro profissional. Sem saudação, sem conclusão, sem opinião sua.`;
 
 function montarMensagensExtracao(textoFonte, meta = {}) {
   const cabecalho = [
@@ -320,6 +366,10 @@ const PADROES_ANCORA = [
   { nome: 'CPF', re: /\b\d{3}\.?\d{3}\.?\d{3}-\d{2}\b/g },
   { nome: 'processo', re: /\b\d{7}-?\d{2}\.?\d{4}\.?\d\.?\d{2}\.?\d{4}\b/g },
   { nome: 'data', re: /\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\b/g },
+  // A citacao legal so virou risco quando o briefing ganhou um campo de fundamentacao: pedir "os
+  // dispositivos discutidos" e exatamente o convite para o modelo completar "a LDB" com
+  // "(Lei n 9.394/96)" de memoria. O numero sai perfeito — e e por isso que ninguem desconfia.
+  { nome: 'norma', re: /\b(?:lei|lc|s[úu]mula|art(?:igo)?)\.?\s*n?[º°]?\s*\d(?:[\d.\/-]*\d)?/gi },
 ];
 
 const soDigitos = (s) => String(s).replace(/\D/g, '');
@@ -376,6 +426,17 @@ function conferirAncoragem(valor, fonte) {
       if (nome === 'valor') {
         const n = comoNumero(token);
         if (n === null || valoresFonte.has(n)) continue;
+      } else if (nome === 'norma') {
+        // Norma se confere BLOCO a bloco, nunca pela cadeia inteira. "Lei n 9.394/96" tem os blocos
+        // 9394 e 96: se a fonte disse "Lei 9.394" e o modelo completou o ano, procurar "939496" no
+        // texto marcaria um numero CERTO. Mesmo raciocinio do dinheiro comparado como numero — falso
+        // alarme no campo de fundamentacao ensina o advogado a ignorar o simbolo.
+        //
+        // O ponto e separador de milhar aqui ("9.394"), entao sai antes de partir os blocos; quem
+        // separa de verdade e "/" e "-". Bloco curto ("art. 47", "§ 2") nao identifica norma nenhuma
+        // e e ignorado — a mesma guarda de 3 digitos dos demais padroes.
+        const blocos = token.replace(/\./g, '').match(/\d+/g) || [];
+        if (!blocos.some((b) => b.length >= 3 && !digitosFonte.includes(b))) continue;
       } else {
         const digitos = soDigitos(token);
         // Menos de 3 digitos nao identifica nada (um "1/2" da vida) e geraria ruido constante.
@@ -401,24 +462,36 @@ function validarExtracao(bruto, textoFonte) {
 
   const entrada = bruto && typeof bruto === 'object' && !Array.isArray(bruto) ? bruto : {};
 
+  // Passa um texto pelo filtro de ancoragem e acumula o aviso ja nomeando o campo — e o rotulo que o
+  // advogado le no rodape para saber ONDE esta o numero suspeito.
+  const ancorar = (texto, rotulo) => {
+    const { valor, achados } = conferirAncoragem(texto, fonte);
+    for (const a of achados) avisos.push(`${rotulo}: ${a.tipo} "${a.token}" não aparece no texto da reunião`);
+    return valor;
+  };
+
   for (const [chave, tipo] of Object.entries(CAMPOS)) {
     const valor = entrada[chave];
 
-    if (tipo === 'lista') {
-      const lista = Array.isArray(valor) ? valor : (typeof valor === 'string' && valor.trim() ? [valor] : []);
-      extracao[chave] = lista
-        .map((item) => (typeof item === 'string' ? item.trim() : ''))
-        .filter(Boolean)
+    if (tipo === 'honorarios') {
+      const itens = Array.isArray(valor) ? valor : [];
+      extracao[chave] = itens
         .map((item) => {
-          const { valor: limpo, achados } = conferirAncoragem(item, fonte);
-          for (const a of achados) avisos.push(`${chave}: ${a.tipo} "${a.token}" não aparece no texto da reunião`);
-          return limpo;
+          const campo = (k) => (item && typeof item[k] === 'string' ? item[k].trim() : '');
+          return { etapa: campo('etapa'), valor: campo('valor'), condicao: campo('condicao') };
+        })
+        // Sem etapa E sem valor nao ha parcela nenhuma: uma condicao solta nao diz o que se paga.
+        .filter((i) => i.etapa || i.valor)
+        .map((i) => {
+          const rotulo = `honorarios${i.etapa ? ` (${i.etapa})` : ''}`;
+          return {
+            etapa: ancorar(i.etapa, rotulo),
+            valor: ancorar(i.valor, rotulo),
+            condicao: ancorar(i.condicao, rotulo),
+          };
         });
     } else {
-      const texto = typeof valor === 'string' ? valor.trim() : '';
-      const { valor: limpo, achados } = conferirAncoragem(texto, fonte);
-      for (const a of achados) avisos.push(`${chave}: ${a.tipo} "${a.token}" não aparece no texto da reunião`);
-      extracao[chave] = limpo;
+      extracao[chave] = ancorar(typeof valor === 'string' ? valor.trim() : '', chave);
     }
   }
 
@@ -427,9 +500,9 @@ function validarExtracao(bruto, textoFonte) {
   const extras = Object.keys(entrada).filter((k) => !(k in CAMPOS));
   if (extras.length) avisos.push(`campos ignorados fora do contrato: ${extras.join(', ')}`);
 
-  // Resumo vazio nao e "reuniao sem assunto": e falha de extracao. Sinalizado para o chamador
-  // decidir (nao virar nota vazia no negocio do cliente).
-  const vazia = !extracao.resumo_caso;
+  // Nenhum campo de sustentacao preenchido nao e "reuniao sem assunto": e falha de extracao.
+  // Sinalizado para o chamador decidir (nao virar briefing so de cabecalho e rodape no negocio).
+  const vazia = !CAMPOS_SUSTENTACAO.some((c) => extracao[c]);
 
   return { extracao, avisos, vazia };
 }
@@ -465,21 +538,34 @@ function nomeAnexoNota(marcador, dataIso) {
 }
 
 const secao = (titulo, conteudo) => (conteudo && conteudo.length ? `${titulo}\n${conteudo}` : '');
-const lista = (itens) => (itens || []).map((i) => `• ${i}`).join('\n');
+
+// Secao 3: "- Entrada / Inicio da Acao: R$ 5.000,00 — protocolo em 1o e 2o graus". Etapa sem valor
+// (combinado sem preco) e valor sem etapa (preco sem gatilho) continuam legiveis; o travessao so
+// aparece quando ha condicao.
+const secaoHonorarios = (titulo, itens) =>
+  secao(titulo, (itens || []).map((i) => {
+    const cabeca = [i.etapa, i.valor].filter(Boolean).join(': ');
+    return cabeca ? `- ${[cabeca, i.condicao].filter(Boolean).join(' — ')}` : '';
+  }).filter(Boolean).join('\n'));
 
 // Funcao PURA: mesma entrada, mesmo texto. E o que permite comparar contra o que esta no CRM.
+//
+// TEXTO PURO, sem Markdown: nenhuma nota deste sistema usa `**` ou `##`, porque o campo
+// `description` do Moskit e exibido cru — sintaxe nao renderizada viraria sujeira na tela do
+// advogado, justamente no documento que ele abre minutos antes de redigir a peca.
+//
+// 3 secoes, de proposito (20/08/2026): o briefing nao leva contexto/historico do cliente, so o que
+// vai para a proposta. Mesmo icone (📌) e titulo em minuscula nas tres, espelhando o exemplo real que
+// motivou a mudanca.
 function montarTextoNota({ extracao, meta = {}, avisos = [], marcador }) {
   const quando = [meta.dataBr, meta.horaBr].filter(Boolean).join(' às ');
+  const e = extracao || {};
 
   const corpo = [
-    `🧠 Notas da reunião${quando ? ` — ${quando}` : ''}${meta.tituloEvento ? ` (${meta.tituloEvento})` : ''}`,
-    '',
-    secao('📌 RESUMO DO CASO', extracao.resumo_caso),
-    secao('⚖️ TESES E ESTRATÉGIA', extracao.teses_estrategia),
-    secao('📄 DOCUMENTOS SOLICITADOS', lista(extracao.documentos_solicitados)),
-    secao('💰 PROPOSTA / VALORES', extracao.proposta_valores),
-    secao('🔑 DADOS CRÍTICOS', extracao.dados_criticos),
-    secao('➡️ PRÓXIMOS PASSOS', lista(extracao.proximos_passos)),
+    `📄 BRIEFING DE ATENDIMENTO E ALINHAMENTO ESTRATÉGICO${quando ? ` — ${quando}` : ''}${meta.tituloEvento ? ` (${meta.tituloEvento})` : ''}`,
+    secao('📌 1. Do objeto', e.objeto),
+    secao('📌 2. Da estratégia', e.estrategia),
+    secaoHonorarios('📌 3. Da proposta de honorários', e.honorarios),
   ].filter((p) => p !== '').join('\n\n');
 
   const rodape = [
@@ -515,9 +601,11 @@ module.exports = {
   montarMensagensExtracao,
   validarExtracao,
   conferirAncoragem,
+  ehExtracaoAtual,
   marcadorNota,
   nomeAnexoNota,
   montarTextoNota,
   PROMPT_SISTEMA_NOTAS,
   CAMPOS,
+  CAMPOS_SUSTENTACAO,
 };
