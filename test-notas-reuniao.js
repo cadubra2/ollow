@@ -336,7 +336,7 @@ console.log('\n=== Texto-fonte e truncagem ===');
 console.log('\n=== Validacao da saida da IA (filtro de ancoragem) ===');
 
 // E contra ESTA fonte que todo numero da extracao e conferido. Repare que ela cita "art. 47" e
-// "Lei 9.394/96": desde que o briefing ganhou uma secao de estrategia, citacao legal entrou no
+// "Lei 9.394/96": desde que o briefing ganhou o campo de fundamentacao, citacao legal entrou no
 // filtro, e os dois casos (o numero curto que nao identifica nada e a norma inteira) precisam de
 // cobertura.
 const FONTE = 'O advogado propos honorarios de R$ 3.500,00 divididos em 3x. '
@@ -345,44 +345,46 @@ const FONTE = 'O advogado propos honorarios de R$ 3.500,00 divididos em 3x. '
 
 {
   const { extracao, avisos } = validarExtracao({
-    objeto: 'Audiencia marcada para 20/09/2026.',
-    estrategia: 'Processo 0801234-56.2026.8.14.0301 instruido com o historico, com fundamento no art. 47 da Lei 9.394/96.',
+    perfil_qualificacao: 'Aluno de Medicina no ultimo periodo.',
+    situacao_atual_urgencia: 'Audiencia em 20/09/2026.',
+    fundamentacao_legal: 'Art. 47 da Lei 9.394/96.',
+    superacao_obices: 'Processo 0801234-56.2026.8.14.0301 instruido com o historico.',
     honorarios: [{ etapa: 'Entrada / Início da Ação', valor: 'R$ 3.500,00', condicao: 'protocolo em 1o grau' }],
   }, FONTE);
 
   checar('valor que existe na fonte passa limpo', extracao.honorarios[0].valor === 'R$ 3.500,00', extracao.honorarios[0]);
-  checar('processo que existe passa limpo', !extracao.estrategia.includes('⚠'), extracao.estrategia);
-  checar('data que existe passa limpa', !extracao.objeto.includes('⚠'), extracao.objeto);
-  checar('norma que existe passa limpa', !extracao.estrategia.includes('⚠'), extracao.estrategia);
+  checar('processo que existe passa limpo', !extracao.superacao_obices.includes('⚠'), extracao.superacao_obices);
+  checar('data que existe passa limpa', !extracao.situacao_atual_urgencia.includes('⚠'), extracao.situacao_atual_urgencia);
+  checar('norma que existe passa limpa', !extracao.fundamentacao_legal.includes('⚠'), extracao.fundamentacao_legal);
   checar('nada ancorado => nenhum aviso', avisos.length === 0, avisos);
 }
 
 {
-  // O risco que a secao de estrategia abriu: pedir "os dispositivos discutidos" e o convite para o
-  // modelo completar "a LDB" com um numero de lei que ninguem disse. O numero sai perfeito.
+  // O risco que o campo "fundamentacao_legal" abriu: pedir "os dispositivos discutidos" e o convite
+  // para o modelo completar "a LDB" com um numero de lei que ninguem disse. O numero sai perfeito.
   const { extracao, avisos } = validarExtracao({
-    objeto: 'ok',
-    estrategia: 'Aplicacao da Lei 13.105/2015 e do art. 47.',
+    perfil_qualificacao: 'ok',
+    fundamentacao_legal: 'Aplicacao da Lei 13.105/2015 e do art. 47.',
   }, FONTE);
 
-  checar('norma INVENTADA e marcada', extracao.estrategia.includes('Lei 13.105/2015 [⚠ não localizado'), extracao.estrategia);
-  checar('o numero original permanece legivel', extracao.estrategia.includes('Lei 13.105/2015'), extracao.estrategia);
+  checar('norma INVENTADA e marcada', extracao.fundamentacao_legal.includes('Lei 13.105/2015 [⚠ não localizado'), extracao.fundamentacao_legal);
+  checar('o numero original permanece legivel', extracao.fundamentacao_legal.includes('Lei 13.105/2015'), extracao.fundamentacao_legal);
   // "art. 47" tem dois digitos: nao identifica norma nenhuma e marcaria toda peca do escritorio.
-  checar('artigo curto NAO vira ruido', !/art\. 47 \[⚠/.test(extracao.estrategia), extracao.estrategia);
-  checar('aviso nomeia o campo', avisos.some((a) => a.startsWith('estrategia:')), avisos);
+  checar('artigo curto NAO vira ruido', !/art\. 47 \[⚠/.test(extracao.fundamentacao_legal), extracao.fundamentacao_legal);
+  checar('aviso nomeia o campo', avisos.some((a) => a.startsWith('fundamentacao_legal:')), avisos);
 }
 
 {
   // O bloco a bloco: a fonte disse "Lei 9.394" sem o ano, e o modelo completou "/96". Comparar a
   // cadeia inteira ("939496") procuraria no texto um numero que ninguem escreveu junto e marcaria uma
-  // citacao CERTA — falso alarme na estrategia ensina o advogado a ignorar o simbolo.
-  const { extracao } = validarExtracao({ objeto: 'ok', estrategia: 'Lei 9.394/96' }, 'o advogado citou a Lei 9.394');
-  checar('ano acrescentado a uma lei que existe na fonte nao vira alarme', !extracao.estrategia.includes('⚠'), extracao.estrategia);
+  // citacao CERTA — falso alarme no campo de fundamentacao ensina o advogado a ignorar o simbolo.
+  const { extracao } = validarExtracao({ perfil_qualificacao: 'ok', fundamentacao_legal: 'Lei 9.394/96' }, 'o advogado citou a Lei 9.394');
+  checar('ano acrescentado a uma lei que existe na fonte nao vira alarme', !extracao.fundamentacao_legal.includes('⚠'), extracao.fundamentacao_legal);
 }
 
 {
   const { extracao, avisos } = validarExtracao({
-    objeto: 'ok',
+    perfil_qualificacao: 'ok',
     honorarios: [
       { etapa: 'Entrada / Início da Ação', valor: 'R$ 3.500,00', condicao: 'protocolo' },
       { etapa: 'Êxito Final', valor: 'R$ 9.900,00', condicao: 'transito em julgado' },
@@ -402,7 +404,7 @@ const FONTE = 'O advogado propos honorarios de R$ 3.500,00 divididos em 3x. '
   // procuraria "500000" num texto que tem "5000". Dinheiro se compara como numero.
   const SEM_MOEDA = 'A causa foi precificada em 5000 reais para a primeira instancia e 1500 reais para recursos.';
   const { extracao } = validarExtracao({
-    objeto: 'ok',
+    perfil_qualificacao: 'ok',
     honorarios: [{ etapa: 'Entrada / Início da Ação', valor: 'R$ 5.000,00', condicao: 'primeira instancia' }],
   }, SEM_MOEDA);
   checar('"5000 reais" na fonte casa com "R$ 5.000,00" na extracao', !extracao.honorarios[0].valor.includes('⚠'), extracao.honorarios[0].valor);
@@ -410,7 +412,7 @@ const FONTE = 'O advogado propos honorarios de R$ 3.500,00 divididos em 3x. '
 
 {
   const { extracao } = validarExtracao({
-    objeto: 'ok',
+    perfil_qualificacao: 'ok',
     honorarios: [
       { condicao: 'quando o juiz decidir' },  // sem etapa e sem valor: nao e parcela nenhuma
       { etapa: 'Manutenção / Acompanhamento Mensal', valor: 'R$ 800,00/mês' },
@@ -426,7 +428,7 @@ const FONTE = 'O advogado propos honorarios de R$ 3.500,00 divididos em 3x. '
 
 {
   const { extracao, avisos, vazia } = validarExtracao({
-    objeto: '',
+    perfil_qualificacao: '',
     resumo_caso: 'campo do contrato antigo',   // chave que nao existe mais
     honorarios: 'nao e lista',
   }, FONTE);
@@ -438,13 +440,31 @@ const FONTE = 'O advogado propos honorarios de R$ 3.500,00 divididos em 3x. '
 
 {
   checar('objeto sozinho ja sustenta a nota', validarExtracao({ objeto: 'Propositura de mandado de seguranca.' }, FONTE).vazia === false);
-  checar('estrategia sozinha tambem sustenta', validarExtracao({ estrategia: 'Mandado de seguranca, mesmo juizo por prevencao.' }, FONTE).vazia === false);
-  // Honorarios sozinho, sem objeto nem estrategia, e o retrato do modelo que preencheu o formulario
-  // sem ter lido a reuniao — e uma nota assim vai para o prontuario do cliente.
+  // Estrategia e preco sem UMA linha de contexto factual e o retrato do modelo que preencheu o
+  // formulario sem ter lido a reuniao — e uma nota assim vai para o prontuario do cliente.
   const so = validarExtracao({
+    via_eleita_foro: 'Mandado de seguranca',
     honorarios: [{ etapa: 'Entrada / Início da Ação', valor: 'R$ 3.500,00' }],
   }, FONTE);
-  checar('honorarios SEM objeto nem estrategia ainda e extracao vazia', so.vazia === true, so.extracao);
+  checar('estrategia + honorarios SEM contexto ainda e extracao vazia', so.vazia === true, so.extracao);
+  // Campo novo: papo social sozinho, sem nenhum campo do caso, tambem nao sustenta a nota — e o
+  // retrato de uma reuniao que so teve conversa fora do objeto do atendimento.
+  const soSocial = validarExtracao({
+    contexto_pessoal_social: 'Cliente comentou sobre outro emprego e planos de carreira.',
+  }, FONTE);
+  checar('contexto_pessoal_social sozinho ainda e extracao vazia', soSocial.vazia === true, soSocial.extracao);
+}
+
+{
+  // O campo novo (21/08/2026): papo social/pessoal tem lugar proprio, pra nao vazar pro perfil do
+  // cliente nem ser confundido com honorario (ex.: salario de outro emprego, dito de passagem).
+  const { extracao, avisos } = validarExtracao({
+    objeto: 'ok',
+    contexto_pessoal_social: 'Atua em outro emprego (advocacia empresarial), remuneracao de R$ 3.500,00 mensais, cogita mudar de carreira.',
+  }, FONTE);
+  checar('contexto_pessoal_social passa pelo mesmo filtro de ancoragem que os demais campos',
+    !extracao.contexto_pessoal_social.includes('⚠'), extracao.contexto_pessoal_social);
+  checar('nenhum aviso extra so por causa do campo novo', avisos.length === 0, avisos);
 }
 
 {
@@ -469,14 +489,22 @@ console.log('\n=== Marcador e texto da nota ===');
 }
 
 {
-  // O caso real que motivou a mudanca para 3 secoes (20/08/2026): aluno de medicina, mandado de
-  // seguranca negado no TRF3 por deficiencia tecnica do patrono anterior, agora com nova negativa
-  // expressa. `estrategia` funde num texto corrido so o que antes eram 3 campos (via/foro,
-  // fundamentacao, superacao de obices) — contexto do cliente/historico nao entra mais no briefing.
+  // O caso real do aluno de medicina (mandado de seguranca negado no TRF3 por deficiencia tecnica do
+  // patrono anterior, agora com nova negativa expressa) — o mesmo caso que motivou a fusao pra 3
+  // secoes em 20/08/2026 e a reversao pra 5 secoes em 21/08/2026, depois de testar contra um segundo
+  // caso real (assessoria administrativa de Fies) que expos a falta do contexto do cliente e do papo
+  // social/pessoal ter lugar proprio.
   const marcador = marcadorNota('m1', 'd1');
   const EXTRACAO = {
+    perfil_qualificacao: 'Aluno de Medicina no ultimo periodo, aprovado em 1o lugar.',
+    historico_processual_anterior: 'Mandado de seguranca extinto no TRF3 por deficiencia tecnica do patrono anterior.',
+    situacao_atual_urgencia: 'Nova negativa expressa da IES; risco de perder a posse no cargo.',
+    diretrizes_internas_equipe: 'Subir a transcricao no NotebookLM antes de redigir a peca.',
     objeto: 'Propositura de mandado de seguranca perante a Justica Federal.',
-    estrategia: 'Mandado de seguranca, mesmo juizo por prevencao, com fundamento no principio da razoabilidade e na teoria do fato consumado.',
+    via_eleita_foro: 'Mandado de seguranca, mesmo juizo por prevencao.',
+    fundamentacao_legal: 'Principio da razoabilidade e teoria do fato consumado.',
+    superacao_obices: '',
+    contexto_pessoal_social: 'Pretende migrar de carreira apos concluir a formacao em Medicina.',
     honorarios: [
       { etapa: 'Entrada / Início da Ação', valor: 'R$ 5.000,00', condicao: 'protocolo em 1o e 2o graus' },
       { etapa: 'Êxito Final', valor: 'R$ 10.000,00', condicao: '' },
@@ -487,11 +515,13 @@ console.log('\n=== Marcador e texto da nota ===');
 
   checar('titulo do briefing no topo', texto.startsWith('📄 BRIEFING DE ATENDIMENTO E ALINHAMENTO ESTRATÉGICO'), texto.slice(0, 70));
   checar('a data e o titulo do evento no cabecalho', texto.includes('— 14/08/2026 (Consulta — Lia (Berto))'), texto.slice(0, 120));
-  checar('as tres secoes na ordem', /1\. Do objeto[\s\S]*2\. Da estratégia[\s\S]*3\. Da proposta de honorários/.test(texto), texto);
-  checar('secao 1 e texto corrido, sem bullet', texto.includes('📌 1. Do objeto\nPropositura'), texto);
-  checar('secao 2 e texto corrido, sem bullet', texto.includes('📌 2. Da estratégia\nMandado de seguranca'), texto);
-  checar('honorario com condicao usa travessao', texto.includes('- Entrada / Início da Ação: R$ 5.000,00 — protocolo em 1o e 2o graus'), texto);
-  checar('honorario sem condicao nao deixa travessao solto', texto.includes('- Êxito Final: R$ 10.000,00\n'), texto);
+  checar('as cinco secoes na ordem', /1\. CONTEXTO[\s\S]*2\. DO OBJETO[\s\S]*3\. DA ESTRATÉGIA[\s\S]*4\. DA PROPOSTA[\s\S]*5\. CONTEXTO PESSOAL/.test(texto), texto);
+  checar('rotulo com valor vira bullet', texto.includes('• Perfil/Qualificação: Aluno de Medicina'), texto);
+  checar('rotulo VAZIO some do bullet', !texto.includes('Superação de Óbices'), texto);
+  checar('secao 2 e texto corrido, sem bullet', texto.includes('📌 2. DO OBJETO\nPropositura'), texto);
+  checar('honorario com condicao usa travessao', texto.includes('• Entrada / Início da Ação: R$ 5.000,00 — protocolo em 1o e 2o graus'), texto);
+  checar('honorario sem condicao nao deixa travessao solto', texto.includes('• Êxito Final: R$ 10.000,00\n'), texto);
+  checar('secao 5 (campo novo) e texto corrido', texto.includes('🗒️ 5. CONTEXTO PESSOAL/SOCIAL\nPretende migrar'), texto);
   checar('nota termina com o marcador', texto.trim().endsWith(marcador), texto.slice(-60));
   checar('disclaimer de IA presente', texto.includes('gerado por IA'));
   checar('metodo de vinculo impresso para auditoria', texto.includes('Vínculo: evento_telefone'), texto);
@@ -505,8 +535,8 @@ console.log('\n=== Marcador e texto da nota ===');
 }
 
 {
-  // Secao com conteudo vazio some inteira. E o motivo de o prompt proibir "nao informado": um titulo
-  // sem o corpo correspondente ocupa espaco afirmando que se sabe alguma coisa.
+  // Secao com TODOS os rotulos vazios some inteira. E o motivo de o prompt proibir "nao informado":
+  // um titulo seguido de tres rotulos vazios ocupa espaco afirmando que se sabe alguma coisa.
   const texto = montarTextoNota({
     extracao: { objeto: 'So o objeto foi dito.', honorarios: [] },
     meta: {},
@@ -514,9 +544,11 @@ console.log('\n=== Marcador e texto da nota ===');
     marcador: marcadorNota('m4', 'd4'),
   });
 
-  checar('secao de estrategia vazia some inteira', !texto.includes('Da estratégia'), texto);
-  checar('honorarios vazio omite a secao', !texto.includes('Da proposta de honorários'), texto);
-  checar('o que existe continua aparecendo', texto.includes('📌 1. Do objeto'), texto);
+  checar('secao 1 inteira vazia some', !texto.includes('CONTEXTO DO CLIENTE'), texto);
+  checar('secao 3 inteira vazia some', !texto.includes('ESTRATÉGIA JURÍDICA'), texto);
+  checar('honorarios vazio omite a secao 4', !texto.includes('PROPOSTA DE HONORÁRIOS'), texto);
+  checar('secao 5 (campo novo) vazia tambem some', !texto.includes('CONTEXTO PESSOAL'), texto);
+  checar('o que existe continua aparecendo', texto.includes('📌 2. DO OBJETO'), texto);
 }
 
 {
