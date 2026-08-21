@@ -276,11 +276,17 @@ function prepararTextoFonte({ corpo, textoDoc, maxChars = 120000 }) {
 // na ordem em que o escritorio le. Nao existe "template" em outro lugar — trocar este objeto e trocar
 // o formato da nota.
 //
-// So 3 chaves, de proposito: o escritorio decidiu (20/08/2026, a partir de um caso real ja usado como
-// exemplo) que o briefing NAO leva contexto/historico do cliente — so o que vai para a proposta:
-// objeto, estrategia e honorarios. `estrategia` funde num texto corrido unico o que antes eram 3
-// campos separados (via eleita/foro, fundamentacao legal, superacao de obices) mais diretrizes
-// internas da equipe — o prompt e quem guia essa fusao, nao um campo por assunto.
+// Decisao do escritorio em 20/08/2026 (remover contexto do cliente, fundir estrategia num paragrafo
+// unico) foi REVERTIDA em 21/08/2026: testar o formato de 3 campos contra um caso real de assessoria
+// administrativa (Fies) mostrou que o contexto do cliente tem valor pra quem abre o negocio antes da
+// consulta, e que "Via Eleita & Foro" ficava vazia (e a secao inteira sumia) sempre que o atendimento
+// era so assessoria documental, sem acao judicial — ver PROMPT_SISTEMA_NOTAS.
+//
+// `contexto_pessoal_social` e NOVO: o mesmo caso real trouxe muito papo social sem relacao com o caso
+// (outro emprego do cliente, aspiracoes de carreira, rede de amigos). Sem um campo proprio, isso
+// vazava pra dentro de `perfil_qualificacao` (a regra de "seja exaustivo" nao distingue relevancia) —
+// ou, pior, um valor em reais dito de passagem (ex.: salario de outro emprego) podia ser confundido
+// com honorario. O campo separa sem descartar.
 //
 // `honorarios` e uma LISTA LIVRE de etapas, e nao cinco campos fixos (entrada / exito 1 / exito 2 /
 // exito final / mensalidade). Campo fixo e um convite a preencher: perguntado sobre "Exito
@@ -288,15 +294,32 @@ function prepararTextoFonte({ corpo, textoDoc, maxChars = 120000 }) {
 // plausivel — e numero inventado no campo de honorarios e o pior erro que esta rotina pode cometer.
 // As cinco etapas canonicas vivem no PROMPT, como vocabulario preferido, nao como formulario.
 const CAMPOS = {
+  // 1. Contexto do Cliente & Historico Fatico
+  perfil_qualificacao: 'texto',
+  historico_processual_anterior: 'texto',
+  situacao_atual_urgencia: 'texto',
+  diretrizes_internas_equipe: 'texto',
+  // 2. Do Objeto
   objeto: 'texto',
-  estrategia: 'texto',
+  // 3. Da Estrategia Juridica (aceita via judicial OU administrativa)
+  via_eleita_foro: 'texto',
+  fundamentacao_legal: 'texto',
+  superacao_obices: 'texto',
+  // 4. Da Proposta de Honorarios
   honorarios: 'honorarios',
+  // 5. Contexto Pessoal/Social — fora do caso, mas preservado
+  contexto_pessoal_social: 'texto',
 };
 
 // Os campos que SUSTENTAM a nota. Sem nenhum deles a extracao falhou — nao e "reuniao objetiva".
-// Honorarios sozinho, sem objeto nem estrategia, e o retrato de um modelo que preencheu o formulario
-// sem ter lido nada.
-const CAMPOS_SUSTENTACAO = ['objeto', 'estrategia'];
+// `contexto_pessoal_social` sozinho (ou honorarios sozinho) nao sustenta a nota: papo social sem
+// nenhum campo de caso preenchido e sinal de que a extracao nao achou o atendimento em si.
+const CAMPOS_SUSTENTACAO = [
+  'perfil_qualificacao',
+  'historico_processual_anterior',
+  'situacao_atual_urgencia',
+  'objeto',
+];
 
 // Uma extracao gravada em ciclo ANTERIOR segue o contrato de hoje? O index.js reusa a extracao da
 // tabela quando a linha ja passou por EXTRAIDO, para nao pagar OpenAI duas vezes — e uma linha
@@ -310,38 +333,56 @@ function ehExtracaoAtual(obj) {
 
 const PROMPT_SISTEMA_NOTAS = `Você extrai dados estruturados de notas e transcrições de reuniões de um escritório de advocacia brasileiro (Caballero, Rocha & Carvalho), para montar o BRIEFING DE ATENDIMENTO E ALINHAMENTO ESTRATÉGICO no CRM.
 
-Responda SOMENTE com um objeto JSON com exatamente estas chaves:
+Responda SOMENTE com um objeto JSON PLANO (as 10 chaves abaixo direto na raiz do objeto — NUNCA
+agrupadas dentro de um sub-objeto por seção/número; "1.", "2." etc. são só organização deste texto,
+não fazem parte da chave nem viram um nível a mais no JSON). Exatamente estas chaves:
 
-1. DO OBJETO
-- "objeto": texto corrido, em redação de contrato — como a cláusula de "objeto" de um contrato de honorários. Descreva com precisão qual providência jurídica o escritório vai tomar (ação, recurso, medida específica), perante qual órgão/juízo, e com que finalidade concreta para o cliente. Não resuma numa frase genérica: escreva o parágrafo inteiro, com todos os detalhes que a reunião deu (nome da instituição, cargo, situação específica etc.).
+1. CONTEXTO DO CLIENTE & HISTÓRICO FÁTICO
+- "perfil_qualificacao": texto. Quem é o cliente: profissão, formação, cargo, situação acadêmica ou funcional, aprovações, e o que mais o qualifica no caso — só o que for relevante para o atendimento (ver seção 5 para o que não for).
+- "historico_processual_anterior": texto. Ações, recursos ou pedidos administrativos anteriores: onde tramitaram, o que foi decidido e por quê. Inclua a causa da derrota quando ela foi discutida.
+- "situacao_atual_urgencia": texto. O que acontece agora, o que o cliente arrisca perder e em que prazo.
+- "diretrizes_internas_equipe": texto. Instruções que a equipe deu a si mesma na reunião: quem faz o quê, que ferramenta usar, o que estudar antes de redigir, o que confirmar com o cliente.
 
-2. DA ESTRATÉGIA
-- "estrategia": texto corrido único — um parágrafo narrativo EXTENSO, não uma lista de tópicos nem uma frase solta. Funda neste único texto, com o MÁXIMO de detalhe que a reunião permitir:
-  - a medida escolhida e onde será proposta (juízo, tribunal, prevenção ou nova distribuição);
-  - os fundamentos discutidos, citando o dispositivo/tese pelo NOME que foi dito (artigo, princípio, teoria — ex.: "tese da razoabilidade e do fato consumado");
-  - como derrubar o que atrapalha (o óbice específico, o que provar, que documento juntar, que preliminar enfrentar, que erro do processo anterior corrigir);
-  - instruções que a equipe deu a si mesma na reunião (quem faz o quê, que ferramenta usar, o que confirmar com o cliente).
-  Uma frase curta e genérica ("vamos entrar com mandado de segurança") é falha de extração — reproduza o raciocínio jurídico discutido com a riqueza de um parecer, não o título de uma ação.
+2. DO OBJETO
+- "objeto": texto corrido, em redação de contrato — como a cláusula de "objeto" de um contrato de honorários. Descreva com precisão qual providência o escritório vai tomar (ação judicial, recurso, ou assessoria administrativa/documental), perante quem (juízo ou órgão), e com que finalidade concreta para o cliente. Não resuma numa frase genérica: escreva o parágrafo inteiro, com todos os detalhes que a reunião deu (nome da instituição, cargo, situação específica etc.).
 
-3. DA PROPOSTA DE HONORÁRIOS
+3. DA ESTRATÉGIA JURÍDICA
+- "via_eleita_foro": texto. A medida escolhida e onde será conduzida. Pode ser uma via JUDICIAL (ação, juízo, tribunal, prevenção ou nova distribuição) OU uma via ADMINISTRATIVA/documental (ex.: procedimento perante um órgão, requerimento administrativo, gestão de documentação de um programa ou fundo) — nem todo atendimento é uma ação judicial, e a ausência de processo não significa ausência de estratégia.
+- "fundamentacao_legal": texto. Os fundamentos discutidos: dispositivos, princípios e teses (quando houver via judicial), ou a norma/regulamento do órgão que rege o procedimento (quando for via administrativa). Vazio se nada foi citado.
+- "superacao_obices": texto. Como derrubar o que atrapalha: o que provar, que documento juntar, que preliminar enfrentar, que erro anterior corrigir, que exigência do órgão cumprir.
+
+4. DA PROPOSTA DE HONORÁRIOS
 - "honorarios": lista de objetos {"etapa","valor","condicao"}, um por parcela combinada.
   "etapa": use, quando couber, os rótulos "Entrada / Início da Ação", "Êxito Intermediário (Etapa 1)", "Êxito Intermediário (Etapa 2)", "Êxito Final", "Manutenção / Acompanhamento Mensal".
   "valor": o valor como foi dito (R$ 3.500,00). "condicao": o que dispara essa parcela — descreva por extenso, sem abreviar ("protocolo em 1º e 2º graus", não "protocolo").
-  Inclua SOMENTE as etapas efetivamente combinadas. Lista vazia se não se falou de dinheiro.
+  Inclua SOMENTE as etapas efetivamente combinadas. Lista vazia se não se falou de dinheiro a ser pago AO ESCRITÓRIO — um valor mencionado em outro contexto (salário do cliente em outro emprego, preço de outro serviço) NÃO é honorário; ver seção 5.
+
+5. CONTEXTO PESSOAL/SOCIAL (fora do caso)
+- "contexto_pessoal_social": texto corrido. Tudo que for conversa social ou contexto de vida do cliente SEM relação direta com o objeto da contratação: outro emprego ou atividade profissional não relacionada, aspirações de carreira, rede de contatos/amigos, histórico social, valores em reais mencionados nesse contexto (ex.: salário de outro emprego). Isso existe para você NÃO colocar esse conteúdo dentro de "perfil_qualificacao" ou dos demais campos do caso, e para nunca confundir um valor desse contexto com honorário. Se a reunião NÃO teve nenhum papo desse tipo, devolva string vazia "" — NUNCA escreva frases como "não mencionou outros empregos" ou "sem contexto social a relatar" (mesmo erro proibido na regra 4, mas este campo é onde ele mais tende a acontecer, porque toda reunião jurídica é "só sobre o caso").
+
+FORMATO EXATO DA RESPOSTA (objeto plano, as 10 chaves lado a lado, sem agrupar por seção):
+{"perfil_qualificacao": "...", "historico_processual_anterior": "...", "situacao_atual_urgencia": "...", "diretrizes_internas_equipe": "...", "objeto": "...", "via_eleita_foro": "...", "fundamentacao_legal": "...", "superacao_obices": "...", "honorarios": [...], "contexto_pessoal_social": "..."}
 
 NÍVEL DE DETALHE ESPERADO (estilo de referência — o CONTEÚDO vem sempre da reunião atual, nunca copie este exemplo):
+- perfil_qualificacao: "Aluno de Medicina no último período, aprovado em 1º lugar em concursos públicos."
+- historico_processual_anterior: "Processo anterior negado/extinto no TRF3 por deficiência técnica do patrono anterior — ausência de pedido expresso de formação de banca e falta de juntada de documentos/histórico."
+- situacao_atual_urgencia: "Nova negativa expressa e ilegal da instituição de ensino; risco iminente de perda de posse em novos cargos públicos."
+- diretrizes_internas_equipe: "Responsável deve subir a transcrição no NotebookLM para análise crítica e aprofundamento antes da redação da peça."
 - objeto: "A atuação do escritório CABALLERO, ROCHA & CARVALHO consistirá nos serviços de consultoria e assessoria jurídica especializada para a propositura de Mandado de Segurança na Justiça Federal, com o objetivo de compelir a faculdade a constituir banca examinadora especial para fins de abreviação da colação de grau do CONTRATANTE, assegurando a posse em cargo público."
-- estrategia: "A estratégia compreende a propositura de mandado de segurança na Justiça Federal, com fundamento no artigo 47, parágrafo 2º, da Lei de Diretrizes e Bases da Educação, superando o óbice regimental da instituição mediante a demonstração de interesse de agir, instrução documental robusta e aplicação da tese de razoabilidade e do fato consumado."
-Repare no que torna isto detalhado: nome da instituição por extenso, o dispositivo legal específico (não só "a LDB"), e as teses/técnicas pelo nome próprio (não "vamos juntar documentos e argumentar"). Um "objeto"/"estrategia" que não chegue a este nível de especificidade, quando a reunião tinha a informação, é extração malfeita.
+- via_eleita_foro (via judicial): "Mandado de Segurança perante a Justiça Federal, mesmo juízo por prevenção." / via_eleita_foro (via administrativa, outro tipo de caso): "Assessoria administrativa e documental perante o Fundo de Financiamento Estudantil (Fies) e o Ministério da Educação (MEC)."
+- fundamentacao_legal: "Artigo 47, § 2º, da Lei de Diretrizes e Bases da Educação (Lei nº 9.394/96); princípio da razoabilidade e teoria do fato consumado."
+- superacao_obices: "Comprovação do interesse de agir com a juntada da negativa administrativa formal; instrução probatória robusta (histórico acadêmico, edital e convocação do concurso)."
+- contexto_pessoal_social: "Atua em outro emprego não relacionado ao caso (advocacia empresarial em outro escritório), com insatisfação relatada quanto à carga horária e remuneração; menciona interesse de mudar de carreira e vínculos sociais antigos."
+Repare no que torna isto detalhado: nome da instituição por extenso, o dispositivo legal específico (não só "a LDB"), e as teses/técnicas pelo nome próprio (não "vamos juntar documentos e argumentar"). Um campo que não chegue a este nível de especificidade, quando a reunião tinha a informação, é extração malfeita — mas detalhe vale para o que É relevante ao caso; o que não é (campo 10) tem lugar próprio, não é para descartar nem misturar.
 
 REGRAS INEGOCIÁVEIS:
 1. Nunca invente. Valor, prazo, CPF, número de processo, número de lei ou data que não esteja no texto NÃO pode aparecer na resposta. Na dúvida, omita.
 2. Só escreva número de lei, artigo ou súmula se o NÚMERO tiver sido dito na reunião. Se só o nome foi dito ("a LDB", "o CPC"), escreva o nome sem número.
-3. Seja EXTREMAMENTE DETALHADO no que foi dito: preserve todo nome de órgão, instituição, programa, cargo, prazo, condição, tese jurídica e dispositivo citado. "objeto" e "estrategia" são parágrafos completos e específicos, nunca uma frase-resumo genérica. Perder um nome, um número ou um raciocínio jurídico discutido derrota o propósito do briefing — quem lê precisa entender o caso sem ouvir a reunião de novo. A riqueza vem do texto da reunião, nunca do seu repertório.
+3. Seja EXTREMAMENTE DETALHADO no que foi dito: preserve todo nome de órgão, instituição, programa, cargo, prazo, condição, tese jurídica e dispositivo citado — nos campos do CASO. "objeto", "via_eleita_foro", "fundamentacao_legal" e "superacao_obices" são frases/parágrafos completos e específicos, nunca um resumo genérico. Perder um nome, um número ou um raciocínio discutido derrota o propósito do briefing — quem lê precisa entender o caso sem ouvir a reunião de novo. A riqueza vem do texto da reunião, nunca do seu repertório.
 4. Campo sem informação no texto: string vazia "" ou lista vazia []. Nunca escreva "não informado", "não mencionado" ou similar — campo vazio é omitido do briefing automaticamente.
 5. NÃO classifique a área do direito nem sugira advogado responsável. Isso é decidido em outro lugar do sistema, e uma segunda opinião aqui contradiz a primeira.
 6. Distinga o que o CLIENTE afirmou do que o ADVOGADO opinou. Use "o cliente relata que..." e "o advogado orientou que...".
-7. NÃO inclua contexto pessoal ou histórico do cliente (profissão, processos anteriores, urgência) — o briefing cobre só objeto, estratégia e honorários.
+7. Documentos a juntar entram em "superacao_obices"; ações combinadas para a equipe entram em "diretrizes_internas_equipe". Não há campo separado para eles.
 8. Preserve valores monetários no formato original do texto (R$ 3.500,00), sem converter nem arredondar.
 9. Escreva em português do Brasil, em tom objetivo de registro profissional. Sem saudação, sem conclusão, sem opinião sua.`;
 
@@ -539,13 +580,19 @@ function nomeAnexoNota(marcador, dataIso) {
 
 const secao = (titulo, conteudo) => (conteudo && conteudo.length ? `${titulo}\n${conteudo}` : '');
 
-// Secao 3: "- Entrada / Inicio da Acao: R$ 5.000,00 — protocolo em 1o e 2o graus". Etapa sem valor
+// Secao de rotulos (1 e 3). Bullet sem valor some, e se todos sumirem a secao inteira nao existe —
+// e a mesma regra de `secao`, e o motivo de o prompt proibir "nao informado": um titulo seguido de
+// tres rotulos vazios ocupa espaco afirmando que se sabe alguma coisa.
+const secaoRotulada = (titulo, pares) =>
+  secao(titulo, pares.filter(([, v]) => v).map(([r, v]) => `• ${r}: ${v}`).join('\n'));
+
+// Secao 4: "• Entrada / Inicio da Acao: R$ 5.000,00 — protocolo em 1o e 2o graus". Etapa sem valor
 // (combinado sem preco) e valor sem etapa (preco sem gatilho) continuam legiveis; o travessao so
 // aparece quando ha condicao.
 const secaoHonorarios = (titulo, itens) =>
   secao(titulo, (itens || []).map((i) => {
     const cabeca = [i.etapa, i.valor].filter(Boolean).join(': ');
-    return cabeca ? `- ${[cabeca, i.condicao].filter(Boolean).join(' — ')}` : '';
+    return cabeca ? `• ${[cabeca, i.condicao].filter(Boolean).join(' — ')}` : '';
   }).filter(Boolean).join('\n'));
 
 // Funcao PURA: mesma entrada, mesmo texto. E o que permite comparar contra o que esta no CRM.
@@ -554,18 +601,29 @@ const secaoHonorarios = (titulo, itens) =>
 // `description` do Moskit e exibido cru — sintaxe nao renderizada viraria sujeira na tela do
 // advogado, justamente no documento que ele abre minutos antes de redigir a peca.
 //
-// 3 secoes, de proposito (20/08/2026): o briefing nao leva contexto/historico do cliente, so o que
-// vai para a proposta. Mesmo icone (📌) e titulo em minuscula nas tres, espelhando o exemplo real que
-// motivou a mudanca.
+// 5 secoes (revertido de 3 em 21/08/2026, ver CAMPOS): contexto do cliente de volta, estrategia
+// juridica de volta a 3 sub-campos (aceita via administrativa tambem), e uma 5a secao nova pro que e
+// social/pessoal e nao pertence ao caso.
 function montarTextoNota({ extracao, meta = {}, avisos = [], marcador }) {
   const quando = [meta.dataBr, meta.horaBr].filter(Boolean).join(' às ');
   const e = extracao || {};
 
   const corpo = [
     `📄 BRIEFING DE ATENDIMENTO E ALINHAMENTO ESTRATÉGICO${quando ? ` — ${quando}` : ''}${meta.tituloEvento ? ` (${meta.tituloEvento})` : ''}`,
-    secao('📌 1. Do objeto', e.objeto),
-    secao('📌 2. Da estratégia', e.estrategia),
-    secaoHonorarios('📌 3. Da proposta de honorários', e.honorarios),
+    secaoRotulada('👤 1. CONTEXTO DO CLIENTE & HISTÓRICO FÁTICO', [
+      ['Perfil/Qualificação', e.perfil_qualificacao],
+      ['Histórico Processual Anterior', e.historico_processual_anterior],
+      ['Situação Atual & Urgência', e.situacao_atual_urgencia],
+      ['Diretrizes Internas da Equipe', e.diretrizes_internas_equipe],
+    ]),
+    secao('📌 2. DO OBJETO', e.objeto),
+    secaoRotulada('⚖️ 3. DA ESTRATÉGIA JURÍDICA', [
+      ['Via Eleita & Foro', e.via_eleita_foro],
+      ['Fundamentação Legal Principal', e.fundamentacao_legal],
+      ['Superação de Óbices', e.superacao_obices],
+    ]),
+    secaoHonorarios('💰 4. DA PROPOSTA DE HONORÁRIOS', e.honorarios),
+    secao('🗒️ 5. CONTEXTO PESSOAL/SOCIAL', e.contexto_pessoal_social),
   ].filter((p) => p !== '').join('\n\n');
 
   const rodape = [

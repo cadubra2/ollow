@@ -528,27 +528,46 @@ em [src/notas-reuniao.js](src/notas-reuniao.js) (puro, sem rede); o `index.js` s
   confiança *alta* com um negócio qualquer. A transcrição nem chega em `extrairSinais`: não existe
   parâmetro para ela, e há teste garantindo que continue assim.
 - **A nota é o "BRIEFING DE ATENDIMENTO E ALINHAMENTO ESTRATÉGICO", e o contrato de extração É a
-  estrutura dele.** Três seções, montadas por `montarTextoNota` a partir das 3 chaves de `CAMPOS`
-  ([src/notas-reuniao.js](src/notas-reuniao.js)): *1. Do objeto* (escopo formal da contratação),
-  *2. Da estratégia* (texto corrido único: via eleita e foro, fundamentação legal, superação de
-  óbices e diretrizes internas da equipe — tudo numa narrativa só) e *3. Da proposta de honorários*.
-  Não existe template em outro lugar — trocar `CAMPOS` é trocar o formato da nota.
-  **Decisão do escritório em 20/08/2026**: o briefing deixou de levar contexto/histórico do cliente
-  (perfil, histórico processual anterior, situação/urgência) — só objeto, estratégia e honorários, no
-  mesmo formato do texto de proposta já usado com clientes reais (ex.: caso do aluno de medicina com
-  mandado de segurança negado no TRF3). `estrategia` existe para fundir num parágrafo só o que antes
-  eram campos separados; documentos a juntar e combinados internos da equipe entram nela, sem campo
-  próprio.
+  estrutura dele.** Cinco seções, montadas por `montarTextoNota` a partir das 10 chaves de `CAMPOS`
+  ([src/notas-reuniao.js](src/notas-reuniao.js)): *1. Contexto do Cliente & Histórico Fático* (perfil,
+  histórico processual anterior, situação/urgência, diretrizes internas da equipe), *2. Do Objeto*
+  (escopo formal da contratação), *3. Da Estratégia Jurídica* (via eleita e foro, fundamentação,
+  superação de óbices), *4. Da Proposta de Honorários* e *5. Contexto Pessoal/Social*. Não existe
+  template em outro lugar — trocar `CAMPOS` é trocar o formato da nota.
+  **Vaivém de 20→21/08/2026**: em 20/08 o escritório removeu a seção de contexto do cliente e fundiu
+  a estratégia num parágrafo único (`objeto`/`estrategia`/`honorarios`, 3 seções). Em 21/08, testar
+  esse formato reduzido contra um segundo caso real (assessoria administrativa de Fies para
+  convocação em curso de Medicina, "Iury e Rayssa Coutinho") expôs dois problemas que o primeiro caso
+  de teste (aluno de medicina/TRF3) não mostrava: (a) muito **papo social/pessoal sem relação com o
+  caso** (outro emprego do cliente, aspirações de carreira, rede de contatos) vazava para dentro do
+  perfil, porque a regra de "seja exaustivo" não distinguia relevância; (b) **"Via Eleita & Foro"
+  ficava vazia** — e a seção de Estratégia Jurídica sumia inteira — em atendimentos que são só
+  assessoria administrativa/documental, sem ação judicial. A decisão final: reverter para as 4 seções
+  originais, **mais** um campo novo (`contexto_pessoal_social`, 5ª seção) para isolar o papo social sem
+  descartá-lo, e `via_eleita_foro` passou a aceitar via administrativa também, não só judicial.
+  **Validado com chamadas reais à OpenAI contra 3 casos diferentes** (mandado de segurança/TRF3,
+  assessoria de Fies, equiparação salarial, abatimento de Fies por atuação na COVID) — não só teste
+  determinístico com fixture. Isso pegou dois bugs que fixture nenhum pegaria: (1) a IA às vezes
+  aninhava os campos em sub-objetos por seção (`{"DO OBJETO": {"objeto": "..."}}`), o que fazia
+  `validarExtracao` não reconhecer nenhuma chave e a extração sair `vazia: true` — corrigido com uma
+  instrução explícita de "objeto JSON PLANO" + um esqueleto de exemplo no prompt; (2)
+  `contexto_pessoal_social` é o campo mais propenso a violar a regra de "nunca escreva não
+  mencionado" (regra 4), porque toda reunião jurídica É só sobre o caso — reforçado com um aviso
+  específico nesse campo depois de aparecer no caso do FIES (Sandino Rocha, sem nenhum papo social).
   **`honorarios` é lista livre de `{etapa, valor, condicao}`, não cinco campos fixos.** Campo fixo é
   convite a preencher: perguntado sobre "Êxito Intermediário (Etapa 2)" num atendimento em que só se
   falou de entrada, o modelo devolve um valor plausível — e número inventado no campo de honorários é
   o pior erro que esta rotina pode cometer. As cinco etapas canônicas vivem no **prompt**, como
-  vocabulário preferido.
+  vocabulário preferido. Um valor em reais dito num contexto alheio ao caso (ex.: salário do cliente em
+  outro emprego) vai para `contexto_pessoal_social`, nunca para `honorarios` — é a instrução do prompt
+  que evita essa confusão, não o filtro de ancoragem (que só confere presença do dígito na fonte, não
+  a que campo ele pertence).
   **Texto puro, sem Markdown**: o `description` do Moskit é exibido cru, então `**` e `##` virariam
   sujeira justamente no documento que o advogado abre antes de redigir a peça.
   `vazia` deixou de ser "resumo em branco" e passou a ser *nenhum* campo de sustentação
-  (`CAMPOS_SUSTENTACAO`, hoje `objeto`/`estrategia`) preenchido — honorários sozinho, sem objeto nem
-  estratégia, é o retrato do modelo que preencheu o formulário sem ter lido a reunião.
+  (`CAMPOS_SUSTENTACAO`: `perfil_qualificacao`/`historico_processual_anterior`/
+  `situacao_atual_urgencia`/`objeto`) preenchido — `contexto_pessoal_social` ou honorários sozinhos,
+  sem nenhum desses, é o retrato do modelo que preencheu o formulário sem ter lido a reunião.
   **A extração guardada é reusada só se seguir o contrato de hoje** (`ehExtracaoAtual`, conferido no
   `index.js` antes de reaproveitar uma linha em `EXTRAIDO`). Campo ausente vira seção ausente, então
   uma linha extraída sob contrato antigo entregaria ao cliente um briefing com cabeçalho e rodapé e
@@ -567,8 +586,8 @@ em [src/notas-reuniao.js](src/notas-reuniao.js) (puro, sem rede); o `index.js` s
   procuraria `500000` num texto que tem `5000` e marcaria um valor **certo** como não localizado.
   Falso alarme no campo de honorários é pior que nenhum aviso: ensina o advogado a ignorar o símbolo.
   Documento, processo e data continuam por dígitos, onde a identidade é a própria sequência.
-  **Citação legal entrou no filtro quando o briefing ganhou uma seção de fundamentação (hoje dentro
-  de `estrategia`).** Pedir "os dispositivos discutidos" é exatamente o convite para o modelo completar "a LDB" com
+  **Citação legal entrou no filtro quando o briefing ganhou o campo de fundamentação.** Pedir "os
+  dispositivos discutidos" é exatamente o convite para o modelo completar "a LDB" com
   "(Lei 9.394/96)" de memória — o número sai perfeito, e é por isso que ninguém desconfia. A norma é
   conferida **bloco a bloco**, nunca pela cadeia inteira: `"9.394/96"` vira `9394` e `96` (o ponto é
   separador de milhar e sai antes; quem separa é `/` e `-`), e bloco com menos de 3 dígitos é
@@ -767,6 +786,11 @@ comportamento não mediria o status quo.
 ### Integrações externas (todas via `axios`, timeout global `TIMEOUT_HTTP_MS`)
 
 - **OpenAI**: chamada HTTPS direta (`openaiChat`), sem SDK — decisão deliberada para evitar hangs.
+  **Os pedaços de rede são acumulados como `Buffer` e só decodificados UTF-8 uma vez no fim**
+  (`Buffer.concat`). MEDIDO contra a API real em 21/08/2026: o padrão antigo (`data += chunk`, que
+  força `toString()` a cada pedaço) corrompeu um caractere multi-byte ("Educaç��o") numa resposta real
+  do `gpt-4o-mini` — o caractere caiu bem na fronteira entre dois pedaços TCP. Risco raro mas presente
+  em toda chamada à OpenAI do sistema, não só notas de reunião.
 - **Moskit CRM** (`MOSKIT_BASE`): `PUT` de deal precisa reenviar o corpo do `GET` (peculiaridade da
   API); `GET` logo após um `PUT` pode retornar dados em cache por até ~4s; `limit` de paginação
   sempre retorna 10 independente do valor pedido. Em `/activities` (medido em 12/08/2026, um

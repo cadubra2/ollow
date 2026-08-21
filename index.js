@@ -293,12 +293,19 @@ async function openaiChat(messages, responseFormat) {
       },
       timeout: 25000,
     }, (res) => {
-      let data = '';
-      res.on('data', (chunk) => { data += chunk; });
+      // Acumula os Buffers brutos e so decodifica UTF-8 uma vez no fim: decodificar chunk a chunk
+      // (`data += chunk` forca toString() por pedaco) corrompe um caractere multi-byte (c, ~a, etc.)
+      // que caia bem na fronteira entre dois pedacos de rede. MEDIDO contra a API real em 21/08/2026:
+      // "Ministerio da Educacao" saiu com o "ca" corrompido numa resposta real do gpt-4o-mini.
+      const chunks = [];
+      // Buffer.isBuffer: o dublê de OpenAI usado nos testes emite 'data' com string pronta em vez de
+      // Buffer (mais simples de escrever) — sem essa checagem, Buffer.concat lançaria contra o dublê.
+      res.on('data', (chunk) => { chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, 'utf8')); });
       res.on('end', () => {
         if (done) return;
         done = true;
         clearTimeout(timer);
+        const data = Buffer.concat(chunks).toString('utf8');
         try {
           const parsed = JSON.parse(data);
           const content = parsed.choices?.[0]?.message?.content;
