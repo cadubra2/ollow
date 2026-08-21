@@ -490,6 +490,14 @@ try { db.exec("ALTER TABLE conversations ADD COLUMN retorno_aviso_hash TEXT"); }
 try { db.exec("ALTER TABLE conversations ADD COLUMN reuniao_num INTEGER DEFAULT 1"); } catch {}
 try { db.exec("ALTER TABLE conversations ADD COLUMN reunioes_anteriores TEXT"); } catch {}
 try { db.exec("ALTER TABLE conversations ADD COLUMN reuniao_aviso_hash TEXT"); } catch {}
+// Quando esta linha foi vista pela ultima vez pela reconciliacao de classificacao (ver
+// reconciliarClassificacao, modo 'antigos'). reconciliarClassificacao no modo 'recentes' (o de sempre,
+// por updated_at) nunca alcanca deal fora da janela de RECONCILIACAO_DIAS ou fora do top-N mais
+// recentes — um deal parado ha mais de 30 dias nunca era revisitado. O modo 'antigos' ordena por esta
+// coluna (NULL primeiro) em vez de updated_at, e cada linha processada e marcada com a hora atual —
+// e o que garante rotacao: a proxima rodada em modo 'antigos' avanca para a fatia seguinte nunca vista,
+// em vez de reler sempre os mesmos registros.
+try { db.exec("ALTER TABLE conversations ADD COLUMN reconciliado_em TEXT"); } catch {}
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_contrato_zapsign_doc_token ON conversations(contrato_zapsign_doc_token)"); } catch {}
 
 db.exec(`
@@ -1105,6 +1113,39 @@ function camposPendentes(dados) {
   return CAMPOS_OBRIGATORIOS.filter((k) => !dados[k] || dados[k] === 'null');
 }
 
+// Reconhece "pagina/instagram do socio" e "site do escritorio" no texto da conversa e forca a origem
+// (e, no caso do socio, a captacao) — deterministico, sem depender do modelo lembrar disso a cada
+// rodada. Muta e devolve `dados` (mesmo contrato das outras sanitizacoes do pipeline).
+//
+// Texto SEM ACENTO (removerAcentos): MEDIDO em 21/08/2026 no deal 48206716 ("vi a página do Advogado
+// Bruno Rocha") — a regex "pagina" sem acento nunca batia contra "página" com acento no texto real,
+// entao esta regra nunca acionava pra essa grafia, que e a mais comum em portugues. "site do
+// escritorio" e outro sinal claro que o modelo tambem deixava passar (deals 48412103/48359253).
+function aplicarPadroesDeterministicosDeOrigem(dados, mensagens) {
+  const textoCompleto = removerAcentos((mensagens || []).map((m) => m.text).join(' ')).toLowerCase();
+  const PADROES_SOCIO = [
+    { regex: /pagina\s+do\s+(bruno|dr\.?\s*bruno|advogado\s+bruno)/i, socio: 'Bruno' },
+    { regex: /pagina\s+do\s+(berto|dr\.?\s*berto|caballero)/i, socio: 'Berto' },
+    { regex: /pagina\s+do\s+(iury|dr\.?\s*iury)/i, socio: 'Iury' },
+    { regex: /instagram\s+do\s+(bruno|dr\.?\s*bruno)/i, socio: 'Bruno' },
+    { regex: /instagram\s+do\s+(berto|dr\.?\s*berto|caballero)/i, socio: 'Berto' },
+    { regex: /instagram\s+do\s+(iury|dr\.?\s*iury)/i, socio: 'Iury' },
+  ];
+  for (const padrao of PADROES_SOCIO) {
+    if (padrao.regex.test(textoCompleto)) {
+      if (dados.origem !== 'Instagram') console.log(`  ℹ️ pagina/Instagram de ${padrao.socio} detectada — origem forçada para Instagram`);
+      dados.origem = 'Instagram';
+      dados.captacao = padrao.socio;
+      return dados;
+    }
+  }
+  if (/\bsite\s+(do\s+escritorio|de\s+voces)\b/.test(textoCompleto)) {
+    if (dados.origem !== 'Site') console.log('  ℹ️ mencao a "site do escritorio" detectada — origem forçada para Site');
+    dados.origem = 'Site';
+  }
+  return dados;
+}
+
 // GATE DO CASO DESCRITO. Area do direito, advogado responsavel e assunto so entram no CRM se alguem
 // tiver CONTADO o caso nesta conversa — observacao validada contra a mensagem real (cliente ou equipe,
 // ver src/evidencia.js). Sem isso o modelo deduzia a area do SOCIO que o lead mencionou: "gostaria de
@@ -1241,6 +1282,13 @@ function sanitizarClassificacao(dados, obsValidas) {
 function mesclarParaCrm(dadosAnteriores, dados, obsValidas) {
   const mesclados = mergeDados(dadosAnteriores || {}, dados);
   sanitizarClassificacao(mesclados, obsValidas);
+  // "Nao identificado" e a opcao SEMPRE que a conversa nao revelar canal nenhum (index.js, regra 2 do
+  // prompt) — mas isso so pode ser forcado APOS o merge, nunca antes: forcar em `dados` (a extracao
+  // crua desta rodada) apagaria uma origem real de uma rodada anterior, ja que mergeDados so preserva
+  // o valor antigo quando o novo e null. Aqui, so entra em vigor quando NENHUMA rodada (esta ou
+  // anterior) jamais capturou nada — os 3 deals que ficaram com o campo literalmente ausente no CRM
+  // (48401150/48402576/48402595, 21/08/2026) sao exatamente o caso que isso fecha.
+  if (!mesclados.origem) mesclados.origem = 'Nao identificado';
   return mesclados;
 }
 
@@ -3040,7 +3088,17 @@ REGRAS DE DECISAO:
 
 CAMPOS OBRIGATORIOS (nunca podem ser null em criar):
 1. assunto — tema curto do caso, 2 a 5 palavras (ex: "Inventario", "Usucapiao de imovel", "Abatimento do FIES", "Rescisao de contrato"). E o que aparece no titulo do negocio no CRM, entao seja especifico e direto, sem frase completa. NUNCA deixe null: se o cliente ainda NAO contou o caso, use exatamente "Consulta juridica" — NUNCA use o nome de uma area do direito como assunto (isso transforma um palpite de area no titulo do negocio).
-2. origem — SEMPRE preencher. Extraia da mensagem inicial. Se nao encontrar, use "Nao identificado".
+2. origem — SEMPRE preencher. Procure ATIVAMENTE por canal de entrada em QUALQUER ponto da conversa,
+   nao so na primeira mensagem: "vi/acessei/segui a pagina, o Instagram ou o link da bio do Dr. X" ->
+   Instagram; "vi seu video/reels" -> Youtube; "vi/acessei/entrei no site" -> Site; "indicacao de
+   [alguem]"/"minha amiga indicou"/"fulano me indicou" -> Indicacao de amigos e parentes; "ja fui
+   cliente"/"outro caso com voces" -> Indicacao de clientes. A EQUIPE por vezes pergunta diretamente
+   "como conheceu nosso escritorio?" com uma lista numerada de opcoes — a RESPOSTA do cliente a essa
+   pergunta e o sinal MAIS CONFIAVEL que existe e tem que ser usada (deal 48317782 ficou "Nao
+   identificado" porque a equipe perguntou "Voce pode nos contar como conheceu o nosso escritorio?
+   1.Indicacao 2.Artigo 3.Instagram 4.Youtube" e o cliente respondeu "verifiquei no instagram", e essa
+   resposta nao foi usada). So depois de procurar isso na conversa INTEIRA, se nao achar nada, use
+   "Nao identificado".
 3. tipo_consulta — "consulta paga" por padrao. Use "consulta gratis" APENAS se a equipe disser explicitamente que a consulta e cortesia/gratuita/sem custo/isenta. Use "sem consulta" so se o lead disser EXPLICITAMENTE que nao quer contratar.
 4. area_direito — Use seu conhecimento juridico para inferir a area A PARTIR DO QUE O CLIENTE CONTOU SOBRE O CASO, e de nada mais. Se ele so cumprimentou, so pediu consulta, so disse por qual canal chegou ou so citou o nome de um advogado ("quero falar com o Dr. Berto"), voce NAO sabe a area: devolva null. E PROIBIDO derivar a area de captacao, de origem, do advogado que o lead mencionou ou dos PERFIS DOS ADVOGADOS abaixo — o caminho e sempre area -> advogado, nunca advogado -> area. Deixar null e o resultado correto e esperado nessa situacao; a area entra numa rodada seguinte, quando o cliente descrever o caso.
    CASO RECORRENTE NESTE ESCRITORIO — FIES: caso envolvendo financiamento estudantil (FIES) — negativa administrativa, transferencia de curso, renegociacao, aditamento, recurso — e SEMPRE "Direito Educacional", mesmo que o cliente nao diga isso com essas palavras (deals 48474073, 48466404, 48464876, 48320992 nasceram com area_direito null porque o modelo nao fez essa ligacao sozinho, apesar do caso estar descrito).
@@ -3654,7 +3712,11 @@ async function processarConversaDirect(chatId) {
     // em stmtGetPending a cada boot — as 5 conversas internas eram reenfileiradas indefinidamente.
     if (ehInterno(phoneClean) || ehInterno(chatId)) {
       console.log(`  ⏭️ numero interno (equipe/socio) — ignorando permanentemente`);
-      stmtUpdateProcessed.run(JSON.stringify({}), 'interno', chatId);
+      // Preserva o que ja tinha sido classificado antes (dadosAnteriores) — nao ha extracao nova
+      // nesta rodada pra mesclar. MEDIDO em 21/08/2026 (deal 48222273): gravar `{}` aqui apagava a
+      // classificacao valida de uma rodada anterior so porque o numero passou a bater em TEAM_PHONES,
+      // mesmo sem nenhuma evidencia nova que justificasse a perda.
+      stmtUpdateProcessed.run(JSON.stringify(dadosAnteriores || {}), 'interno', chatId);
       return;
     }
 
@@ -3716,7 +3778,14 @@ async function processarConversaDirect(chatId) {
 
     if (classificacao.classificacao === 'inviavel') {
       console.log(`  ⏭️ Inviavel (${classificacao.justificativa}) — ignorando`);
-      stmtUpdateProcessed.run(JSON.stringify({}), 'inviavel', chatId);
+      // Preserva dadosAnteriores pelo mesmo motivo do ramo 'interno' acima: classificarConversa roda
+      // ANTES de extrairDadosAtendimento, entao nao ha `dados` novo nenhum nesta rodada — so a
+      // conclusao de que esta rodada especifica nao vale a pena extrair. Uma classificacao boa de uma
+      // rodada anterior (ex.: origem via "pagina do socio", PADROES_SOCIO abaixo) nao pode ser apagada
+      // so porque uma mensagem TRIVIAL depois ("obrigado!", "ok") foi julgada inviavel. MEDIDO em
+      // 21/08/2026: 12 dos 29 deals afetados por este bug ainda tinham o sinal de origem na conversa,
+      // perdido so porque esta linha gravava `{}` sem condicao.
+      stmtUpdateProcessed.run(JSON.stringify(dadosAnteriores || {}), 'inviavel', chatId);
       db.prepare("UPDATE conversations SET last_processed_at = datetime('now') WHERE chat_id = ?").run(chatId);
       return;
     }
@@ -3827,24 +3896,7 @@ async function processarConversaDirect(chatId) {
         dados.nome = nomeWhatsApp;
       }
     }
-    // Se o lead mencionou pagina/Instagram de socio, forcar origem Instagram + captacao
-    const textoCompleto = mensagens.map(m => m.text).join(' ').toLowerCase();
-    const PADROES_SOCIO = [
-      { regex: /pagina\s+do\s+(bruno|dr\.?\s*bruno|advogado\s+bruno)/i, socio: 'Bruno' },
-      { regex: /pagina\s+do\s+(berto|dr\.?\s*berto|caballero)/i, socio: 'Berto' },
-      { regex: /pagina\s+do\s+(iury|dr\.?\s*iury)/i, socio: 'Iury' },
-      { regex: /instagram\s+do\s+(bruno|dr\.?\s*bruno)/i, socio: 'Bruno' },
-      { regex: /instagram\s+do\s+(berto|dr\.?\s*berto|caballero)/i, socio: 'Berto' },
-      { regex: /instagram\s+do\s+(iury|dr\.?\s*iury)/i, socio: 'Iury' },
-    ];
-    for (const padrao of PADROES_SOCIO) {
-      if (padrao.regex.test(textoCompleto)) {
-        if (dados.origem !== 'Instagram') console.log(`  ℹ️ pagina/Instagram de ${padrao.socio} detectada — origem forçada para Instagram`);
-        dados.origem = 'Instagram';
-        dados.captacao = padrao.socio;
-        break;
-      }
-    }
+    aplicarPadroesDeterministicosDeOrigem(dados, mensagens);
     const { casoDescrito } = sanitizarClassificacao(dados, obsValidas);
 
     // CLIENTE QUE VOLTA (ver src/cliente-retorno.js). Roda aqui, DEPOIS de sanitizarClassificacao (que
@@ -3906,7 +3958,6 @@ async function processarConversaDirect(chatId) {
       }
     }
 
-    const jsonDados = JSON.stringify(dados);
     const confianca = result.confianca ?? 0;
 
     console.log(`  → Ação decidida: "${acao}" (${justificativa}) | confianca: ${confianca}`);
@@ -3922,7 +3973,7 @@ async function processarConversaDirect(chatId) {
     }
 
     if (acao === 'ignorar') {
-      stmtUpdateProcessed.run(jsonDados, acao, chatId);
+      stmtUpdateProcessed.run(JSON.stringify(mesclarParaCrm(dadosAnteriores, dados, obsValidas)), acao, chatId);
       db.prepare("UPDATE conversations SET last_processed_at = datetime('now') WHERE chat_id = ?").run(chatId);
       console.log(`  ⏭️ ignorado ${chatId} (${justificativa})`);
       return;
@@ -4018,7 +4069,7 @@ async function processarConversaDirect(chatId) {
     if (acao === 'nota') {
       if (!row.deal_id) {
         console.log(`  ⏭️ acao "nota" mas sem deal_id — ignorando`);
-        stmtUpdateProcessed.run(jsonDados, acao, chatId);
+        stmtUpdateProcessed.run(JSON.stringify(mesclarParaCrm(dadosAnteriores, dados, obsValidas)), acao, chatId);
         db.prepare("UPDATE conversations SET last_processed_at = datetime('now') WHERE chat_id = ?").run(chatId);
         return;
       }
@@ -4059,7 +4110,7 @@ async function processarConversaDirect(chatId) {
     if (acao === 'atualizar_campos') {
       if (!row.deal_id) {
         console.log(`  ⏭️ acao "atualizar_campos" mas sem deal_id — ignorando`);
-        stmtUpdateProcessed.run(jsonDados, acao, chatId);
+        stmtUpdateProcessed.run(JSON.stringify(mesclarParaCrm(dadosAnteriores, dados, obsValidas)), acao, chatId);
         db.prepare("UPDATE conversations SET last_processed_at = datetime('now') WHERE chat_id = ?").run(chatId);
         return;
       }
@@ -4137,7 +4188,7 @@ async function processarConversaDirect(chatId) {
     }
 
     console.log(`  ⏭️ acao desconhecida "${acao}" — ignorando`);
-    stmtUpdateProcessed.run(jsonDados, acao, chatId);
+    stmtUpdateProcessed.run(JSON.stringify(mesclarParaCrm(dadosAnteriores, dados, obsValidas)), acao, chatId);
     db.prepare("UPDATE conversations SET last_processed_at = datetime('now') WHERE chat_id = ?").run(chatId);
 
   } catch (erro) {
@@ -4613,8 +4664,10 @@ app.get('/auditoria-funil-completo', exigeAdmin, rota(async (req, res) => {
     .sort((a, b) => a.priority - b.priority)
     .map((s) => ({ id: s.id, name: s.name, priority: s.priority }));
 
-  // ATENCAO: /deals ignora `limit` e sempre devolve so os 10 mais recentes (quirk conhecido da API
-  // do Moskit) — esta amostra e so uma indicacao rapida, nao uma varredura de todos os deals.
+  // ATENCAO: `page`/`limit` sao ignorados em silencio aqui (sempre devolve so os 10 mais recentes) —
+  // esta amostra e so uma indicacao rapida, nao uma varredura de todos os deals. MEDIDO em 21/08/2026
+  // (ver estudar-deals-sem-origem.js): quem pagina de verdade e `?start=`, mesmo padrao de
+  // listarAtividadesMoskit — pra uma varredura completa de /deals, troque `page` por `start` e itere.
   const dealsRes = await axios.get(`${MOSKIT_BASE}/deals`, {
     params: { page: 1, limit: 100, sort: 'id', order: 'desc' },
     headers: apiHeaders,
@@ -5490,18 +5543,32 @@ function camposClassificacaoDe(dados, condicoesValorEnviadas) {
   return payload.entityCustomFields || [];
 }
 
-async function reconciliarClassificacao({ aplicar = false, incluirLegado = false, limite = 100 } = {}) {
-  const linhas = db.prepare(`
-    SELECT chat_id, deal_id, last_data, bloco_condicoes_enviado, messages, atendimento_inicio_msg_idx
-    FROM conversations
-    WHERE deal_id IS NOT NULL AND last_data IS NOT NULL
-      AND (updated_at IS NULL OR updated_at >= datetime('now', ?))
-    ORDER BY updated_at DESC
-    LIMIT ?
-  `).all(`-${RECONCILIACAO_DIAS} days`, limite);
+// modo 'recentes' (default): igual a sempre, por updated_at, dentro da janela de RECONCILIACAO_DIAS.
+// modo 'antigos': ignora a janela de dias e ordena por reconciliado_em (nunca visto primeiro) — e a
+// forma de alcancar o deal que o modo 'recentes' nunca revisita porque parou de receber mensagem ha
+// mais de RECONCILIACAO_DIAS ou caiu fora do top-N mais recentes. Cada linha processada por QUALQUER
+// modo grava reconciliado_em = agora, o que faz a proxima rodada em modo 'antigos' avancar para a
+// fatia seguinte em vez de reler sempre os mesmos registros.
+async function reconciliarClassificacao({ aplicar = false, incluirLegado = false, limite = 100, modo = 'recentes' } = {}) {
+  const linhas = modo === 'antigos'
+    ? db.prepare(`
+        SELECT chat_id, deal_id, last_data, bloco_condicoes_enviado, messages, atendimento_inicio_msg_idx
+        FROM conversations
+        WHERE deal_id IS NOT NULL AND last_data IS NOT NULL
+        ORDER BY reconciliado_em IS NOT NULL, reconciliado_em ASC
+        LIMIT ?
+      `).all(limite)
+    : db.prepare(`
+        SELECT chat_id, deal_id, last_data, bloco_condicoes_enviado, messages, atendimento_inicio_msg_idx
+        FROM conversations
+        WHERE deal_id IS NOT NULL AND last_data IS NOT NULL
+          AND (updated_at IS NULL OR updated_at >= datetime('now', ?))
+        ORDER BY updated_at DESC
+        LIMIT ?
+      `).all(`-${RECONCILIACAO_DIAS} days`, limite);
 
   const relatorio = {
-    aplicar, incluir_legado: incluirLegado, janela_dias: RECONCILIACAO_DIAS,
+    aplicar, incluir_legado: incluirLegado, janela_dias: RECONCILIACAO_DIAS, modo,
     analisados: 0, sem_divergencia: 0,
     corrigidos: [], a_corrigir: [], travados: [], legado: [], fechados: [],
     nao_rebaixados: [], deals_apagados: [], bloco_recalculado: [], erros: [],
@@ -5536,6 +5603,12 @@ async function reconciliarClassificacao({ aplicar = false, incluirLegado = false
     }
 
     relatorio.analisados++;
+    // Marca esta linha como vista NESTA rodada, para o cursor do modo 'antigos' avancar. So em
+    // aplicar=true: dry-run e leitura pura, mesma regra do bloco_condicoes_enviado acima — senao
+    // "conferir sem escrever" (GET /auditoria-classificacao sem ?aplicar=1) deixaria de ser verdade.
+    if (aplicar) {
+      db.prepare("UPDATE conversations SET reconciliado_em = datetime('now') WHERE chat_id = ?").run(linha.chat_id);
+    }
 
     try {
       // Espaco entre as leituras: a varredura de 64 deals ja tomou 429 do Moskit.
@@ -5658,8 +5731,14 @@ async function reconciliarClassificacao({ aplicar = false, incluirLegado = false
 // Rotina periodica: corrige sozinha o que o proprio bot escreveu e avisa no Telegram o que ela NAO pode
 // tocar (campo corrigido na mao, deal fechado, deal legado sem autoria) — essas dependem de decisao
 // humana, entao viram aviso, nunca escrita.
+// Alterna com o modo 'antigos' a cada 2 execucoes: o modo 'recentes' (sempre por updated_at, dentro
+// de RECONCILIACAO_DIAS) nunca alcanca um deal que parou de receber mensagem ha mais de
+// RECONCILIACAO_DIAS ou caiu fora do top-N mais recentes — esses ficavam esquecidos para sempre.
+let contadorReconciliacaoPeriodica = 0;
 async function rodarReconciliacaoPeriodica() {
-  const r = await reconciliarClassificacao({ aplicar: true });
+  contadorReconciliacaoPeriodica++;
+  const modo = contadorReconciliacaoPeriodica % 2 === 0 ? 'antigos' : 'recentes';
+  const r = await reconciliarClassificacao({ aplicar: true, modo });
 
   const pendencias = [...r.travados, ...r.legado];
   if (!r.corrigidos.length && !pendencias.length) return r;
@@ -7763,6 +7842,7 @@ module.exports = {
   // Gate do caso descrito e autoria de campos: funcoes puras (ou so-banco) exercitadas direto em
   // test-pipeline.js, porque processarConversaDirect depende da OpenAI e nao roda nos testes.
   aplicarGateCasoDescrito,
+  aplicarPadroesDeterministicosDeOrigem,
   deveEsperarCasoDescrito,
   sanitizarClassificacao,
   mesclarParaCrm,
