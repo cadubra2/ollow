@@ -89,6 +89,36 @@ Escrevem em dados reais de produção (Moskit e/ou banco real):
   reunião assume: se `GET /deals/{id}/notes` devolve o texto (e como pagina), se `events.list` traz
   `attachments[]` pela credencial do bot, e qual a cobertura real do passo "Telefone:" da cascata.
   **Só leitura**, mas lê Moskit e Google de produção, então fica fora do `npm test`.
+- `diagnosticar-classificacao.js [--sondar-crm]` — mede o tamanho de cada causa raiz de origem/área/
+  advogado vazios (travado por edição manual, opção inválida nunca corrigida, fora da janela da
+  reconciliação periódica, sem evidência de caso, suspeita do bug de merge histórico, deal criado fora
+  do bot) antes de decidir o que vale corrigir — ver "Classificação do deal" acima. **Só leitura**: os
+  5 primeiros buckets são 100% locais (zero chamada de rede); o 6º (deal fora do bot) sempre lê
+  `/activities` paginado (~20 requisições) e só bate em `/deals/{id}` individualmente com a flag
+  explícita `--sondar-crm` (o script imprime a contagem e o tempo estimado antes de pedir a flag). Lê
+  Moskit de produção, então fica fora do `npm test`.
+- `estudar-deals-sem-origem.js` — lista, deal por deal (não só contagem), todo negócio marcado pelo
+  próprio Moskit com `origin: 'BOT_WHATSAPP'` (o CRM grava isso a partir do header `X-Ollow-Origin`
+  que o bot manda em toda escrita — mais confiável que cruzar por `conversations.deal_id`, que fica
+  incompleto: cliente-retorno zera `deal_id` da linha ao abrir atendimento novo, e deal criado fora do
+  bot nunca tem linha) e que está sem o campo "Origem" no CRM real. Pagina `/deals` inteiro por
+  `?start=` — MEDIDO em 21/08/2026 que, ao contrário do que o comentário antigo de
+  `auditoria-funil-completo` registra (`limit`/`page` são ignorados), `start=` pagina de verdade, e
+  cada página já vem com `entityCustomFields` completo (sem GET por deal). Cruza com `conversations`
+  (linha atual + `deals_anteriores`) para tentar explicar a causa; sem correspondência local, reporta
+  só o fato. "Sem origem" conta tanto campo ausente/vazio quanto a opção "Não identificado" (id
+  `435777`) explicitamente marcada — decisão de negócio, não só técnica: ver "Classificação do deal"
+  acima. **Só leitura**, mas varre a conta inteira (~300 requisições numa base de 3000+ deals), então
+  fica fora do `npm test` — rodar direto na VPS evita reintroduzir latência de rede.
+- `recuperar-origem-perdida.js` — dos deals sem origem, separa quem o modelo já examinou e
+  genuinamente não achou nada (fallback correto) de quem teve `last_data` apagado pelo bug de
+  `'inviavel'`/`'interno'` mas ainda tem a conversa intacta em `messages`. Regex sobre o texto
+  (instagram/página de sócio, site, indicação, vídeo/Youtube — inspirado em `src/moskit-ids.js`
+  `ORIGEM` mas escrito como linguagem natural, não como opção canônica). **Zero chamada de IA, só
+  leitura**. Cuidado com falso positivo ao estender o vocabulário: "google" sozinho pega o convite do
+  Google Meet/Calendar que toda consulta agendada insere no texto, e termos sem `\b` (limite de
+  palavra) pegam substring dentro de outra palavra ("danos materi**AIS**" bateu em `matéria`
+  sem o delimitador) — os dois já mediram falso positivo real em 21/08/2026 e foram corrigidos.
 - `reprocessar-nota-reuniao.js <gmailMessageId> <dealId> [--aplicar]` — religa à mão uma nota de
   reunião que ficou órfã (o id vem no aviso do Telegram). Sem `--aplicar` só imprime a nota que
   iria; com `--aplicar` **escreve no CRM**.
@@ -169,6 +199,31 @@ docs/pop/                POP oficial do processo de negócio (HTML + PDF) — fo
 
 **Autoria**: `custom_fields_bot`/`campos_travados` guardam o que o bot escreveu (inclusive o nome do
 deal, chave `__name`). Valor divergente disso = correção humana → campo travado para sempre, com nota.
+
+**Dois buracos estruturais, achados em 21/08/2026 por `diagnosticar-classificacao.js` (script novo,
+só leitura — mede 6 causas raiz de origem/área/advogado vazios antes de decidir o que corrigir):**
+
+- **Bug de merge em 4 ramos sem `mesclarParaCrm`.** Os ramos `'ignorar'` (inclusive o downgrade
+  automático `acao==='criar' && confianca<6`), `'nota'`/`'atualizar_campos'` sem `deal_id` ainda
+  gravado, e o fallback de ação desconhecida persistiam em `last_data` a extração CRUA da rodada
+  (`JSON.stringify(dados)`), nunca passando por `mesclarParaCrm` como o ramo `'aguardar'` e
+  `finalizarCiclo` já faziam. Uma classificação válida de uma rodada anterior (com
+  `_casoDescritoValidado`) era apagada em silêncio sempre que a rodada seguinte não reemitisse a mesma
+  evidência — provavelmente a causa mais comum de deal que "estava classificado e ficou vazio".
+  Corrigido: os 4 pontos agora persistem `mesclarParaCrm(dadosAnteriores, dados, obsValidas)`.
+  Regressão em `test-pipeline.js` (seção "classificacao anterior sobrevive a rodada sem merge").
+- **Janela fixa da reconciliação periódica nunca cobria o histórico completo.** `reconciliarClassificacao`
+  sempre filtrava por `updated_at` dentro de `RECONCILIACAO_DIAS` (30d) `LIMIT` (100) — um deal parado
+  há mais de 30 dias, ou fora do top-100 mais recentes, nunca era revisitado, e a reconciliação é um
+  ESPELHO (só compara `last_data` x CRM; se `last_data` nunca teve a classificação, não há nada para
+  comparar). Coluna nova `reconciliado_em` + modo `reconciliarClassificacao({ modo: 'antigos' })`
+  (ordena por `reconciliado_em`, ignora a janela de dias, grava a hora atual em cada linha processada
+  quando `aplicar=true`) — `rodarReconciliacaoPeriodica` alterna `'recentes'`/`'antigos'` a cada
+  execução, sem aumentar a taxa de chamadas ao Moskit. Regressão em `test-pipeline.js` ("cursor
+  antigos alcanca o que o modo recentes nunca revisita").
+
+Nenhuma das duas correções relaxa a exigência de evidência real (`aplicarGateCasoDescrito` continua
+intocado) — só fecham buraco que apagava ou nunca revisitava classificação que já tinha evidência.
 
 ### `src/moskit-ids.js` é a fonte única de verdade para IDs do Moskit
 
@@ -886,6 +941,61 @@ busca o que ela pede. Desligada por padrão (`REUNIAO_RETORNO_ATIVO`) e, quando 
   varrido tudo. Ver `listarAtividadesMoskit`. Atenção: em `/contacts` quem pagina é o
   `x-moskit-listing-next-page-token` (`buscarOuCriarContato`) — o mecanismo **difere por endpoint**,
   não assuma. `deal.status` só aceita `OPEN`/`WON`/`LOST`.
+  **Em `/deals` (listagem) o mesmo padrão se repete, e por anos ninguém tinha testado `?start=`.**
+  `page`/`limit` são ignorados em silêncio (sempre os ~10 mais recentes) — por isso
+  `auditoria-funil-completo` e o comentário antigo diziam "não há paginação real para `/deals`". MEDIDO
+  em 21/08/2026 (`estudar-deals-sem-origem.js`): `?start=` pagina de verdade, igual a `/activities`, e
+  cada página já vem com `entityCustomFields` completo — uma varredura da conta inteira (3080+ deals)
+  não precisa de GET por deal, só de iterar `start += 10` até a página vir incompleta. Isso também
+  revelou que o campo nativo `origin` do deal (não é custom field) grava sozinho, pelo Moskit, o valor
+  do header `X-Ollow-Origin` que toda escrita do bot já manda (`'BOT_WHATSAPP'`) — é a forma mais
+  confiável de achar "todo deal que o bot tocou", mais confiável que cruzar por
+  `conversations.deal_id` (que fica incompleto: cliente-retorno zera esse campo ao abrir atendimento
+  novo, e deal criado fora do bot nunca teve linha). Varredura completa em 21/08/2026: dos 3081 deals
+  da conta, só 101 são `origin=BOT_WHATSAPP` — a enorme maioria (2793) é `'Moskit Boost'`, uma fonte de
+  lead alheia ao bot, com 174 `'Moskit'` (manual) — 13,1% da conta inteira está sem "Origem".
+  **A definição de "sem origem" importa, e muda o resultado por uma ordem de grandeza.** Contando só
+  campo ausente/vazio, 3 dos 101 deals do bot estavam sem origem. Mas "Não identificado" (id `435777`,
+  `src/moskit-ids.js:36`) é o fallback que o próprio prompt manda usar quando não acha o canal
+  (`index.js:3051`) — tecnicamente preenchido, mas tão inútil pra análise de captação quanto vazio.
+  Contando os dois como "sem origem" (decisão de negócio, não só técnica): **49 dos 101 (48%)**. Causa
+  por trás dos 46 casos de "Não identificado" explícito: 24 eram o modelo genuinamente não achando a
+  origem na conversa (fallback correto, não é bug — mesmo padrão dos 3 originais); **12 tinham
+  `last_action='inviavel'` com `last_data` zerado** — prova em produção de que o bug de merge do
+  ramo `'inviavel'` (`index.js:3663-3665,3725-3727`, wipe para `{}` independente de já existir
+  deal_id/classificação) não tinha sido coberto pela correção anterior (só tratava
+  `'ignorar'`/`'nota'`/`'atualizar_campos'` sem deal/fallback desconhecido); os outros 13 eram "sem
+  correspondência em `conversations`" (deal antigo, sem linha nem em `deals_anteriores`). **Corrigido
+  em 21/08/2026**: os dois ramos agora persistem `dadosAnteriores` em vez de `{}` — não há `dados`
+  novo pra mesclar (`classificarConversa`/a checagem de número rodam ANTES da extração), então o
+  conserto certo é simplesmente não apagar o que já existia, não mesclar nada. Regressão em
+  `test-pipeline.js` ("ramo inviavel"/"ramo interno: area sobrevive").
+  **O bug não perdia o dado de verdade — só escondia.** Zerava `last_data` pra `{}`, mas NUNCA tocava
+  `messages`: a conversa inteira continuava salva. Medido em 21/08/2026
+  (`recuperar-origem-perdida.js`, regex sobre o texto das mensagens, zero chamada de IA): dos 29 deals
+  com `last_action` em `('inviavel','interno')`, **12 (41%) ainda tinham o sinal de origem no texto**
+  — instagram/"página do sócio", site do escritório, indicação, vídeo/Youtube. Controle: numa amostra
+  de TODOS os 27 deals restantes onde o modelo já tinha examinado a conversa e concluído "Não
+  identificado" (sem o bug), só **2 (7%)** tinham sinal real que o modelo deixou passar — o GAP
+  REAL de reconhecimento do modelo, bem menor que o do bug. Um deles era inequívoco: a equipe
+  perguntou "Você pode nos contar como conheceu o nosso escritório? 1.Indicação 2.Artigo 3.Instagram
+  4.Youtube" e o cliente respondeu "verifiquei no instagram" (deal 48317782) — o modelo não usou a
+  resposta. "Muitos deals sem origem" no CRM ainda é majoritariamente da base fora do bot (Moskit
+  Boost), mas a fatia do próprio bot era maior do que a primeira medição sugeriu.
+  **Extração determinística de origem, mesmo espírito de `derivarAdvogadoDaArea`.** A regra de
+  "página/Instagram do sócio" (agora `aplicarPadroesDeterministicosDeOrigem`, extraída de dentro de
+  `processarConversaDirect` pra virar testável isoladamente) tinha um bug próprio, achado no mesmo
+  levantamento: comparava contra `"pagina"` **sem acento**, e o texto real do cliente quase sempre
+  vem com acento ("página") — a regra nunca acionava pra essa grafia, a mais comum em português (deal
+  48206716). Corrigido com `removerAcentos` no texto antes de testar. Mesma função ganhou uma regra
+  nova pro "site do escritório" (deals 48412103/48359253, outro sinal claro que o modelo também
+  deixava passar) — determinístico é mais confiável que esperar o modelo lembrar a cada rodada.
+  `mesclarParaCrm` ganhou um fallback final: se, DEPOIS do merge com `dadosAnteriores`, a origem
+  continuar vazia, força `"Nao identificado"` — nunca antes do merge (forçar em `dados` cru
+  ressuscitaria o mesmo bug do 48423360, mesclando um valor forçado por cima de uma origem real de
+  rodada anterior). Fecha o caso dos 3 deals de 21/08/2026 que ficaram com o campo literalmente
+  ausente no CRM, não só "Não identificado". Regressão em `test-pipeline.js`
+  ("aplicarPadroesDeterministicosDeOrigem").
   **`PUT /deals/{id}` tem que reenviar `activities`, senão o Moskit recusa o negócio inteiro.** MEDIDO
   em 19/08/2026 no deal 48441223: o PUT é *full replace*, e **omitir** `activities` significa para o
   Moskit "desvincule estas atividades" — o que ele recusa quando alguma já foi concluída, devolvendo

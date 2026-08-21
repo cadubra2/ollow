@@ -44,6 +44,9 @@ process.env.NOTAS_ANEXO_MAX_TENTATIVAS = '3';
 process.env.CLIENTE_RETORNO_ATIVO = 'true';
 process.env.CLIENTE_RETORNO_DRY_RUN = 'false';
 process.env.RETORNO_FOLGA_HORAS = '2';
+// src/telefone.js le TEAM_PHONES como `const` no require abaixo (mesmo motivo das flags acima) —
+// numero dedicado so pro teste do ramo 'interno' de processarConversaDirect.
+process.env.TEAM_PHONES = '5511900009999';
 
 // ---------- dublê do axios ----------
 const axios = require('axios');
@@ -116,7 +119,7 @@ google.calendar = () => ({
 const {
   moverParaEstagio, criarNotaMoskit, aplicarViradaCobranca, atualizarNegocioMoskit,
   handleAgendamentoCalendar, listarAtividadesMoskit, finalizarCiclo,
-  aplicarGateCasoDescrito, deveEsperarCasoDescrito, registrarBriefing, mergeDados,
+  aplicarGateCasoDescrito, deveEsperarCasoDescrito, aplicarPadroesDeterministicosDeOrigem, registrarBriefing, mergeDados,
   mesclarParaCrm, derivarAdvogadoDaArea, detectarOpcoesInvalidas, registrarOpcoesInvalidas,
   reconciliarClassificacao, reconciliarPendenciasAgendamento, reconciliarVinculoAtividades, montarPayloadMoskit,
   refrescarBriefingsPertoDaConsulta,
@@ -1629,6 +1632,129 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
   }
 
   // ============================================================
+  // Regra deterministica de origem: "pagina/instagram do socio" e "site do escritorio" nao podem
+  // depender do modelo lembrar disso a cada rodada. MEDIDO em 21/08/2026 (deal 48206716): a regex
+  // antiga usava "pagina" sem acento e nunca batia contra "página" (a grafia mais comum), entao a
+  // regra nunca acionava pra esse caso real.
+  console.log('\n=== aplicarPadroesDeterministicosDeOrigem: sinais deterministicos de origem ===');
+  {
+    const msgs = [{ role: 'cliente', text: 'Olá, vi a página do Advogado Bruno Rocha e gostaria de uma análise do meu caso.' }];
+    const dados = { origem: null, captacao: null };
+    aplicarPadroesDeterministicosDeOrigem(dados, msgs);
+    igual('"página" COM acento tambem forca Instagram (antes so "pagina" sem acento acionava)', dados.origem, 'Instagram');
+    igual('   e a captacao vai pro socio certo', dados.captacao, 'Bruno');
+  }
+  {
+    const msgs = [{ role: 'cliente', text: 'Cliquei no link da bio no Instagram do Dr. Berto Caballero, gostaria de tratar sobre meu caso.' }];
+    const dados = { origem: 'Nao identificado', captacao: null };
+    aplicarPadroesDeterministicosDeOrigem(dados, msgs);
+    igual('"instagram do Berto" forca Instagram mesmo com origem ja preenchida (sobrescreve o fallback)', dados.origem, 'Instagram');
+    igual('   captacao = Berto', dados.captacao, 'Berto');
+  }
+  {
+    const msgs = [{ role: 'cliente', text: 'Olá, acessei o site do escritório e gostaria de uma consulta.' }];
+    const dados = { origem: null };
+    aplicarPadroesDeterministicosDeOrigem(dados, msgs);
+    igual('"site do escritorio" forca Site (sem socio associado)', dados.origem, 'Site');
+    igual('   captacao nao e tocada por esta regra', dados.captacao, undefined);
+  }
+  {
+    // Prioridade: se a conversa cita socio E site, o socio (sinal mais especifico) vence.
+    const msgs = [{ role: 'cliente', text: 'Vi o site do escritório e depois achei a página do Bruno no Instagram.' }];
+    const dados = { origem: null };
+    aplicarPadroesDeterministicosDeOrigem(dados, msgs);
+    igual('socio tem prioridade sobre site quando os dois aparecem', dados.origem, 'Instagram');
+    igual('   captacao = Bruno', dados.captacao, 'Bruno');
+  }
+  {
+    const msgs = [{ role: 'cliente', text: 'Bom dia, gostaria de agendar uma consulta.' }];
+    const dados = { origem: 'Instagram', captacao: 'Iury' };
+    aplicarPadroesDeterministicosDeOrigem(dados, msgs);
+    igual('sem sinal nenhum: nao mexe no que a IA ja tinha extraido', dados.origem, 'Instagram');
+    igual('   captacao tambem intocada', dados.captacao, 'Iury');
+  }
+
+  // ============================================================
+  // Bug real (sem regressao antes desta correcao): os ramos 'ignorar' (inclusive o downgrade
+  // automatico por confianca baixa), 'nota'/'atualizar_campos' sem deal_id ainda gravado, e o fallback
+  // de acao desconhecida persistiam em last_data a extracao CRUA desta rodada (JSON.stringify(dados)),
+  // sem passar por mesclarParaCrm. Uma classificacao valida de uma rodada anterior (com
+  // _casoDescritoValidado) era apagada em silencio sempre que a rodada seguinte nao reemitisse a mesma
+  // evidencia — provavelmente a causa mais comum de deal que "estava classificado e ficou vazio".
+  console.log('\n=== processarConversaDirect: classificacao anterior sobrevive a rodada sem merge ===');
+  const CHAT_MERGE = '5511900002222';
+  const MSGS_MERGE = [{ role: 'cliente', text: 'Alguma pergunta genérica sobre o andamento', timestamp: new Date().toISOString() }];
+  const LAST_DATA_VALIDO_MERGE = JSON.stringify({
+    nome: 'Fulano de Tal', area_direito: 'Direito de Familia', advogado_responsavel: 'Bruno',
+    assunto: 'Inventario', origem: 'Instagram', _casoDescritoValidado: true,
+  });
+  const CLASSIFICACAO_GENERICA = { classificacao: 'criar_negocio', justificativa: 'cliente perguntando algo generico' };
+  {
+    // Ramo 'ignorar' via downgrade automatico de confianca baixa (acao 'criar' com confianca<6).
+    limpar();
+    semear(CHAT_MERGE, { deal_id: 60, last_data: LAST_DATA_VALIDO_MERGE, last_action: 'atualizar_campos', messages: JSON.stringify(MSGS_MERGE) });
+    openai.respostas = [CLASSIFICACAO_GENERICA, { acao: 'criar', justificativa: 'baixa confianca', confianca: 3, dados: { nome: 'Fulano de Tal' }, observacoes: [] }];
+    await processarConversaDirect(CHAT_MERGE);
+    const depois = JSON.parse(linha(CHAT_MERGE).last_data || '{}');
+    igual('   last_action gravado como "ignorar"', linha(CHAT_MERGE).last_action, 'ignorar');
+    igual('ramo "ignorar" (via downgrade de confianca): area sobrevive', depois.area_direito, 'Direito de Familia');
+    igual('   advogado tambem sobrevive', depois.advogado_responsavel, 'Bruno');
+    igual('   nenhum PUT no negocio (ciclo so gravou local)', dealsAtualizados().length, 0);
+  }
+  {
+    // Ramo 'nota' com deal_id AINDA null.
+    limpar();
+    semear(CHAT_MERGE, { deal_id: null, last_data: LAST_DATA_VALIDO_MERGE, last_action: 'aguardar', messages: JSON.stringify(MSGS_MERGE) });
+    openai.respostas = [CLASSIFICACAO_GENERICA, { acao: 'nota', justificativa: 'modelo devolveu nota sem o negocio existir', confianca: 8, dados: { nome: 'Fulano de Tal' }, observacoes: [] }];
+    await processarConversaDirect(CHAT_MERGE);
+    const depois = JSON.parse(linha(CHAT_MERGE).last_data || '{}');
+    igual('ramo "nota" sem deal_id: area sobrevive', depois.area_direito, 'Direito de Familia');
+    igual('   advogado tambem sobrevive', depois.advogado_responsavel, 'Bruno');
+  }
+  {
+    // Ramo 'atualizar_campos' com deal_id AINDA null.
+    limpar();
+    semear(CHAT_MERGE, { deal_id: null, last_data: LAST_DATA_VALIDO_MERGE, last_action: 'aguardar', messages: JSON.stringify(MSGS_MERGE) });
+    openai.respostas = [CLASSIFICACAO_GENERICA, { acao: 'atualizar_campos', justificativa: 'modelo devolveu atualizar_campos sem o negocio existir', confianca: 8, dados: { nome: 'Fulano de Tal' }, observacoes: [] }];
+    await processarConversaDirect(CHAT_MERGE);
+    const depois = JSON.parse(linha(CHAT_MERGE).last_data || '{}');
+    igual('ramo "atualizar_campos" sem deal_id: area sobrevive', depois.area_direito, 'Direito de Familia');
+    igual('   advogado tambem sobrevive', depois.advogado_responsavel, 'Bruno');
+  }
+  {
+    // Ramo 'inviavel': classificarConversa roda ANTES da extracao (index.js) — nesta rodada nao
+    // existe `dados` novo nenhum, so a classificacao de uma rodada ANTERIOR que nao pode ser apagada
+    // so porque esta mensagem especifica foi julgada nao-viavel (ex.: "obrigado!" depois da consulta).
+    // MEDIDO em 21/08/2026: 12 de 29 deals reais atingidos por este bug ainda tinham sinal de origem
+    // na conversa, perdido so por causa disso.
+    limpar();
+    semear(CHAT_MERGE, { deal_id: 60, last_data: LAST_DATA_VALIDO_MERGE, last_action: 'atualizar_campos', messages: JSON.stringify(MSGS_MERGE) });
+    openai.respostas = [{ classificacao: 'inviavel', justificativa: 'cliente so agradecendo' }];
+    await processarConversaDirect(CHAT_MERGE);
+    const depois = JSON.parse(linha(CHAT_MERGE).last_data || '{}');
+    igual('   last_action gravado como "inviavel"', linha(CHAT_MERGE).last_action, 'inviavel');
+    igual('ramo "inviavel": area sobrevive', depois.area_direito, 'Direito de Familia');
+    igual('   advogado tambem sobrevive', depois.advogado_responsavel, 'Bruno');
+  }
+  {
+    // Ramo 'interno': e checagem de numero (TEAM_PHONES), roda ANTES de qualquer chamada a OpenAI —
+    // nunca deveria ter chegado a apagar classificacao alguma. MEDIDO em 21/08/2026 (deal 48222273,
+    // Alice Pimentel — o mesmo caso ja citado no comentario de src/telefone.js sobre numero interno
+    // que virou lead antes de entrar em TEAM_PHONES).
+    const CHAT_INTERNO = '5511900009999'; // bate em TEAM_PHONES, configurado no topo deste arquivo
+    limpar();
+    semear(CHAT_INTERNO, { deal_id: 60, last_data: LAST_DATA_VALIDO_MERGE, last_action: 'atualizar_campos', messages: JSON.stringify(MSGS_MERGE) });
+    openai.respostas = [];
+    openai.prompts = [];
+    await processarConversaDirect(CHAT_INTERNO);
+    const depois = JSON.parse(linha(CHAT_INTERNO).last_data || '{}');
+    igual('   last_action gravado como "interno"', linha(CHAT_INTERNO).last_action, 'interno');
+    igual('   nenhuma chamada de rede (nem a OpenAI)', openai.prompts.length, 0);
+    igual('ramo "interno": area sobrevive', depois.area_direito, 'Direito de Familia');
+    igual('   advogado tambem sobrevive', depois.advogado_responsavel, 'Bruno');
+  }
+
+  // ============================================================
   console.log('\n=== garantirDealExiste: erro transitorio nao pode criar deal duplicado ===');
   {
     limpar();
@@ -1964,6 +2090,47 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     igual('404 entra em deals_apagados', r.deals_apagados.length, 1);
     igual('   e nao em erros', r.erros.length, 0);
     igual('   nenhum PUT', de('PUT', '/deals/70').length, 0);
+  }
+
+  // ============================================================
+  // Cursor de reconciliacao (modo 'antigos'): o modo 'recentes' (o de sempre, por updated_at dentro de
+  // RECONCILIACAO_DIAS) nunca revisita um deal parado ha mais de 30 dias ou fora do top-N mais recentes
+  // — ficava esquecido para sempre, mesmo com classificacao errada/vazia. O modo 'antigos' ordena por
+  // reconciliado_em (NULL primeiro) e cada linha processada grava a hora atual, o que faz a proxima
+  // rodada avancar para a fatia seguinte em vez de reler sempre os mesmos registros.
+  console.log('\n=== reconciliarClassificacao: cursor "antigos" alcanca o que o modo "recentes" nunca revisita ===');
+  {
+    const sqliteAtras = (deslocamento) => db.prepare('SELECT datetime(\'now\', ?)').pluck().get(deslocamento);
+    const CHAT_CURSOR_A = '5511966660001';
+    const CHAT_CURSOR_B = '5511966660002';
+    const CHAT_CURSOR_C = '5511966660003';
+    const LAST_DATA_SEM_CLASSIFICACAO = JSON.stringify({ nome: 'Teste' });
+    const RECONCILIADO_B_INICIAL = '2020-06-01 00:00:00';
+    const RECONCILIADO_C_INICIAL = '2026-01-01 00:00:00';
+
+    limpar();
+    db.prepare('DELETE FROM conversations').run();
+    // A: nunca reconciliado (NULL), atualizado agora — deve ser o PRIMEIRO no modo "antigos".
+    semear(CHAT_CURSOR_A, { deal_id: 81, last_data: LAST_DATA_SEM_CLASSIFICACAO, reconciliado_em: null });
+    // B: reconciliado ha muito tempo E fora da janela de RECONCILIACAO_DIAS (30d) — o modo "recentes"
+    // nunca o alcanca; deve ser o SEGUNDO no modo "antigos".
+    semear(CHAT_CURSOR_B, { deal_id: 82, last_data: LAST_DATA_SEM_CLASSIFICACAO, updated_at: sqliteAtras('-60 days'), reconciliado_em: RECONCILIADO_B_INICIAL });
+    // C: reconciliado mais recentemente que B (mas ainda no passado), atualizado agora — fica por ULTIMO.
+    semear(CHAT_CURSOR_C, { deal_id: 83, last_data: LAST_DATA_SEM_CLASSIFICACAO, reconciliado_em: RECONCILIADO_C_INICIAL });
+
+    const rRecentes = await reconciliarClassificacao({ modo: 'recentes' });
+    igual('modo "recentes" (default, dry-run): so alcanca quem esta dentro da janela de dias', rRecentes.analisados, 2);
+
+    const r1 = await reconciliarClassificacao({ aplicar: true, modo: 'antigos', limite: 1 });
+    igual('modo "antigos" #1: processa exatamente 1 linha', r1.analisados, 1);
+    checar('   e marca reconciliado_em na que nunca tinha sido vista (A)', linha(CHAT_CURSOR_A).reconciliado_em !== null, linha(CHAT_CURSOR_A).reconciliado_em);
+    igual('   B ainda nao foi tocada', linha(CHAT_CURSOR_B).reconciliado_em, RECONCILIADO_B_INICIAL);
+    igual('   C ainda nao foi tocada', linha(CHAT_CURSOR_C).reconciliado_em, RECONCILIADO_C_INICIAL);
+
+    const r2 = await reconciliarClassificacao({ aplicar: true, modo: 'antigos', limite: 1 });
+    igual('modo "antigos" #2: avanca para a proxima mais antiga (B, fora da janela de dias — nunca alcancada pelo modo "recentes")', r2.analisados, 1);
+    checar('   B foi marcada nesta rodada', linha(CHAT_CURSOR_B).reconciliado_em !== RECONCILIADO_B_INICIAL, linha(CHAT_CURSOR_B).reconciliado_em);
+    igual('   C continua intocada (ainda nao chegou a vez dela — sem repetir A/B antes de esgotar)', linha(CHAT_CURSOR_C).reconciliado_em, RECONCILIADO_C_INICIAL);
   }
 
   // ============================================================
