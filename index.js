@@ -20,6 +20,7 @@ const MOSKIT_IDS = require('./src/moskit-ids');
 const zapsign = require('./src/zapsign');
 const notasReuniao = require('./src/notas-reuniao');
 const clienteRetorno = require('./src/cliente-retorno');
+const reuniaoRetorno = require('./src/reuniao-retorno');
 const briefing = require('./src/briefing');
 
 // ------------------------------------------------------------
@@ -220,6 +221,22 @@ const RETORNO_FOLGA_HORAS = Number(process.env.RETORNO_FOLGA_HORAS) || clienteRe
 // ele abre o atendimento e reagenda. Sem esse reagendamento a conversa fica muda e nunca volta — o
 // mesmo defeito que exigiu reconciliarPendenciasAgendamento.
 const RETORNO_REPROCESSO_MS = Number(process.env.RETORNO_REPROCESSO_MS) || 30 * 1000;
+
+// ---- Reuniao de retorno: 2a+ reuniao do MESMO caso ---------------------------------------------
+// Consulta ja aconteceu e cliente+equipe confirmam outro horario para o MESMO negocio (ver
+// src/reuniao-retorno.js). Sem esta rotina, handleAgendamentoCalendar trata isso como remarcacao da
+// consulta que ja aconteceu: da PATCH no evento passado (apagando o registro da reuniao anterior) e
+// a reuniao nova nunca entra na agenda do Moskit (registrarConsultaNaAgendaMoskit sai na guarda de
+// atividade_moskit_id ja existente).
+//
+// Nasce DESLIGADA e, quando ligada, nasce em dry-run — mesmo padrao de CLIENTE_RETORNO_*. Aqui
+// "como hoje" e desviado de proposito no dry-run: "como hoje" seria mover o evento da consulta que
+// ja aconteceu, e medir nao justifica destruir esse registro (ver handleAgendamentoCalendar).
+const REUNIAO_RETORNO_ATIVO = process.env.REUNIAO_RETORNO_ATIVO === 'true';
+const REUNIAO_RETORNO_DRY_RUN = process.env.REUNIAO_RETORNO_DRY_RUN !== 'false';
+// Ate quantas horas DEPOIS do fim da reuniao anterior uma confirmacao nova ainda conta como
+// remarcacao (no-show + reagendamento rapido) em vez de reuniao nova de acompanhamento.
+const REUNIAO_TOLERANCIA_REMARCACAO_HORAS = Number(process.env.REUNIAO_TOLERANCIA_REMARCACAO_HORAS) || reuniaoRetorno.TOLERANCIA_HORAS_PADRAO;
 
 // ---- Anexo do Doc do Gemini na aba "Arquivos" do negocio -------------------------------------
 // O POST /deals/{id}/attachments NAO aceita upload: o corpo e {"url": "..."} e quem baixa o arquivo
@@ -463,6 +480,16 @@ try { db.exec("ALTER TABLE conversations ADD COLUMN atendimento_inicio_msg_idx I
 try { db.exec("ALTER TABLE conversations ADD COLUMN atendimento_num INTEGER DEFAULT 1"); } catch {}
 try { db.exec("ALTER TABLE conversations ADD COLUMN deals_anteriores TEXT"); } catch {}
 try { db.exec("ALTER TABLE conversations ADD COLUMN retorno_aviso_hash TEXT"); } catch {}
+// 2a+ reuniao do MESMO caso (ver src/reuniao-retorno.js) — diferente do bloco acima, que e sobre um
+// caso NOVO. Aqui o negocio e o MESMO; so o compromisso (evento/Atividade/briefing) e novo.
+//   reuniao_num — numero da reuniao ATUAL desta conversa (1 = a consulta original).
+//   reunioes_anteriores — JSON [{numero, horarioIso, evento_id, atividade_id, encerrada_em}] das
+//     reunioes ja arquivadas, para numeroDaReuniao (nota do Gemini) e para a nota do negocio poder
+//     citar a reuniao anterior sem chamada ao CRM.
+//   reuniao_aviso_hash — dedup por LINHA, mesmo padrao de retorno_aviso_hash/vinculo_aviso_hash.
+try { db.exec("ALTER TABLE conversations ADD COLUMN reuniao_num INTEGER DEFAULT 1"); } catch {}
+try { db.exec("ALTER TABLE conversations ADD COLUMN reunioes_anteriores TEXT"); } catch {}
+try { db.exec("ALTER TABLE conversations ADD COLUMN reuniao_aviso_hash TEXT"); } catch {}
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_contrato_zapsign_doc_token ON conversations(contrato_zapsign_doc_token)"); } catch {}
 
 db.exec(`
@@ -1680,17 +1707,23 @@ async function registrarOpcoesInvalidas(dealId, chatId, invalidas) {
 async function registrarBriefing(dealId, chatId, contexto) {
   if (!dealId) return false;
 
-  const texto = briefing.montarTextoBriefing(contexto || {});
+  // Precisa vir ANTES de montar o texto: o numero da reuniao entra no proprio cabecalho (a linha
+  // "Consulta:"/"Retorno N:", ver rotuloCompromisso) e por isso faz parte do que e hasheado.
+  const atual = chatId
+    ? db.prepare('SELECT briefing_hash, briefing_added, briefing_versao, reuniao_num FROM conversations WHERE chat_id = ?').get(chatId)
+    : null;
+  const numeroReuniao = Number(atual?.reuniao_num) || 1;
+
+  const texto = briefing.montarTextoBriefing({
+    ...(contexto || {}),
+    rotuloConsulta: reuniaoRetorno.rotuloCompromisso(numeroReuniao),
+  });
   if (!texto.trim()) {
     console.log(`  ⏭️ briefing sem conteudo — nao postado`);
     return false;
   }
 
   const hash = briefing.hashTextoBriefing(texto);
-  const atual = chatId
-    ? db.prepare('SELECT briefing_hash, briefing_added, briefing_versao FROM conversations WHERE chat_id = ?').get(chatId)
-    : null;
-
   if (atual?.briefing_hash === hash) {
     console.log(`  ⏭️ briefing inalterado — nao repostado`);
     return false;
@@ -1709,7 +1742,10 @@ async function registrarBriefing(dealId, chatId, contexto) {
   const data = new Intl.DateTimeFormat('pt-BR', {
     timeZone: TZ_ESCRITORIO, day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
   }).format(new Date());
-  const titulo = `📋 Briefing · v${versao} · ${data}`;
+  // "Reunião N" e numeracao SEQUENCIAL simples (1, 2, 3...), diferente do vocabulario da agenda
+  // (rotuloCompromisso: "Consulta"/"Retorno N-1") — o titulo da nota conta reunioes, o cabecalho
+  // dela usa o mesmo nome que esta na agenda. Os dois se encontram aqui.
+  const titulo = `📋 Briefing · v${versao} · Reunião ${numeroReuniao} · ${data}`;
   await criarNotaMoskit(dealId, `${titulo}\n\n${texto}\n\n${briefing.MARCADOR_BRIEFING}`);
   if (chatId) {
     db.prepare('UPDATE conversations SET briefing_added = 1, briefing_hash = ?, briefing_versao = ? WHERE chat_id = ?').run(hash, versao, chatId);
@@ -2111,13 +2147,22 @@ async function handlePagamentoConfirmado(dealId, dados, chatId) {
 // nao autorizados, entao sempre falha FECHADA.
 // Usado por sincronizarAtividadesMoskit/backfillMeetLinks, que so tem o dealId (nao o chatId).
 // Retorna { permitido, motivo, comprovante } — motivo: 'comprovante' | 'consulta_gratis' |
-// 'aguardando' | 'sem_deal' | 'erro'.
+// 'retorno' | 'aguardando' | 'sem_deal' | 'erro'.
 async function autorizacaoParaAgendar(dealId) {
   if (!dealId) return { permitido: false, motivo: 'sem_deal', comprovante: null };
 
   // Caminho rapido: esse deal ja teve um comprovante vinculado por handlePagamentoConfirmado
   const porDeal = stmtComprovantePorDeal.get(dealId);
   if (porDeal) return { permitido: true, motivo: 'comprovante', comprovante: porDeal };
+
+  // Reuniao de retorno (ver src/reuniao-retorno.js): o deal ja teve uma reuniao REALIZADA — a
+  // consulta original ja foi paga, e cobrar comprovante de novo para um acompanhamento do MESMO
+  // caso travaria essa Atividade em "aguardando_pagamento" para sempre. Determinístico por desenho
+  // (evento passado / nota do Gemini concluida, por deal_id) — nunca o titulo digitado pela equipe,
+  // que abriria um contorno do gate de pagamento.
+  if (REUNIAO_RETORNO_ATIVO && consultaJaRealizadaPorDeal(dealId).realizada) {
+    return { permitido: true, motivo: 'retorno', comprovante: null };
+  }
 
   try {
     const dealRes = await axios.get(`${MOSKIT_BASE}/deals/${dealId}`, {
@@ -2174,10 +2219,17 @@ async function autorizacaoParaAgendar(dealId) {
 //
 // O `dealId` vem por parametro pelo mesmo motivo de montarDescricaoEvento: sincronizarMetadadosEvento
 // COMPARA este resumo com o que esta no Google, e duas fontes diferentes para o mesmo dado fariam o
-// evento ser repatchado a cada ciclo.
-function montarResumoEvento(dados, dealId) {
+// evento ser repatchado a cada ciclo. Pelo MESMO motivo, `numeroReuniao` (ver src/reuniao-retorno.js)
+// tem que vir sempre do banco (row.reuniao_num), NUNCA recalculado aqui dentro — os tres call sites
+// (Atividade do Moskit, sincronizarMetadadosEvento, criacao do evento) usam o mesmo numero, senao
+// sincronizarMetadadosEvento veria "mudou" e repatcharia o evento pra sempre.
+//
+// rotuloCompromisso decide o vocabulario: a 1a reuniao do caso continua "Consulta" (sem numeroReuniao
+// tambem cai em "Consulta", entao todo call site antigo que nao passa o 3o argumento continua igual).
+function montarResumoEvento(dados, dealId, numeroReuniao) {
   const presencial = dados.modalidade_consulta === 'presencial';
-  const base = `Consulta${presencial ? ' (Presencial)' : ''} — ${dados.nome || 'Cliente'} (${dados.advogado_responsavel || 'a definir'})`;
+  const rotulo = reuniaoRetorno.rotuloCompromisso(numeroReuniao);
+  const base = `${rotulo}${presencial ? ' (Presencial)' : ''} — ${dados.nome || 'Cliente'} (${dados.advogado_responsavel || 'a definir'})`;
   return dealId ? `${base} · #${dealId}` : base;
 }
 
@@ -2264,7 +2316,7 @@ async function registrarConsultaNaAgendaMoskit({ dealId, dados, chatId, horarioI
   const payload = montarPayloadAtividade({
     dealId,
     contatoId,
-    titulo: montarResumoEvento(dados, dealId), // mesmo titulo do evento do Google: e o mesmo compromisso
+    titulo: montarResumoEvento(dados, dealId, row?.reuniao_num), // mesmo titulo do evento do Google: e o mesmo compromisso
     assunto: dados.assunto,
     dueDate,
     presencial: dados.modalidade_consulta === 'presencial',
@@ -2296,7 +2348,7 @@ async function sincronizarMetadadosEvento(dados, chatId, row, dealId) {
   const auth = getGoogleAuthClient();
   if (!auth) return;
 
-  const novoResumo = montarResumoEvento(dados, dealId);
+  const novoResumo = montarResumoEvento(dados, dealId, row?.reuniao_num);
   const novaDescricao = montarDescricaoEvento(dados, chatId, dealId);
   if (novoResumo.includes('(a definir)')) return; // ainda nao sabemos o advogado — nao piora o que esta la
 
@@ -2316,7 +2368,7 @@ async function sincronizarMetadadosEvento(dados, chatId, row, dealId) {
   }
 }
 
-async function criarEventoGoogleCalendar(dados, chatId, dealId) {
+async function criarEventoGoogleCalendar(dados, chatId, dealId, numeroReuniao) {
   const auth = getGoogleAuthClient();
   if (!auth) {
     console.log('  ⏭️ Google Calendar nao configurado (faltam google-oauth-client.json/google-oauth-token.json/GOOGLE_CALENDAR_ID) — pulando');
@@ -2343,7 +2395,7 @@ async function criarEventoGoogleCalendar(dados, chatId, dealId) {
 
   const calendar = google.calendar({ version: 'v3', auth });
   const event = {
-    summary: montarResumoEvento(dados, dealId),
+    summary: montarResumoEvento(dados, dealId, numeroReuniao),
     description: montarDescricaoEvento(dados, chatId, dealId),
     start: { dateTime: inicioNaive, timeZone: TZ_ESCRITORIO },
     end: { dateTime: fimNaive, timeZone: TZ_ESCRITORIO },
@@ -2376,7 +2428,19 @@ async function criarEventoGoogleCalendar(dados, chatId, dealId) {
 //
 // O horario agendado e o das observacoes, nao o `dados.data_hora_consulta`: e o horario que as duas
 // partes concordaram nesta rodada, e nao herda valor antigo via mergeDados.
-async function handleAgendamentoCalendar(dealId, dados, chatId, pagamentoVerificado, row, apuracao) {
+// Timestamp da MENSAGEM que fechou a perna mais recente da dupla confirmacao (max(cliente, equipe)
+// por msg_idx) — nunca Date.now(). Usado so por classificarReuniao (ver src/reuniao-retorno.js):
+// um reprocessamento dias depois (fila, processar_pendentes.js, refresh de briefing) tem que chegar
+// no MESMO veredito de quando a confirmacao realmente fechou, e o relogio da maquina muda a cada
+// reprocessamento enquanto o timestamp da mensagem nao muda nunca. `mensagens` ausente (chamada
+// direta de teste, sem o array) devolve null — reuniaoRetorno.classificarReuniao cai para "agora".
+function timestampConfirmacao(apuracao, mensagens) {
+  const idx = Math.max(apuracao?.cliente?.msg_idx ?? -1, apuracao?.equipe?.msg_idx ?? -1);
+  if (idx < 0 || !Array.isArray(mensagens)) return null;
+  return mensagens[idx]?.timestamp || null;
+}
+
+async function handleAgendamentoCalendar(dealId, dados, chatId, pagamentoVerificado, row, apuracao, mensagens) {
   const podeAgendar = !!apuracao?.confirmado;
   const dadosEvento = podeAgendar
     ? { ...dados, data_hora_consulta: apuracao.horarioIso }
@@ -2453,6 +2517,59 @@ async function handleAgendamentoCalendar(dealId, dados, chatId, pagamentoVerific
       }
       return;
     }
+
+    // Reuniao de retorno (2a+ reuniao do MESMO caso — ver src/reuniao-retorno.js). A partir daqui ha
+    // um horario NOVO confirmado para um deal que ja tem evento na agenda: sem esta checagem, o
+    // codigo abaixo (atualizarEventoSeRemarcado) trataria isso SEMPRE como remarcacao, dando PATCH
+    // no evento que talvez ja tenha ACONTECIDO — apagando o registro da reuniao anterior, sem a
+    // reuniao nova nunca entrar na agenda do Moskit (registrarConsultaNaAgendaMoskit sai na guarda de
+    // atividade_moskit_id ja existente).
+    if (REUNIAO_RETORNO_ATIVO) {
+      const consultaAnterior = consultaDoAtendimento(row);
+      const classificacao = reuniaoRetorno.classificarReuniao({
+        consulta: consultaAnterior,
+        horarioNovoIso: apuracao.horarioIso,
+        confirmadoEm: timestampConfirmacao(apuracao, mensagens),
+        timeZone: TZ_ESCRITORIO,
+        toleranciaHoras: REUNIAO_TOLERANCIA_REMARCACAO_HORAS,
+      });
+
+      if (classificacao.retorno) {
+        const porque = reuniaoRetorno.descreverMotivo(classificacao.motivo);
+        const dataFormatadaRetorno = formatarHorarioEscritorio(apuracao.horarioIso);
+
+        if (REUNIAO_RETORNO_DRY_RUN) {
+          // Desvio DELIBERADO da convencao de CLIENTE_RETORNO_DRY_RUN ("segue como hoje"): "como
+          // hoje" aqui seria mover o evento da consulta que ja aconteceu, e medir nao justifica
+          // destruir esse registro. O dry-run so avisa e retorna, sem chamar atualizarEventoSeRemarcado.
+          const hash = `dry|${apuracao.horarioIso}|${classificacao.motivo}`;
+          if (row?.reuniao_aviso_hash !== hash) {
+            console.log(`  🤖 [dry-run] deal ${dealId}: reuniao NOVA seria aberta para ${dataFormatadaRetorno} (${porque}) — evento anterior NAO sera movido`);
+            await criarNotaMoskit(dealId, `🤖 [dry-run] Reunião nova detectada para ${dataFormatadaRetorno} (${porque}). Uma reunião própria SERIA aberta em vez de mover o evento anterior — revisão manual necessária (REUNIAO_RETORNO_DRY_RUN ativo).`).catch(() => {});
+            await enviarTelegram([
+              '🔁 *Reunião de retorno detectada (dry-run)*',
+              `Negócio: \`${dealId}\``,
+              `Novo horário confirmado: ${dataFormatadaRetorno}`,
+              `Motivo: ${porque}`,
+              '',
+              '🤖 [dry-run] nada foi alterado — o evento anterior NÃO foi movido nem uma reunião nova foi criada.',
+            ].join('\n')).catch(() => {});
+            try { db.prepare('UPDATE conversations SET reuniao_aviso_hash = ? WHERE chat_id = ?').run(hash, chatId); } catch (e) { console.error(`  ⚠️ nao gravei reuniao_aviso_hash: ${e.message}`); }
+          }
+          return;
+        }
+
+        // Arquiva a reuniao atual (evento/Atividade) e zera o estado do compromisso — deal_id, bloco
+        // de condicoes e contrato continuam intocados, e o proprio caso. Relendo `row` do banco, a
+        // chamada recursiva cai no ramo "evento nao existe" abaixo, que cria o evento novo e a
+        // Atividade nova com o titulo/numero certos (row.reuniao_num ja incrementado).
+        const numeroNovo = abrirNovaReuniao(chatId, row);
+        console.log(`  🔁 deal ${dealId}: reuniao ${numeroNovo} aberta para ${dataFormatadaRetorno} (${porque}) — reuniao anterior preservada em reunioes_anteriores`);
+        const rowAtualizado = db.prepare('SELECT * FROM conversations WHERE chat_id = ?').get(chatId);
+        return handleAgendamentoCalendar(dealId, dados, chatId, pagamentoVerificado, rowAtualizado, apuracao, mensagens);
+      }
+    }
+
     await atualizarEventoSeRemarcado(dealId, dadosEvento, chatId, row);
 
     // Evento ja existia e a dupla confirmacao continua valida — o deal tem consulta marcada de
@@ -2487,7 +2604,7 @@ async function handleAgendamentoCalendar(dealId, dados, chatId, pagamentoVerific
   let evento = null;
   let erroGoogle = null;
   try {
-    evento = await criarEventoGoogleCalendar(dadosEvento, chatId, dealId);
+    evento = await criarEventoGoogleCalendar(dadosEvento, chatId, dealId, row?.reuniao_num);
   } catch (e) {
     if (e.horarioInvalido) {
       console.error(`  ❌ Erro ao criar evento no Google Calendar: ${e.message}`);
@@ -3199,14 +3316,14 @@ function processarConversa(chatId) {
 // dois piores bugs desta semana: o ramo "nota" nao chamava atualizarNegocioMoskit (a virada de
 // cobranca nao chegava ao CRM) e o ramo "criar" tinha uma verificacao de deal incompleta. Com um
 // lugar so, corrigir passa a valer para os tres de uma vez.
-async function finalizarCiclo({ dealId, dados, dadosMesclados, chatId, row, apuracao, acao, resumo, obsValidas }) {
+async function finalizarCiclo({ dealId, dados, dadosMesclados, chatId, row, apuracao, acao, resumo, obsValidas, mensagens }) {
   // Antes de qualquer outra consequencia: se algum campo de classificacao ficou vazio porque a IA
   // inventou um valor que nao existe no CRM, isso precisa aparecer para a equipe.
   await registrarOpcoesInvalidas(dealId, chatId, detectarOpcoesInvalidas(dadosMesclados || dados));
 
   const resultadoPagamento = await handlePagamentoConfirmado(dealId, dados, chatId);
   await handleAgendamentoCalendar(
-    dealId, dadosMesclados, chatId, resultadoPagamento.verificadoPorComprovante, row, apuracao
+    dealId, dadosMesclados, chatId, resultadoPagamento.verificadoPorComprovante, row, apuracao, mensagens
   );
 
   if (dados.estagio_funil_sugerido) {
@@ -3323,6 +3440,39 @@ function consultaDoAtendimento(row) {
   });
 }
 
+// Mesma pergunta de consultaDoAtendimento, mas para quem so tem o dealId — autorizacaoParaAgendar e
+// chamada por sincronizarAtividadesMoskit/backfillMeetLinks, que nunca tem a linha de `conversations`
+// em maos. `conversations.deal_id` e o mesmo dealId quando a conversa passou pelo bot; sem linha
+// nenhuma (Atividade nativa, sem chat) sobra so a nota do Gemini, que consultaDoAtendimento ja sabe
+// ler pelo deal_id.
+function consultaJaRealizadaPorDeal(dealId) {
+  let eventoCalendarData = null;
+  if (dealId) {
+    try {
+      eventoCalendarData = db.prepare('SELECT evento_calendar_data FROM conversations WHERE deal_id = ?').get(dealId)?.evento_calendar_data || null;
+    } catch {}
+  }
+  return consultaDoAtendimento({ deal_id: dealId, evento_calendar_data: eventoCalendarData });
+}
+
+// Todas as reunioes conhecidas de um deal — a ATUAL (reuniao_num + evento_calendar_data da linha em
+// `conversations`) mais as ja arquivadas em reunioes_anteriores — no formato que
+// reuniaoRetorno.numeroDaReuniao espera: [{numero, horarioIso}]. Usado pela rotina de notas de
+// reuniao pra descobrir a qual reuniao um e-mail do Gemini se refere, pela DATA do assunto.
+function reunioesConhecidasDoDeal(dealId) {
+  if (!dealId) return [];
+  let linha;
+  try {
+    linha = db.prepare('SELECT reuniao_num, evento_calendar_data, reunioes_anteriores FROM conversations WHERE deal_id = ?').get(dealId);
+  } catch {
+    return [];
+  }
+  if (!linha) return [];
+  const lista = lerReunioesAnteriores(linha).map((r) => ({ numero: r.numero, horarioIso: r.horarioIso }));
+  lista.push({ numero: Number(linha.reuniao_num) || 1, horarioIso: linha.evento_calendar_data || null });
+  return lista;
+}
+
 function textoConsultaAnterior(retorno) {
   const naive = retorno?.consulta?.quando ? instanteParaNaiveLocal(retorno.consulta.quando) : null;
   return formatarHorarioEscritorio(naive) || 'data desconhecida';
@@ -3415,6 +3565,63 @@ async function abrirNovoAtendimento({ chatId, row, retorno, dados, dadosAnterior
     agendarProcessamento(chatId, RETORNO_REPROCESSO_MS);
   }
   return true;
+}
+
+// ------------------------------------------------------------
+// Reuniao de retorno: abertura da 2a+ reuniao do MESMO caso
+// ------------------------------------------------------------
+// Prepare preguicoso, mesmo motivo de stmtAbrirAtendimento/stmtNotaPorAnexoToken: as colunas de
+// reuniao entram por ALTER TABLE dentro de try {} catch {} no boot, e um prepare no carregamento do
+// modulo transformaria esse catch numa armadilha.
+let _stmtAbrirNovaReuniao = null;
+function stmtAbrirNovaReuniao() {
+  if (!_stmtAbrirNovaReuniao) {
+    _stmtAbrirNovaReuniao = db.prepare(`
+      UPDATE conversations SET
+        reuniao_num = ?, reunioes_anteriores = ?,
+        evento_calendar_criado = 0, evento_calendar_id = NULL, evento_calendar_data = NULL,
+        atividade_moskit_id = NULL,
+        briefing_added = 0, briefing_hash = NULL, briefing_versao = 0, briefing_refresh_para = NULL,
+        agendamento_pendente_hash = NULL, agendamento_erro_hash = NULL,
+        agendamento_divergencia_hash = NULL, agendamento_pendencia_avisada = NULL
+      WHERE chat_id = ?
+    `);
+  }
+  return _stmtAbrirNovaReuniao;
+}
+
+function lerReunioesAnteriores(row) {
+  try {
+    const lista = JSON.parse(row?.reunioes_anteriores || '[]');
+    return Array.isArray(lista) ? lista : [];
+  } catch {
+    return [];
+  }
+}
+
+// Abre a reuniao NOVA no MESMO negocio: arquiva a reuniao atual (evento/Atividade) em
+// reunioes_anteriores e zera o estado do compromisso, para o ciclo em curso continuar e criar o
+// evento/Atividade/briefing novos, numerados como "Retorno N" (ver src/reuniao-retorno.js).
+//
+// Ao contrario de abrirNovoAtendimento (caso NOVO, negocio diferente), esta reuniao e sobre o MESMO
+// caso: deal_id, bloco_condicoes_enviado, contrato_zapsign_*, custom_fields_bot/campos_travados e
+// last_data continuam intocados de proposito — nada aqui muda a classificacao do negocio.
+//
+// Uma UPDATE so, mesmo motivo de stmtAbrirAtendimento: meia limpeza (Atividade nova apontando pro
+// evento_calendar_id antigo, por exemplo) e pior que nenhuma.
+function abrirNovaReuniao(chatId, row) {
+  const numeroAnterior = Number(row?.reuniao_num) || 1;
+  const numeroNovo = numeroAnterior + 1;
+  const anteriores = lerReunioesAnteriores(row);
+  anteriores.push({
+    numero: numeroAnterior,
+    horarioIso: row?.evento_calendar_data || null,
+    evento_id: row?.evento_calendar_id || null,
+    atividade_id: row?.atividade_moskit_id || null,
+    encerrada_em: new Date().toISOString(),
+  });
+  stmtAbrirNovaReuniao().run(numeroNovo, JSON.stringify(anteriores), chatId);
+  return numeroNovo;
 }
 
 // ------------------------------------------------------------
@@ -3659,26 +3866,43 @@ async function processarConversaDirect(chatId) {
         // cria o negocio novo. Em dry-run nada foi gravado e o fluxo segue como sempre foi.
         if (aberto) return;
       } else if (retorno.decisao === 'ambiguo') {
-        const consultaTexto = textoConsultaAnterior(retorno);
-        await avisarRetornoUmaVez({
-          chatId, row, retorno,
-          nota: `🔁 Caso descrito depois da consulta de ${consultaTexto}, mas ${clienteRetorno.descreverMotivo(retorno.motivo)} — o bot não sabe dizer se é um caso NOVO ou a continuação deste. Nada foi reclassificado; se for caso novo, abra o negócio na mão.`,
-          telegrama: [
-            '🔁 *Cliente antigo escreveu de novo — é caso novo?*',
-            `Cliente: ${dados?.nome || dadosAnteriores?.nome || row?.contact_name || 'nao informado'} (\`${chatId}\`)`,
-            `Negócio: \`${row.deal_id}\` — consulta em ${consultaTexto}`,
-            `Motivo da dúvida: ${clienteRetorno.descreverMotivo(retorno.motivo)}`,
-            '',
-            'O bot NÃO reclassificou nada. Se for um caso novo, abra o negócio manualmente.',
-          ].join('\n'),
-        });
-        // Caso novo suspeito nao reescreve a classificacao do caso ANTIGO enquanto a equipe nao decide
-        // — mesma tecnica de aplicarGateCasoDescrito, e pelo mesmo motivo: campo em branco a equipe
-        // preenche, campo com o dado do caso errado ninguem descobre lendo.
-        dados.area_direito = null;
-        dados.advogado_responsavel = null;
-        dados.assunto = null;
-        acao = 'aguardar';
+        // Resolvido pela dupla confirmacao (ver src/reuniao-retorno.js): cliente e equipe ja
+        // confirmaram um horario posterior ao FIM da consulta realizada — nao ha ambiguidade "caso
+        // novo ou continuacao?" que interesse aqui, e reuniao nova do MESMO caso. Sem esta saida, o
+        // ramo abaixo forcaria `acao = 'aguardar'`, que retorna ANTES de finalizarCiclo rodar
+        // (handleAgendamentoCalendar nunca seria chamado) — o retorno jamais seria agendado.
+        const horarioConfirmadoInstante = apuracao?.confirmado
+          ? horarioNaiveParaInstante(apuracao.horarioIso, TZ_ESCRITORIO)
+          : null;
+        const resolvidoComoRetorno = REUNIAO_RETORNO_ATIVO
+          && horarioConfirmadoInstante
+          && retorno.consulta?.fimComFolga
+          && horarioConfirmadoInstante > retorno.consulta.fimComFolga;
+
+        if (resolvidoComoRetorno) {
+          console.log(`  🔁 Retorno: ambiguo resolvido pela dupla confirmacao (${formatarHorarioEscritorio(apuracao.horarioIso)} e posterior a consulta realizada) — segue como reuniao nova do mesmo caso`);
+        } else {
+          const consultaTexto = textoConsultaAnterior(retorno);
+          await avisarRetornoUmaVez({
+            chatId, row, retorno,
+            nota: `🔁 Caso descrito depois da consulta de ${consultaTexto}, mas ${clienteRetorno.descreverMotivo(retorno.motivo)} — o bot não sabe dizer se é um caso NOVO ou a continuação deste. Nada foi reclassificado; se for caso novo, abra o negócio na mão.`,
+            telegrama: [
+              '🔁 *Cliente antigo escreveu de novo — é caso novo?*',
+              `Cliente: ${dados?.nome || dadosAnteriores?.nome || row?.contact_name || 'nao informado'} (\`${chatId}\`)`,
+              `Negócio: \`${row.deal_id}\` — consulta em ${consultaTexto}`,
+              `Motivo da dúvida: ${clienteRetorno.descreverMotivo(retorno.motivo)}`,
+              '',
+              'O bot NÃO reclassificou nada. Se for um caso novo, abra o negócio manualmente.',
+            ].join('\n'),
+          });
+          // Caso novo suspeito nao reescreve a classificacao do caso ANTIGO enquanto a equipe nao
+          // decide — mesma tecnica de aplicarGateCasoDescrito, e pelo mesmo motivo: campo em branco a
+          // equipe preenche, campo com o dado do caso errado ninguem descobre lendo.
+          dados.area_direito = null;
+          dados.advogado_responsavel = null;
+          dados.assunto = null;
+          acao = 'aguardar';
+        }
       }
     }
 
@@ -3770,7 +3994,7 @@ async function processarConversaDirect(chatId) {
         row.briefing_added = 0;
       }
 
-      await finalizarCiclo({ dealId, dados, dadosMesclados, chatId, row, apuracao, acao, obsValidas,
+      await finalizarCiclo({ dealId, dados, dadosMesclados, chatId, row, apuracao, acao, obsValidas, mensagens,
         resumo: `Processamento de ${chatId} concluido` });
 
       // So DEPOIS de finalizarCiclo (que chama handleAgendamentoCalendar): postar o Briefing com
@@ -3815,7 +4039,7 @@ async function processarConversaDirect(chatId) {
 
       await finalizarCiclo({
         dealId, dados, dadosMesclados: mesclarParaCrm(dadosAnteriores, dados, obsValidas),
-        chatId, row, apuracao, acao, obsValidas, resumo: `Nota adicionada para ${chatId}`,
+        chatId, row, apuracao, acao, obsValidas, mensagens, resumo: `Nota adicionada para ${chatId}`,
       });
 
       if (dados.resumo_atendimento) {
@@ -3895,7 +4119,7 @@ async function processarConversaDirect(chatId) {
         console.log('  🎯 Todos os campos obrigatorios preenchidos!');
       }
 
-      await finalizarCiclo({ dealId, dados, dadosMesclados, chatId, row, apuracao, acao, obsValidas,
+      await finalizarCiclo({ dealId, dados, dadosMesclados, chatId, row, apuracao, acao, obsValidas, mensagens,
         resumo: `Deal ${dealId} atualizado com campos pendentes` });
 
       if (pendentes.length === 0) {
@@ -4695,11 +4919,12 @@ function processarMensagemRecebida(chatId, phone, contactName, corpo, role, idZe
 const ATIVIDADE_TIPOS_CONSULTA = MOSKIT_IDS.ATIVIDADE_TIPOS_CONSULTA;
 
 // Marca, na nota do Moskit, que a reuniao foi liberada sem comprovante — sem isso nao ha como
-// auditar depois quais consultas foram agendadas sem pagamento.
+// auditar depois quais consultas foram agendadas sem pagamento (ou, no caso de retorno, sem cobrar
+// de novo por uma reuniao que ja foi paga na consulta original).
 function seloConsultaGratis(motivo) {
-  return motivo === 'consulta_gratis'
-    ? '\n🆓 Consulta gratuita (marcada no Moskit) — evento criado sem comprovante de pagamento.'
-    : '';
+  if (motivo === 'consulta_gratis') return '\n🆓 Consulta gratuita (marcada no Moskit) — evento criado sem comprovante de pagamento.';
+  if (motivo === 'retorno') return '\n🔁 Reunião de retorno do caso já atendido — liberada sem novo comprovante.';
+  return '';
 }
 
 // Evita dois ciclos sobrepostos: o setInterval dispara a cada 3 min e a rota manual pode disparar
@@ -4720,7 +4945,7 @@ let sincronizacaoAtividadesEmAndamento = false;
 const SYNC_ATIVIDADES_PAUSA_MS = Number(process.env.SYNC_ATIVIDADES_PAUSA_MS) || 300;
 
 async function sincronizarAtividadesMoskit() {
-  const relatorio = { atividades_verificadas: 0, eventos_criados: 0, ja_sincronizadas: 0, aguardando_pagamento: 0, liberadas_consulta_gratis: 0, ignoradas: 0, erros: 0 };
+  const relatorio = { atividades_verificadas: 0, eventos_criados: 0, ja_sincronizadas: 0, aguardando_pagamento: 0, liberadas_consulta_gratis: 0, liberadas_retorno: 0, ignoradas: 0, erros: 0 };
 
   if (!getGoogleAuthClient()) {
     console.log('  ⏭️ Google Calendar nao configurado — pulando sincronizacao de atividades');
@@ -4805,6 +5030,9 @@ async function sincronizarAtividadesMoskit() {
           if (authNativa.motivo === 'consulta_gratis') {
             relatorio.liberadas_consulta_gratis++;
             console.log(`  🆓 Atividade "${atv.title}" (nativa do Moskit) liberada SEM comprovante — deal ${dealId} marcado como "consulta gratis"`);
+          } else if (authNativa.motivo === 'retorno') {
+            relatorio.liberadas_retorno++;
+            console.log(`  🔁 Atividade "${atv.title}" (nativa do Moskit) liberada SEM comprovante — deal ${dealId} ja teve reuniao realizada`);
           }
 
           const patched = await calendar.events.patch({
@@ -4845,6 +5073,9 @@ async function sincronizarAtividadesMoskit() {
         if (auth.motivo === 'consulta_gratis') {
           relatorio.liberadas_consulta_gratis++;
           console.log(`  🆓 Atividade "${atv.title}" liberada SEM comprovante — deal ${dealId} marcado como "consulta gratis"`);
+        } else if (auth.motivo === 'retorno') {
+          relatorio.liberadas_retorno++;
+          console.log(`  🔁 Atividade "${atv.title}" liberada SEM comprovante — deal ${dealId} ja teve reuniao realizada`);
         }
 
         const inicio = new Date(atv.dueDate);
@@ -4912,7 +5143,7 @@ async function sincronizarAtividadesMoskit() {
       }
     }
 
-    console.log(`\n📅 Sincronizacao de atividades concluida: ${relatorio.eventos_criados} eventos criados, ${relatorio.ja_sincronizadas} ja sincronizadas, ${relatorio.aguardando_pagamento} aguardando pagamento, ${relatorio.liberadas_consulta_gratis} liberadas por consulta gratis, ${relatorio.erros} erros`);
+    console.log(`\n📅 Sincronizacao de atividades concluida: ${relatorio.eventos_criados} eventos criados, ${relatorio.ja_sincronizadas} ja sincronizadas, ${relatorio.aguardando_pagamento} aguardando pagamento, ${relatorio.liberadas_consulta_gratis} liberadas por consulta gratis, ${relatorio.liberadas_retorno} liberadas por retorno, ${relatorio.erros} erros`);
   } catch (e) {
     console.error(`\n❌ Erro na sincronizacao de atividades: ${e.message}`);
     relatorio.erros++;
@@ -4927,7 +5158,7 @@ async function sincronizarAtividadesMoskit() {
 // nao tem link (criados antes dessa funcionalidade existir, ou nativamente pelo Moskit).
 // Roda uma vez (via rota manual), nao faz parte do ciclo periodico.
 async function backfillMeetLinks(dryRun) {
-  const relatorio = { eventos_verificados: 0, links_adicionados: 0, ja_tinham_link: 0, aguardando_pagamento: 0, liberadas_consulta_gratis: 0, erros: 0, candidatos: [] };
+  const relatorio = { eventos_verificados: 0, links_adicionados: 0, ja_tinham_link: 0, aguardando_pagamento: 0, liberadas_consulta_gratis: 0, liberadas_retorno: 0, erros: 0, candidatos: [] };
   const auth = getGoogleAuthClient();
   if (!auth) {
     console.log('  ⏭️ Google Calendar (OAuth2) nao configurado — pulando backfill de Meet links');
@@ -4952,11 +5183,16 @@ async function backfillMeetLinks(dryRun) {
         try {
           if (ev.status === 'cancelled') continue;
           // So mexe em evento que e uma consulta de verdade: tem link de negocio do Moskit
-          // na descricao (evento criado pelo bot na Fase 5, ou nativamente pelo Moskit/"oll")
-          // ou segue o padrao de titulo usado pelo bot na Fase 4 ("Consulta — nome (advogado)").
+          // na descricao (evento criado pelo bot na Fase 5, ou nativamente pelo Moskit/"oll"),
+          // o marcador `[deal:id]` que todo evento criado pelo bot carrega (montarDescricaoEvento),
+          // ou segue o padrao de titulo usado pelo bot na Fase 4 ("Consulta — nome (advogado)") ou
+          // pela reuniao de retorno ("Retorno N — nome (advogado)", ver src/reuniao-retorno.js).
           // Sem esse filtro, o backfill mexe em QUALQUER evento futuro do calendario
           // (aniversarios, reunioes internas recorrentes etc.) — ja aconteceu uma vez.
-          const eDeConsulta = /\/deal\/\d+/.test(ev.description || '') || /^Consulta\s*—/.test(ev.summary || '');
+          const eDeConsulta = /\/deal\/\d+/.test(ev.description || '')
+            || /\[deal:\d+\]/.test(ev.description || '')
+            || /^Consulta\s*—/.test(ev.summary || '')
+            || /^Retorno\s+\d+\s*—/.test(ev.summary || '');
           if (!eDeConsulta) continue;
 
           if (ev.hangoutLink || ev.conferenceData?.entryPoints?.length) {
@@ -4981,6 +5217,9 @@ async function backfillMeetLinks(dryRun) {
             if (motivoLiberacao === 'consulta_gratis') {
               relatorio.liberadas_consulta_gratis++;
               console.log(`  🆓 Evento "${ev.summary}" liberado SEM comprovante — deal ${dealId} marcado como "consulta gratis"`);
+            } else if (motivoLiberacao === 'retorno') {
+              relatorio.liberadas_retorno++;
+              console.log(`  🔁 Evento "${ev.summary}" liberado SEM comprovante — deal ${dealId} ja teve reuniao realizada`);
             }
           }
 
@@ -5020,7 +5259,7 @@ async function backfillMeetLinks(dryRun) {
       pageToken = res.data.nextPageToken;
     } while (pageToken);
 
-    console.log(`\n🔗 Backfill de Meet concluido: ${relatorio.links_adicionados} links adicionados, ${relatorio.ja_tinham_link} ja tinham, ${relatorio.aguardando_pagamento} aguardando pagamento, ${relatorio.liberadas_consulta_gratis} liberadas por consulta gratis, ${relatorio.erros} erros`);
+    console.log(`\n🔗 Backfill de Meet concluido: ${relatorio.links_adicionados} links adicionados, ${relatorio.ja_tinham_link} ja tinham, ${relatorio.aguardando_pagamento} aguardando pagamento, ${relatorio.liberadas_consulta_gratis} liberadas por consulta gratis, ${relatorio.liberadas_retorno} liberadas por retorno, ${relatorio.erros} erros`);
   } catch (e) {
     console.error(`\n❌ Erro no backfill de Meet links: ${e.message}`);
     relatorio.erros++;
@@ -6822,6 +7061,7 @@ async function processarNotaReuniao({ gmail, calendar, drive, mensagem, stmts, d
       linkDoc: docId ? `https://docs.google.com/document/d/${docId}` : '',
       metodo: resolucao.metodo,
       confianca: resolucao.confianca,
+      numeroReuniao: reuniaoRetorno.numeroDaReuniao(reunioesConhecidasDoDeal(resolucao.dealId), dataIso),
     },
   });
 

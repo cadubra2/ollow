@@ -340,7 +340,7 @@ não fazem parte da chave nem viram um nível a mais no JSON). Exatamente estas 
 1. CONTEXTO DO CLIENTE & HISTÓRICO FÁTICO
 - "perfil_qualificacao": texto. Quem é o cliente: profissão, formação, cargo, situação acadêmica ou funcional, aprovações, e o que mais o qualifica no caso — só o que for relevante para o atendimento (ver seção 5 para o que não for).
 - "historico_processual_anterior": texto. Ações, recursos ou pedidos administrativos anteriores: onde tramitaram, o que foi decidido e por quê. Inclua a causa da derrota quando ela foi discutida.
-- "situacao_atual_urgencia": texto. O que acontece agora, o que o cliente arrisca perder e em que prazo.
+- "situacao_atual_urgencia": texto. O que acontece agora, o que o cliente arrisca perder e em que prazo. Se a reunião é uma reunião DE RETORNO/ACOMPANHAMENTO de um caso já em andamento (não a consulta inicial), este campo carrega o ESTADO ATUAL do caso — o que já foi feito, o que mudou desde a última reunião, o que falta — em vez de ficar vazio só porque não há "caso novo" para descrever.
 - "diretrizes_internas_equipe": texto. Instruções que a equipe deu a si mesma na reunião: quem faz o quê, que ferramenta usar, o que estudar antes de redigir, o que confirmar com o cliente.
 
 2. DO OBJETO
@@ -604,12 +604,16 @@ const secaoHonorarios = (titulo, itens) =>
 // 5 secoes (revertido de 3 em 21/08/2026, ver CAMPOS): contexto do cliente de volta, estrategia
 // juridica de volta a 3 sub-campos (aceita via administrativa tambem), e uma 5a secao nova pro que e
 // social/pessoal e nao pertence ao caso.
+// `meta.numeroReuniao` vem de numeroDaReuniao (src/reuniao-retorno.js): a que reuniao esta nota se
+// refere, pela DATA do assunto do e-mail do Gemini. Sem numero identificado (deal com uma so
+// reuniao, ou data ambigua entre duas do mesmo dia) o cabecalho fica exatamente como era antes desta
+// funcionalidade existir — nenhuma mudanca de formato, so 5 secoes continuam o contrato.
 function montarTextoNota({ extracao, meta = {}, avisos = [], marcador }) {
   const quando = [meta.dataBr, meta.horaBr].filter(Boolean).join(' às ');
   const e = extracao || {};
 
   const corpo = [
-    `📄 BRIEFING DE ATENDIMENTO E ALINHAMENTO ESTRATÉGICO${quando ? ` — ${quando}` : ''}${meta.tituloEvento ? ` (${meta.tituloEvento})` : ''}`,
+    `📄 BRIEFING DE ATENDIMENTO E ALINHAMENTO ESTRATÉGICO${meta.numeroReuniao ? ` — REUNIÃO ${meta.numeroReuniao}` : ''}${quando ? ` — ${quando}` : ''}${meta.tituloEvento ? ` (${meta.tituloEvento})` : ''}`,
     secaoRotulada('👤 1. CONTEXTO DO CLIENTE & HISTÓRICO FÁTICO', [
       ['Perfil/Qualificação', e.perfil_qualificacao],
       ['Histórico Processual Anterior', e.historico_processual_anterior],

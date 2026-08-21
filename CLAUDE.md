@@ -759,6 +759,92 @@ comportamento não mediria o status quo.
   desse arquivo (`https.request`) nasceu aqui e tapou um buraco antigo: `processarNotaReuniao` chamava a
   OpenAI de verdade na suíte.
 
+### Reunião de retorno: a 2ª+ reunião do mesmo caso
+
+Diferente de "Cliente que volta" (caso NOVO, negócio diferente): aqui o cliente já atendido volta
+para uma **segunda reunião do mesmo caso** — alinhamento pós-consulta, acompanhamento processual.
+Mesmo negócio, mesma classificação, só o **compromisso** (evento/Atividade/briefing) é novo. A
+decisão fica em [src/reuniao-retorno.js](src/reuniao-retorno.js) (puro, sem rede); o `index.js` só
+busca o que ela pede. Desligada por padrão (`REUNIAO_RETORNO_ATIVO`) e, quando ligada, em dry-run
+(`REUNIAO_RETORNO_DRY_RUN`).
+
+- **O que era estragado, em silêncio.** `handleAgendamentoCalendar` só conhecia UMA consulta por
+  conversa (`evento_calendar_criado`/`evento_calendar_id`/`atividade_moskit_id`/`briefing_*` são
+  campos únicos por linha de `conversations`). Cliente+equipe confirmando um horário novo para uma
+  reunião de acompanhamento caía sempre no ramo "evento já existe" e era tratado como **remarcação**:
+  `atualizarEventoSeRemarcado` dava `PATCH` em `start`/`end` do evento **que já aconteceu**, apagando
+  o registro da reunião anterior (e o evento a que a nota do Gemini estava ancorada), e a reunião nova
+  nunca entrava na agenda do Moskit (`registrarConsultaNaAgendaMoskit` sai na guarda de
+  `atividade_moskit_id` já existente). Se a Atividade antiga já tivesse sido concluída, o `PUT` da
+  remarcação batia no `422 "Completed activity cannot be updated"` — o Google movia, o Moskit não.
+- **A tolerância de 24h separa no-show de reunião nova.** Cliente que fura o horário e a equipe
+  remarca logo depois é a MESMA reunião que deslizou — não uma reunião nova. `classificarReuniao`
+  (`src/reuniao-retorno.js`) só decide "retorno" quando a consulta anterior **já aconteceu** (reuso
+  direto de `clienteRetorno.consultaJaRealizada`) **e** a dupla confirmação fechou o horário novo
+  **depois** de `REUNIAO_TOLERANCIA_REMARCACAO_HORAS` (padrão 24h) do fim da reunião anterior.
+  `confirmadoEm` é o timestamp da **mensagem** que fechou a perna mais recente da dupla confirmação
+  (`timestampConfirmacao`, `index.js`) — nunca `Date.now()`, senão um reprocessamento dias depois
+  (fila, `processar_pendentes.js`, refresh de briefing) recalcularia a mesma conversa com um relógio
+  diferente e inverteria o veredito.
+- **Vocabulário: "Consulta" continua "Consulta"; a 2ª reunião em diante é "Retorno N".**
+  `rotuloCompromisso` é a fonte única — `montarResumoEvento(dados, dealId, numeroReuniao)` ganha um
+  3º parâmetro, sempre lido de `row.reuniao_num` e **nunca recalculado**, pelo mesmo motivo do
+  `dealId` no comentário da própria função: `sincronizarMetadadosEvento` **compara** o resumo com o
+  que já está no Google, e duas fontes diferentes para o mesmo número repatchariam o evento pra
+  sempre. O sufixo `· #dealId` continua sufixo, e o backfill do Meet (`eDeConsulta`) passa a
+  reconhecer também `[deal:\d+]` na descrição e `/^Retorno\s+\d+\s*—/` no título.
+- **Abrir a reunião nova é uma única `UPDATE`** (`abrirNovaReuniao`, `index.js`, mesmo padrão de
+  `stmtAbrirAtendimento`): arquiva a reunião atual (`{numero, horarioIso, evento_id, atividade_id,
+  encerrada_em}`) em `reunioes_anteriores`, incrementa `reuniao_num`, e zera **só** o estado do
+  compromisso (`evento_calendar_*`, `atividade_moskit_id`, `briefing_*`, os hashes de
+  pendência/erro/divergência). **Preserva de propósito** `deal_id`, `bloco_condicoes_enviado`,
+  `contrato_zapsign_*`, `custom_fields_bot`/`campos_travados` — é o MESMO caso, nada disso deveria
+  mudar. A chamada recursiva de `handleAgendamentoCalendar` com o `row` relido do banco cai no ramo de
+  criação normal (evento + Atividade novos), reusando o caminho já testado em vez de duplicá-lo.
+  `atividades_sincronizadas` **não é tocada** — a linha da reunião anterior continua sendo a trava
+  contra evento duplicado para ela; a reunião nova ganha a sua própria.
+- **No dry-run, o evento anterior nunca é movido** — desvio deliberado da convenção de
+  `CLIENTE_RETORNO_DRY_RUN` ("segue como hoje"): aqui "como hoje" seria mover o evento da consulta
+  que já aconteceu, e medir não justifica destruir esse registro. O dry-run só posta nota
+  `[dry-run]` + Telegram (dedup por `reuniao_aviso_hash`) e retorna.
+- **`autorizacaoParaAgendar` ganha o motivo `'retorno'`**: deal que já teve uma reunião realizada
+  (`consultaJaRealizadaPorDeal`, a mesma pergunta de `consultaDoAtendimento` para quem só tem o
+  `dealId`) é liberado sem comprovante — sem isso, uma Atividade de acompanhamento criada direto no
+  Moskit (sem chat) ficaria travada em "aguardando_pagamento" para sempre, esperando um comprovante
+  de uma consulta que já foi paga. Determinístico por desenho: o critério é a consulta realizada, não
+  o título que a equipe digitou (que abriria um contorno do gate de pagamento).
+- **A nota do Gemini ganha o número da reunião no cabeçalho** (`— REUNIÃO N`), calculado por
+  `numeroDaReuniao(reunioes, dataIso)` a partir da **data** do assunto do e-mail (que não tem hora) —
+  nunca do contador atual, porque o e-mail da reunião 1 pode chegar depois de a reunião 2 já estar
+  aberta. Dia com mais de uma reunião é ambíguo de propósito e não numera nada (mesmo "candidato
+  único ou nada" de `decidirDeal`). **O formato de 5 seções não muda** — só a numeração; um segundo
+  formato exigiria versionar a coluna `extracao`, que hoje não tem esse campo. Risco coberto no
+  prompt: reunião de acompanhamento pode não ter `perfil_qualificacao`/`objeto`, e
+  `CAMPOS_SUSTENTACAO` vazio descartaria a nota inteira (`vazia: true` → `ERRO_PERMANENTE`) —
+  `situacao_atual_urgencia` agora carrega o estado atual do caso nesse cenário.
+- **O briefing pré-reunião também é numerado, mas por um vocabulário diferente do da agenda.**
+  O título usa contagem simples e sequencial (`Reunião 1`, `Reunião 2`, ...) — é o que o usuário pediu
+  — enquanto o cabeçalho da nota usa o mesmo `rotuloCompromisso` da agenda (`Consulta:`/`Retorno N:`).
+  `briefing_versao` reinicia em 0 no `abrirNovaReuniao`, então cada reunião tem sua própria trilha de
+  versões e a primeira nota da reunião nova sempre reposta (o horário mudou, o hash muda).
+- **Interação com "Cliente que volta": o ramo `ambíguo` não pode travar uma reunião já confirmada.**
+  Hoje, consulta realizada + caso descrito depois com mesmo assunto/área força `acao = 'aguardar'`,
+  que retorna **antes** de `finalizarCiclo` — `handleAgendamentoCalendar` nunca roda, e o retorno
+  nunca seria agendado. Quando a dupla confirmação já fechou num horário posterior ao fim da consulta
+  realizada, a ambiguidade "caso novo ou continuação?" está resolvida (é reunião nova do mesmo caso) e
+  o ramo deixa de anular `area_direito`/`advogado_responsavel`/`assunto` e de forçar `aguardar`. Só se
+  aplica com `REUNIAO_RETORNO_ATIVO` ligado — sem a rotina saber abrir a reunião nova corretamente, o
+  comportamento mais seguro é o de hoje (congelar e avisar).
+- **Migração e prepares preguiçosos.** As três colunas novas (`reuniao_num`, `reunioes_anteriores`,
+  `reuniao_aviso_hash`) entram por `ALTER TABLE` em `try {} catch {}`, mesmo motivo de
+  `stmtNotaPorAnexoToken()`/`stmtAbrirAtendimento()`.
+- Regressões em `test-reuniao-retorno.js` (módulo puro: tolerância, `numeroDaReuniao`,
+  `rotuloCompromisso`) e `test-reuniao-retorno-flags.js` (os três modos com que isto vai a produção —
+  desligado, dry-run e ligado-aplicando — cada um no seu processo, mesmo motivo de
+  `test-cliente-retorno-flags.js`: prova, através do pipeline real, que desligado continua movendo o
+  evento antigo como sempre fez, dry-run não move nada, e o modo ligado abre a reunião nova, cria o
+  evento/Atividade com o título certo e preserva a anterior).
+
 ### Segurança das rotas
 
 - Rotas administrativas (`/sincronizar`, `/processar/:chatId`, backfills, auditorias) exigem
