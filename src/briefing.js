@@ -23,7 +23,12 @@ function limparTelefone(bruto) {
 // O cabecalho omite linhas sem informacao de proposito: campo que o modelo ainda nao extraiu nao
 // ganha clareza com "Nao informado" repetido — a narrativa abaixo e que tem o "Nao mencionado"
 // mandado pelo prompt. Linha so entra quando ha valor real.
-function montarCabecalho({ dados, contato, telefone, horarioConsulta }) {
+//
+// `rotuloConsulta` e o vocabulario da reuniao de retorno (ver src/reuniao-retorno.js,
+// rotuloCompromisso): "Consulta" na 1a reuniao do caso, "Retorno N" da 2a em diante — e a linha que
+// amarra os dois lados (a agenda diz "Retorno 1", o briefing tambem). Default "Consulta" preserva o
+// comportamento de antes desta funcionalidade existir.
+function montarCabecalho({ dados, contato, telefone, horarioConsulta, rotuloConsulta }) {
   const d = dados || {};
   const linhas = [];
   const nome = contato || d.nome;
@@ -33,15 +38,15 @@ function montarCabecalho({ dados, contato, telefone, horarioConsulta }) {
   if (d.area_direito) linhas.push(`Área: ${d.area_direito}`);
   if (d.advogado_responsavel) linhas.push(`Advogado: ${d.advogado_responsavel}`);
   if (d.modalidade_consulta) linhas.push(`Modalidade: ${d.modalidade_consulta}`);
-  if (horarioConsulta) linhas.push(`Consulta: ${horarioConsulta}`);
+  if (horarioConsulta) linhas.push(`${rotuloConsulta || 'Consulta'}: ${horarioConsulta}`);
   const valor = d.valor_honorarios_inicial || d.valor_mensalidade;
   if (valor) linhas.push(`Valor: ${valor}`);
   return linhas.join('\n');
 }
 
-function montarTextoBriefing({ dados, contato, telefone, horarioConsulta }) {
+function montarTextoBriefing({ dados, contato, telefone, horarioConsulta, rotuloConsulta }) {
   const partes = [];
-  const cabecalho = montarCabecalho({ dados, contato, telefone, horarioConsulta });
+  const cabecalho = montarCabecalho({ dados, contato, telefone, horarioConsulta, rotuloConsulta });
   if (cabecalho) partes.push(cabecalho);
   const narrativa = String((dados && dados.resumo_atendimento) || '').trim();
   if (narrativa) partes.push(narrativa);

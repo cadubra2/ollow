@@ -34,6 +34,8 @@ const TESTES = [
   'test-notas-reuniao.js',
   'test-cliente-retorno.js',
   'test-cliente-retorno-flags.js',
+  'test-reuniao-retorno.js',
+  'test-reuniao-retorno-flags.js',
 ];
 
 const TZ_TESTES = process.env.TZ_TESTES || 'UTC';
