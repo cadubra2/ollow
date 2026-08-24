@@ -127,7 +127,7 @@ const {
   stmtsNotas, registrarFalhaNota, conferirSilencioNotas, processarNotaReuniao,
   anexarDocNoDeal, anexoComNomeExiste, retomarAnexosPendentes, limparAnexosExpirados,
   enviarTelegram, baixarParaArquivo, montarHeadersAnexo, ehHostZernio, resolverUrlAnexo,
-  garantirDealExiste, importarContatosMoskit,
+  garantirDealExiste, importarContatosMoskit, buscarOuCriarContato, buscarDealPorContato,
   sincronizarAtividadesMoskit, comSufixoDealId, comMarcadorDeal,
   processarConversaDirect, montarHistorico, equipeEnviouCondicoesDeValor,
   janelaAtendimento, consultaDoAtendimento, lerDealsAnteriores, abrirNovoAtendimento, avisarRetornoUmaVez,
@@ -1787,6 +1787,84 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     const dealId = await garantirDealExiste(50, { nome: 'Fulano' }, 1, {});
     igual('deal confirmado existente → devolve o mesmo id', dealId, 50);
     igual('   sem nenhum POST de criacao', de('POST', '/deals').length, 0);
+  }
+
+  // ============================================================
+  // MEDIDO em 24/08/2026 (estudar-deals-duplicados.js --sondar-crm --so-bot): 14 contatos duplicados
+  // de verdade na conta do escritorio — mesmo telefone, dois `contacts.id` diferentes no Moskit, a
+  // maioria concentrada no dia em que o auto-deploy foi testado com varios `pm2 restart` em sequencia
+  // (o cenario que faz o Moskit devolver 429 sob rajada de reprocessamento). Causa: um status fora de
+  // 200-299 OU uma excecao de rede na busca terminavam em silencio e caiam direto no POST /contacts —
+  // exatamente como se o contato genuinamente nao existisse. Mesmo raciocinio de garantirDealExiste
+  // acima: rede instavel != contato/deal inexistente.
+  console.log('\n=== buscarOuCriarContato: falha na busca nao pode criar contato duplicado ===');
+  {
+    limpar();
+    const tel = '5586999990010';
+    db.prepare('DELETE FROM moskit_contacts WHERE phone = ?').run(tel.slice(-13));
+    rede.get = (url) => (url.includes('/contacts') ? { status: 429, data: {} } : { status: 200, data: {} });
+    let contatoCriado = false;
+    rede.post = (url) => { if (url.includes('/contacts')) contatoCriado = true; return { status: 201, data: { id: 999 } }; };
+    const erro = await esperarErro(() => buscarOuCriarContato(tel, 'Fulano'));
+    checar('429 na busca de contato → LANCA em vez de criar', !!erro && !contatoCriado, { erro, contatoCriado });
+  }
+  {
+    limpar();
+    const tel = '5586999990011';
+    db.prepare('DELETE FROM moskit_contacts WHERE phone = ?').run(tel.slice(-13));
+    rede.get = (url) => { if (url.includes('/contacts')) throw new Error('timeout of 30000ms exceeded'); return { status: 200, data: {} }; };
+    let contatoCriado = false;
+    rede.post = (url) => { if (url.includes('/contacts')) contatoCriado = true; return { status: 201, data: { id: 999 } }; };
+    const erro = await esperarErro(() => buscarOuCriarContato(tel, 'Fulano'));
+    checar('timeout na busca de contato → LANCA em vez de criar', !!erro && !contatoCriado, { erro, contatoCriado });
+  }
+  {
+    // Contraprova: a busca chega ao FIM DE VERDADE da lista (pagina sem token de proxima pagina) sem
+    // achar → so ENTAO cria. Sem isto, um bug que fizesse a funcao sempre lancar passaria nos dois
+    // testes acima e travaria toda criacao de contato legitima (o caminho comum, cliente novo).
+    limpar();
+    const tel = '5586999990012';
+    db.prepare('DELETE FROM moskit_contacts WHERE phone = ?').run(tel.slice(-13));
+    rede.get = (url) => (url.includes('/contacts') ? { status: 200, data: [] } : { status: 200, data: {} });
+    let contatoCriado = false;
+    rede.post = (url) => { if (url.includes('/contacts')) contatoCriado = true; return { status: 201, data: { id: 4242 } }; };
+    const id = await buscarOuCriarContato(tel, 'Fulano');
+    igual('busca chega ao fim sem achar → cria contato normalmente', id, 4242);
+    checar('   POST /contacts foi chamado', contatoCriado);
+  }
+
+  // ============================================================
+  console.log('\n=== buscarDealPorContato: pagina de verdade (?start=) e nao conclui "nao existe" numa falha ===');
+  {
+    limpar();
+    rede.get = (url) => (url.includes('/deals') ? { status: 429, data: [] } : { status: 200, data: {} });
+    const erro = await esperarErro(() => buscarDealPorContato(555));
+    checar('429 na busca de deal → LANCA em vez de concluir "nao existe"', !!erro, erro);
+  }
+  {
+    limpar();
+    rede.get = (url) => { if (url.includes('/deals')) throw new Error('timeout of 30000ms exceeded'); return { status: 200, data: {} }; };
+    const erro = await esperarErro(() => buscarDealPorContato(555));
+    checar('timeout na busca de deal → LANCA', !!erro, erro);
+  }
+  {
+    // contacts[] vem na PROPRIA listagem de /deals (confirmado empiricamente em 24/08/2026) — acha
+    // sem nenhum GET extra por deal, o N+1 que existia antes (page:1 + um GET /deals/{id} por item).
+    limpar();
+    rede.get = (url) => (url.includes('/deals')
+      ? { status: 200, data: [{ id: 777, contacts: [{ id: 555 }] }, { id: 778, contacts: [{ id: 1 }] }] }
+      : { status: 200, data: {} });
+    const dealId = await buscarDealPorContato(555);
+    igual('acha pelo contacts[] da propria listagem, sem GET extra', dealId, 777);
+    igual('   nenhum GET /deals/777 individual', de('GET', '/deals/777').length, 0);
+  }
+  {
+    // Contraprova: pagina incompleta (menos de 10) e o fim de verdade da lista — sem achar, devolve
+    // null (o "nao existe" honesto), nunca lanca so porque nao viu a conta inteira.
+    limpar();
+    rede.get = (url) => (url.includes('/deals') ? { status: 200, data: [{ id: 1, contacts: [{ id: 2 }] }] } : { status: 200, data: {} });
+    const dealId = await buscarDealPorContato(999);
+    igual('pagina incompleta sem achar → null (fim de verdade da lista)', dealId, null);
   }
 
   // ============================================================

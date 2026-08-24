@@ -30,6 +30,12 @@ ngrok.log
 # Comprovantes de pagamento baixados dos clientes.
 comprovantes/
 
+# CSVs gerados pelos scripts estudar-*.js/diagnosticar-*.js (nome, telefone e dados do caso de
+# clientes reais). Ficam no disco de quem rodou, nunca no repositorio.
+deals-*.csv
+notas-*.csv
+retorno-*.csv
+
 # PDFs das notas de reuniao, servidos temporariamente para o Moskit baixar. Sao transcricoes de
 # consulta juridica: nunca podem ir para o repositorio. A rotina os apaga assim que o Moskit
 # confirma a copia (ou quando o TTL vence), entao a pasta costuma estar vazia.
