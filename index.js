@@ -133,6 +133,11 @@ const ZERNIO_API_KEY = process.env.ZERNIO_API_KEY;
 // Teto de paginas na busca de contato: protege contra base grande + resposta sem token de proxima
 // pagina, que viraria loop. 20 x 100 cobre a base atual com folga.
 const MAX_PAGINAS_BUSCA_CONTATO = Number(process.env.MAX_PAGINAS_BUSCA_CONTATO) || 20;
+// Teto da busca de deal por contato (buscarDealPorContato) — pagina de 10 (?start=, /deals ignora
+// `limit`), entao 20 paginas = 200 deals mais recentes da conta. Paginar a conta inteira (3000+, ~90s)
+// e impraticavel dentro de um ciclo de processamento; os deals mais recentes sao onde o cenario real
+// do bug (deal criado ha poucos dias, buscado de novo num reprocessamento) vive.
+const MAX_PAGINAS_BUSCA_DEAL = Number(process.env.MAX_PAGINAS_BUSCA_DEAL) || 20;
 // Teto da varredura de atividades. Cada pagina traz 10 (ver listarAtividadesMoskit), entao 20
 // paginas = 200 atividades por ciclo — a varredura completa da base em 12/08/2026 devolveu 190
 // registros unicos, ou seja, hoje o teto cobre tudo com folga e `truncou` nunca dispara.
@@ -1317,33 +1322,56 @@ async function buscarOuCriarContato(phone, name) {
   // 2) Fallback na API, agora paginando de verdade (mesmo mecanismo de importarContatosMoskit).
   //    Menos de 8 digitos nao identifica um telefone com seguranca — evita ".includes()" casando com
   //    qualquer numero que contenha a mesma sequencia.
+  //
+  // MEDIDO em 24/08/2026 (estudar-deals-duplicados.js --sondar-crm --so-bot): 14 contatos duplicados
+  // de verdade na conta — mesmo telefone, dois `contacts.id` diferentes, cada um com seu proprio
+  // deal (o deal em si nasceu certo; o contato por baixo dele e que era o segundo). A maioria
+  // concentrada em 10/08/2026, dia em que o auto-deploy foi testado com varios `pm2 restart` em
+  // sequencia — exatamente o cenario que faz o Moskit devolver 429 sob rajada de reprocessamento.
+  // A causa: `break` silencioso em qualquer status fora de 200-299 (nao passa pelo catch — o
+  // `validateStatus: s<500` faz o axios devolver o 429 como resposta normal, nao excecao) OU
+  // qualquer excecao de rede no catch abaixo terminavam a busca e CAIAM NO POST /contacts,
+  // exatamente como se o contato genuinamente nao existisse. Rede instavel != contato novo — mesmo
+  // raciocinio de garantirDealExiste (index.js) sobre nao tratar erro como "nao existe". Agora um
+  // status fora de 200-299 ou uma excecao INTERROMPEM com erro (a fila retenta depois) em vez de
+  // duplicar o contato; so a paginacao chegar ao fim de verdade (ultima pagina, sem pageToken) e que
+  // autoriza concluir "nao existe, pode criar".
   if (phoneDigits.length >= 8) {
-    try {
-      let pageToken = null;
-      for (let pagina = 0; pagina < MAX_PAGINAS_BUSCA_CONTATO; pagina++) {
-        const listRes = await axios.get(`${MOSKIT_BASE}/contacts`, {
+    let pageToken = null;
+    let chegouAoFim = false;
+    for (let pagina = 0; pagina < MAX_PAGINAS_BUSCA_CONTATO; pagina++) {
+      let listRes;
+      try {
+        listRes = await axios.get(`${MOSKIT_BASE}/contacts`, {
           params: { limit: 100, sort: 'id', order: 'desc', ...(pageToken ? { pageToken } : { page: 1 }) },
           headers: apiHeaders,
           validateStatus: (s) => s < 500,
           timeout: TIMEOUT_HTTP_MS,
         });
-        if (listRes.status < 200 || listRes.status >= 300) break;
-
-        const contatos = Array.isArray(listRes.data) ? listRes.data : [];
-        const found = contatos.find((c) => (c.phones || [])
-          .some((p) => String(p.number).replace(/\D/g, '').includes(phoneDigits)));
-        if (found) {
-          // Alimenta o espelho pra que a proxima rodada nem precise da rede.
-          stmtMoskitUpsert.run(phoneClean, found.id, found.name || '', JSON.stringify(found));
-          return found.id;
-        }
-
-        pageToken = listRes.headers?.['x-moskit-listing-next-page-token']
-          || listRes.headers?.['x-ollow-listing-next-page-token'];
-        if (!pageToken || contatos.length === 0) break;
+      } catch (e) {
+        throw new Error(`busca de contato por telefone falhou (${e.message}) — nao seguro pra concluir que o contato nao existe`);
       }
-    } catch (e) {
-      console.error(`  ⚠️ busca de contato falhou (${e.message}) — seguindo para criacao`);
+      if (listRes.status < 200 || listRes.status >= 300) {
+        throw new Error(`busca de contato por telefone respondeu HTTP ${listRes.status} — nao seguro pra concluir que o contato nao existe`);
+      }
+
+      const contatos = Array.isArray(listRes.data) ? listRes.data : [];
+      const found = contatos.find((c) => (c.phones || [])
+        .some((p) => String(p.number).replace(/\D/g, '').includes(phoneDigits)));
+      if (found) {
+        // Alimenta o espelho pra que a proxima rodada nem precise da rede.
+        stmtMoskitUpsert.run(phoneClean, found.id, found.name || '', JSON.stringify(found));
+        return found.id;
+      }
+
+      pageToken = listRes.headers?.['x-moskit-listing-next-page-token']
+        || listRes.headers?.['x-ollow-listing-next-page-token'];
+      if (!pageToken || contatos.length === 0) { chegouAoFim = true; break; }
+    }
+    if (!chegouAoFim) {
+      // Teto de MAX_PAGINAS_BUSCA_CONTATO atingido sem achar nem chegar ao fim real da lista — nao
+      // sabemos se existe ou nao, e criar as ciegas e exatamente o bug que isto corrige.
+      throw new Error(`busca de contato por telefone nao terminou em ${MAX_PAGINAS_BUSCA_CONTATO} paginas — nao seguro pra concluir que o contato nao existe`);
     }
   }
 
@@ -1373,26 +1401,41 @@ async function buscarOuCriarContato(phone, name) {
   return createRes.data.id;
 }
 
+// MEDIDO em 24/08/2026 (estudar-deals-duplicados.js --sondar-crm): `params:{page:1}` e ignorado em
+// silencio pela API (mesmo quirk de /activities e /deals — so `?start=` pagina de verdade), e sem
+// `limit` a resposta e sempre os ~10 deals mais recentes de TODA a conta — nao do contato. Um
+// contato com deal de dias atras ja sai dessa janela. Corrigido: pagina de verdade por `?start=` e
+// usa `contacts[]` que a PROPRIA listagem devolve (confirmado empiricamente — nao precisa mais de um
+// GET por deal, o N+1 que existia aqui). Bounded por MAX_PAGINAS_BUSCA_DEAL (mesmo espirito de
+// MAX_PAGINAS_BUSCA_CONTATO): paginar a conta inteira (3000+ deals) e impraticavel num ciclo de
+// processamento, mas os deals mais RECENTES sao onde o cenario real do bug vive (deal criado ha
+// poucos dias, buscado de novo num reprocessamento). Erro de rede/status fora de 200-299 LANCA em vez
+// de devolver null — mesmo raciocinio de buscarOuCriarContato: rede instavel nao e prova de que o
+// deal nao existe, e concluir isso as ciegas e o que criava a duplicata.
 async function buscarDealPorContato(contactId) {
-  try {
-    const listRes = await axios.get(`${MOSKIT_BASE}/deals`, {
-      params: { page: 1, sort: 'id', order: 'desc' },
-      headers: apiHeaders,
-      validateStatus: (s) => s < 500,
-    });
-    const deals = listRes.data || [];
-    if (Array.isArray(deals)) {
-      for (const deal of deals) {
-        const detailRes = await axios.get(`${MOSKIT_BASE}/deals/${deal.id}`, {
-          headers: apiHeaders,
-              validateStatus: (s) => s < 500,
-        });
-        const contacts = detailRes.data?.contacts || [];
-        const match = contacts.some((c) => String(c.id) === String(contactId));
-        if (match) return deal.id;
-      }
+  let start = 0;
+  for (let pagina = 0; pagina < MAX_PAGINAS_BUSCA_DEAL; pagina++) {
+    let listRes;
+    try {
+      listRes = await axios.get(`${MOSKIT_BASE}/deals`, {
+        params: { start, sort: 'id', order: 'desc' },
+        headers: apiHeaders,
+        validateStatus: (s) => s < 500,
+      });
+    } catch (e) {
+      throw new Error(`busca de deal por contato falhou (${e.message}) — nao seguro pra concluir que o deal nao existe`);
     }
-  } catch {}
+    if (listRes.status < 200 || listRes.status >= 300) {
+      throw new Error(`busca de deal por contato respondeu HTTP ${listRes.status} — nao seguro pra concluir que o deal nao existe`);
+    }
+    const deals = Array.isArray(listRes.data) ? listRes.data : [];
+    const found = deals.find((d) => (d.contacts || []).some((c) => String(c.id) === String(contactId)));
+    if (found) return found.id;
+    if (deals.length < 10) return null; // pagina incompleta = fim de verdade da lista
+    start += deals.length;
+  }
+  // Teto de paginas atingido sem achar: dentro da janela recente coberta, nao ha deal deste contato —
+  // diferente da falha de rede acima, aqui a busca terminou de verdade (so nao viu a conta inteira).
   return null;
 }
 
@@ -7835,6 +7878,7 @@ module.exports = {
   // Lotes 1 e 2 que nao tinham nenhuma cobertura. registrarAgendamentoPendente fica de fora de
   // proposito: e totalmente observavel atraves de handleAgendamentoCalendar.
   buscarOuCriarContato,
+  buscarDealPorContato,
   aplicarViradaCobranca,
   atualizarNegocioMoskit,
   garantirDealExiste,

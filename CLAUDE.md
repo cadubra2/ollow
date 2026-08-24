@@ -110,6 +110,23 @@ Escrevem em dados reais de produção (Moskit e/ou banco real):
   `435777`) explicitamente marcada — decisão de negócio, não só técnica: ver "Classificação do deal"
   acima. **Só leitura**, mas varre a conta inteira (~300 requisições numa base de 3000+ deals), então
   fica fora do `npm test` — rodar direto na VPS evita reintroduzir latência de rede.
+- `estudar-deals-duplicados.js [--db=<caminho>] [--sondar-crm] [--so-bot]` — duas fases de estudo de
+  deal DUPLICADO (mais de um negócio pro mesmo atendimento/cliente por engano). **Fase 1** (padrão,
+  100% local): reaplica `chaveArea`/`assuntoEspecifico` de `src/cliente-retorno.js` sobre toda cadeia
+  já registrada em `conversations.deals_anteriores`, mais um sinal que a produção não usa
+  (similaridade textual entre os dois assuntos), pra separar retorno legítimo de duplicidade
+  disfarçada por assunto raso mudando. **Fase 2** (`--sondar-crm`, rede real): pagina `/deals` inteiro
+  por `?start=` e clusteriza por nome+caso parecidos, com um filtro tipo IDF — token que aparece em
+  muitos deals (`fies`, `remoção`, sobrenome popular) não conta como sinal de identidade sozinho,
+  senão a maioria dos ~2793 leads do Moskit Boost gera falso positivo por "mesma área jurídica".
+  `--so-bot` restringe a comparação aos deals `origin=BOT_WHATSAPP` — "desde que o bot existe", em vez
+  da conta inteira (que tem leads desde 2021, irrelevantes pra medir duplicidade causada pelo bot).
+  **Achado em 24/08/2026** (o que motivou os dois fixes em `buscarOuCriarContato`/`buscarDealPorContato`
+  documentados em "Integrações externas" abaixo): 14 dos 102 deals que o bot já criou desde 23/07/2026
+  estavam em pares duplicados — mesmo telefone, dois `contacts.id` diferentes no Moskit — 8 deles
+  concentrados no dia 10/08/2026, quando o auto-deploy foi testado com vários `pm2 restart` em
+  sequência. **Só leitura**, mas a Fase 2 varre a conta inteira (~300 requisições), então fica fora do
+  `npm test`.
 - `recuperar-origem-perdida.js` — dos deals sem origem, separa quem o modelo já examinou e
   genuinamente não achou nada (fallback correto) de quem teve `last_data` apagado pelo bug de
   `'inviavel'`/`'interno'` mas ainda tem a conversa intacta em `messages`. Regex sobre o texto
@@ -1027,6 +1044,27 @@ busca o que ela pede. Desligada por padrão (`REUNIAO_RETORNO_ATIVO`) e, quando 
   mesmo escreveu; se o CRM divergir disso, alguém corrigiu na mão — o campo entra em
   `campos_travados` e o bot nunca mais o sobrescreve (`filtrarCamposPorAutoria`). `TIPO_CONSULTA`
   fica de fora: nele quem manda é o checkpoint do bloco de condições.
+  **Rede instável não é prova de "não existe" — tratar como se fosse duplicava contato e deal.**
+  MEDIDO em 24/08/2026 (`estudar-deals-duplicados.js --sondar-crm --so-bot`): 14 dos 102 deals que o
+  bot já criou desde 23/07/2026 formavam pares duplicados — mesmo telefone, dois `contacts.id`
+  diferentes no Moskit —, 8 deles concentrados no dia 10/08/2026, quando o auto-deploy foi testado com
+  vários `pm2 restart` em sequência (o cenário que faz o Moskit devolver 429 sob rajada de
+  reprocessamento). Duas funções tratavam falha de busca como "não existe, pode criar":
+  `buscarOuCriarContato` (`index.js`) — um `break` silencioso em qualquer status fora de 200-299 (o
+  `validateStatus: s<500` faz o axios devolver 429 como resposta normal, **não** como exceção — nem
+  passava pelo `catch`) ou qualquer exceção de rede caíam direto no `POST /contacts`, criando um
+  SEGUNDO contato para o mesmo telefone. `buscarDealPorContato` tinha o mesmo defeito **mais** um bug
+  de paginação (`params:{page:1}` sem `limit` — a API ignora esse parâmetro em silêncio e sempre
+  devolve os ~10 deals mais recentes de TODA a conta, não do contato). Agora as duas lançam em vez de
+  concluir "não existe" numa falha (mesmo raciocínio de `garantirDealExiste`, que já fazia isso para
+  deal por id), e só uma paginação que chega ao FIM DE VERDADE da lista (página incompleta / sem token
+  de próxima página) autoriza criar. `buscarDealPorContato` também passou a paginar `/deals` de
+  verdade por `?start=` (`MAX_PAGINAS_BUSCA_DEAL`, padrão 20 páginas = 200 deals mais recentes — a
+  conta inteira, 3000+, é impraticável dentro de um ciclo síncrono de mensagem) e a ler `contacts[]`
+  direto da própria listagem (confirmado que já vem populado), eliminando o GET extra por deal que
+  existia antes. Regressão em `test-pipeline.js` ("buscarOuCriarContato: falha na busca..." e
+  "buscarDealPorContato: pagina de verdade..."). Os 14 pares já criados continuam duplicados no CRM —
+  correção de código não desfaz o que já aconteceu; religar/mesclar é trabalho manual da equipe.
 - **Google Calendar**: OAuth2 com conta real do escritório (`autorizar-google.js`, roda uma vez,
   interativo) — necessário para gerar link de Meet e convidar participantes por e-mail.
 - **Telegram**: notifica comprovantes recebidos e conversas descartadas da fila após
