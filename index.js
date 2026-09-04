@@ -7799,22 +7799,37 @@ function buscarDealsPorEmail(emails) {
 
 // Ultimo recurso antes do orfao: a consulta pode ter sido marcada direto no CRM, sem passar por
 // conversa nenhuma. Compara o horario da atividade com o inicio da reuniao.
-async function buscarDealsPorAtividade(inicioIso) {
-  if (!inicioIso) return { ids: [], truncou: false };
-
-  const alvo = new Date(inicioIso).getTime();
-  if (Number.isNaN(alvo)) return { ids: [], truncou: false };
+// Uma varredura de /activities, DOIS sinais tirados dela — por horario e por titulo.
+//
+// A varredura e a unica chamada cara da cascata (~20 requisicoes), e por isso ela ja era condicionada
+// a "nada local resolveu". Tirar o segundo sinal da MESMA lista custa zero requisicao: seria
+// desperdicio baixar tudo isso e usar so o horario, que foi justamente o que falhou nas duas
+// primeiras orfas reais (a atividade do Gustavo estava 3h antes da reuniao; as do Gleydson, em outros
+// dias). Ver o comentario de casarAtividadePorTitulo em src/notas-reuniao.js.
+//
+// O titulo tambem funciona quando NAO ha evento na agenda: `tituloEvento` pode vir do proprio assunto
+// do e-mail do Gemini, que reproduz o titulo entre aspas. Por isso a guarda de entrada mudou de
+// "sem inicioIso nao ha nada a fazer" para "sem nenhum dos dois".
+async function buscarDealsPorAtividade(inicioIso, tituloEvento = null) {
+  const alvo = inicioIso ? new Date(inicioIso).getTime() : NaN;
+  const temHorario = !Number.isNaN(alvo);
+  const temTitulo = notasReuniao.tokensDistintivos(tituloEvento).length >= 2;
+  if (!temHorario && !temTitulo) return { ids: [], idsPorTitulo: [], truncou: false };
 
   const { atividades, truncou } = await listarAtividadesMoskit();
   const JANELA_MS = 90 * 60 * 1000; // a reuniao pode ter comecado atrasada, ou a atividade estar arredondada
 
-  const ids = atividades
-    .filter((a) => MOSKIT_IDS.ATIVIDADE_TIPOS_CONSULTA.has(a?.type?.id))
-    .filter((a) => a?.dueDate && Math.abs(new Date(a.dueDate).getTime() - alvo) <= JANELA_MS)
-    .map((a) => a?.deals?.[0]?.id)
-    .filter(Boolean);
+  const ids = temHorario
+    ? atividades
+      .filter((a) => MOSKIT_IDS.ATIVIDADE_TIPOS_CONSULTA.has(a?.type?.id))
+      .filter((a) => a?.dueDate && Math.abs(new Date(a.dueDate).getTime() - alvo) <= JANELA_MS)
+      .map((a) => a?.deals?.[0]?.id)
+      .filter(Boolean)
+    : [];
 
-  return { ids: [...new Set(ids.map(Number))], truncou };
+  const idsPorTitulo = temTitulo ? notasReuniao.casarAtividadePorTitulo(tituloEvento, atividades) : [];
+
+  return { ids: [...new Set(ids.map(Number))], idsPorTitulo, truncou };
 }
 
 // O Doc do Gemini, em PDF, para virar anexo na aba "Arquivos" do negocio.
@@ -8298,14 +8313,17 @@ async function processarNotaReuniao({ gmail, calendar, drive, mensagem, stmts, d
   // A varredura de /activities e a unica chamada cara da cascata: so roda quando nada local resolveu.
   const precisaAtividades = !sinais.dealIdNoTitulo && !sinais.dealIdMarcado
     && !porTelefone.length && !sinais.idSolto && !porEmail.length;
-  const { ids: porAtividade, truncou: truncouAtividades } = precisaAtividades
-    ? await buscarDealsPorAtividade(sinais.inicioIso).catch((e) => {
+  // O titulo vem do evento OU do assunto do e-mail (que o reproduz entre aspas) — este segundo
+  // caminho e o que faz o casamento por titulo funcionar sem evento nenhum na agenda.
+  const tituloParaCasar = sinais.tituloEvento || sinais.tituloDoAssunto;
+  const { ids: porAtividade, idsPorTitulo: porTituloAtividade, truncou: truncouAtividades } = precisaAtividades
+    ? await buscarDealsPorAtividade(sinais.inicioIso, tituloParaCasar).catch((e) => {
       console.error(`  ⚠️ falha ao varrer atividades: ${e.message}`);
-      return { ids: [], truncou: false };
+      return { ids: [], idsPorTitulo: [], truncou: false };
     })
-    : { ids: [], truncou: false };
+    : { ids: [], idsPorTitulo: [], truncou: false };
 
-  const apurada = notasReuniao.decidirDeal(sinais, { porTelefone, porEmail, porAtividade, truncouAtividades });
+  const apurada = notasReuniao.decidirDeal(sinais, { porTelefone, porEmail, porAtividade, porTituloAtividade, truncouAtividades });
 
   // Religamento manual de um orfao (reprocessar-nota-reuniao.js). A cascata roda mesmo assim, e o
   // que ela teria decidido fica no diagnostico: se um humano precisou corrigir, e porque alguma
@@ -8637,7 +8655,9 @@ async function amostrarNota({ calendar, mensagem }) {
   const sinais = notasReuniao.extrairSinais({ evento, assunto, corpo });
   const porTelefone = buscarDealsPorTelefone(sinais.telefone);
   const porEmail = porTelefone.length ? [] : buscarDealsPorEmail(sinais.emails);
-  const resolucao = notasReuniao.decidirDeal(sinais, { porTelefone, porEmail, porAtividade: [] });
+  // Rota de INSPECAO: nao faz a varredura de /activities de proposito (e a unica chamada cara), logo
+  // nem o casamento por horario nem o por titulo tem material. O diagnostico mostra os dois vazios.
+  const resolucao = notasReuniao.decidirDeal(sinais, { porTelefone, porEmail, porAtividade: [], porTituloAtividade: [] });
 
   return {
     id: mensagem.id,
@@ -9204,6 +9224,7 @@ module.exports = {
   // despercebido — o codigo antigo "paginava" e lia sempre os mesmos 10 registros sem erro nenhum.
   listarAtividadesMoskit,
   listarStagesMoskit,
+  buscarDealsPorAtividade,
   // Exportada para teste: e a rotina que decide se uma atividade criada direto no Moskit ganha o
   // sufixo #dealId/marcador [deal:...] no evento do Google (ver comSufixoDealId/comMarcadorDeal).
   sincronizarAtividadesMoskit,

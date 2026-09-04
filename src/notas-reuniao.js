@@ -182,6 +182,71 @@ function extrairSinais({ evento, assunto, corpo }) {
 }
 
 // ------------------------------------------------------------
+// Casamento pelo TITULO contra as Atividades do Moskit
+// ------------------------------------------------------------
+//
+// POR QUE ISTO EXISTE (medido em 04/09/2026, nas duas primeiras reunioes orfas de verdade): reuniao
+// marcada A MAO nao tem telefone na descricao, nem participante por e-mail, nem `#dealId` no titulo —
+// os 6 passos da cascata voltavam vazios e a transcricao ficava sem negocio. Mas o titulo tem os
+// nomes ("Consulta On-line- Iury e Gleydson"), e a MESMA pessoa que digitou o evento digitou a
+// Atividade no CRM com as mesmas palavras: "Retorno - Iury e Gleydson", "Consulta- Berto e Gustavo".
+// Esse par de nomes e o sinal, e ele custa ZERO requisicao nova — a lista de atividades ja e baixada
+// pelo passo `atividade_moskit`.
+//
+// Por que NAO casar por horario resolve: era o que o passo antigo tentava. A atividade do Gustavo
+// estava as 11:00 e a reuniao as 14:00 (fora da janela de 90 min); as do Gleydson eram de outros dias.
+// Horario proximo e coincidencia comum; nome proprio repetido nao e.
+//
+// Por que NAO casar por nome no CRM: MEDIDO — "Gustavo" bate em 15 negocios da conta, e /deals ignora
+// em silencio `name`, `search`, `q` e `term` (devolve sempre os 10 mais recentes), entao seria uma
+// varredura de ~311 requisicoes por nota para um sinal que sozinho nem decide.
+
+// Palavras que aparecem em quase todo titulo de consulta e por isso NAO identificam ninguem. Sem
+// esta lista, "Consulta" casaria com qualquer atividade da conta.
+const PALAVRAS_VAZIAS_TITULO = new Set([
+  'consulta', 'consultas', 'reuniao', 'reunioes', 'retorno', 'atendimento', 'online', 'on', 'line',
+  'presencial', 'videochamada', 'video', 'call', 'meet', 'zoom', 'de', 'da', 'do', 'das', 'dos',
+  'e', 'com', 'para', 'pra', 'sr', 'sra', 'dr', 'dra', 'cliente', 'sobre', 'a', 'o', 'as', 'os',
+]);
+
+function tokensDistintivos(texto) {
+  return [...new Set(
+    String(texto || '')
+      .normalize('NFD').replace(/[̀-ͯ]/g, '')
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter((t) => t.length >= 3 && !PALAVRAS_VAZIAS_TITULO.has(t) && !/^\d+$/.test(t))
+  )];
+}
+
+// Minimo de tokens distintivos para o titulo sequer ser usado. DOIS, e o numero vem de medicao: um
+// primeiro nome sozinho ("Gustavo") bate em 15 negocios da conta — casaria, seria "unico" numa
+// atividade qualquer, e poria a transcricao de um cliente no prontuario de outro. Com dois (o par
+// advogado+cliente, que e como o escritorio nomeia esses eventos) o sinal passa a ser identidade.
+const MIN_TOKENS_TITULO = 2;
+
+// Devolve os ids de negocio das atividades cujo assunto contem TODOS os tokens distintivos do titulo
+// do evento. Puro: recebe a lista de atividades que o chamador ja baixou.
+//
+// Nao filtra por tipo de atividade de proposito (diferente do casamento por horario, onde o tipo e
+// que segura o sinal fraco): aqui quem carrega a identidade sao os nomes proprios, e uma atividade
+// de "ligar para Iury e Gleydson" aponta para o negocio certo do mesmo jeito.
+function casarAtividadePorTitulo(tituloEvento, atividades) {
+  const alvo = tokensDistintivos(tituloEvento);
+  if (alvo.length < MIN_TOKENS_TITULO) return [];
+
+  const ids = [];
+  for (const a of atividades || []) {
+    const tokens = new Set(tokensDistintivos(a?.subject || a?.title));
+    if (!tokens.size) continue;
+    if (!alvo.every((t) => tokens.has(t))) continue;
+    const id = a?.deals?.[0]?.id;
+    if (id) ids.push(Number(id));
+  }
+  return [...new Set(ids.filter((id) => Number.isFinite(id) && id > 0))];
+}
+
+// ------------------------------------------------------------
 // A cascata
 // ------------------------------------------------------------
 
@@ -204,6 +269,10 @@ function decidirDeal(sinais, achados) {
     { metodo: 'id_no_texto', confianca: 'alta', ids: sinais.idSolto ? [sinais.idSolto] : [] },
     { metodo: 'atividade_moskit', confianca: 'media', ids: achados.porAtividade || [] },
     { metodo: 'email_participante', confianca: 'media', ids: achados.porEmail || [] },
+    // ULTIMO de proposito: e o unico passo baseado em semelhanca de TEXTO, entao nunca pode passar na
+    // frente de um sinal deterministico. Se qualquer passo acima ja apontou dois negocios, a cascata
+    // parou antes e este nem roda — o que e o comportamento certo.
+    { metodo: 'atividade_titulo', confianca: 'media', ids: achados.porTituloAtividade || [] },
   ];
 
   const diagnostico = {
@@ -315,6 +384,8 @@ module.exports = {
   extrairDocIdDeEvento,
   extrairSinais,
   decidirDeal,
+  casarAtividadePorTitulo,
+  tokensDistintivos,
   marcadorNota,
   nomeAnexoNota,
   montarTextoNota,

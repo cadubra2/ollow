@@ -880,6 +880,40 @@ infraestrutura de idempotência de antes — só o que vira texto da nota mudou.
   Berto e Aurinete"`, `"Consulta online- Iury e Arthur"`, criados na mão). ~1/3 do volume depende do
   fallback e parte vai terminar em órfão mesmo — por isso o órfão é desfecho de primeira classe, com
   Telegram, diagnóstico do que a cascata viu e o comando `reprocessar-nota-reuniao.js` pronto.
+- **7º passo, `atividade_titulo`: o par de nomes do título casado contra o ASSUNTO das Atividades do
+  Moskit** (`casarAtividadePorTitulo`, [src/notas-reuniao.js](src/notas-reuniao.js)). MEDIDO em
+  04/09/2026, nas duas primeiras órfãs reais depois de a rotina passar a escrever de verdade:
+  `"Consulta On-line- Iury e Gleydson"` (24/08) e `"Consulta on-line- Berto e Gustavo"` (18/08) — as
+  duas sem telefone na descrição, sem participante por e-mail e sem `#dealId`, os 6 passos voltando
+  vazios. O sinal que sobrava era o par de nomes, e **a mesma pessoa que digitou o evento digitou a
+  Atividade no CRM com as mesmas palavras**: `"Retorno - Iury e Gleydson"`, `"Consulta- Berto e
+  Gustavo"`. Custo **zero requisição nova** — a lista de `/activities` já é baixada pelo passo
+  `atividade_moskit`, e usar só o horário dela era desperdício.
+  **Por que o horário não resolvia** (era o que o passo antigo tentava): a Atividade do Gustavo estava
+  às 11:00 e a reunião às 14:00 — fora da janela de 90 min; as do Gleydson eram de 28/08 e 08/09.
+  Horário próximo é coincidência comum num escritório; nome próprio repetido não é.
+  **Por que não casar por nome direto no CRM:** MEDIDO — `"Gustavo"` bate em **15 negócios** da conta,
+  e `/deals` ignora **em silêncio** `name`, `search`, `q` e `term` (devolve sempre os ~10 mais
+  recentes), então seria uma varredura de ~311 requisições por nota para um sinal que sozinho nem
+  decide. (Com o campo do advogado responsável ele vira único — foi assim que as duas foram religadas
+  à mão — mas isso exige a varredura, e o casamento pelo assunto da Atividade dá o mesmo resultado de
+  graça.)
+  **Três guardas, e cada uma tem um número medido atrás:** (1) `PALAVRAS_VAZIAS_TITULO` derruba o
+  vocabulário que aparece em todo título (`consulta`, `online`, `retorno`, `reuniao`…), senão
+  "Consulta" casaria com qualquer atividade da conta; (2) **mínimo de 2 tokens distintivos** — um
+  primeiro nome sozinho é os 15 negócios do Gustavo, e "único numa atividade qualquer" poria a
+  transcrição de um cliente no prontuário de outro; (3) exige **todos** os tokens do título presentes
+  no assunto da atividade, não interseção parcial.
+  **É o ÚLTIMO passo, de propósito**: é o único baseado em semelhança de texto, então nunca passa na
+  frente de um sinal determinístico — e se qualquer passo acima já apontou dois negócios, a cascata
+  parou antes e este nem roda. Não filtra por tipo de atividade (diferente do casamento por horário,
+  onde o tipo é que segura o sinal fraco): aqui quem carrega a identidade são os nomes próprios, e uma
+  atividade de "ligar para Iury e Gleydson" aponta para o negócio certo do mesmo jeito. `confianca:
+  'media'`, e o método vai impresso no rodapé da nota como todos os outros. Regressões em
+  `test-notas-reuniao.js` (o módulo puro: os dois casos reais, um nome sozinho não casando, todos-os-
+  tokens, duas atividades do mesmo negócio contando como um candidato, e dois negócios virando
+  ambiguidade) e `test-pipeline.js` (uma varredura entregando os dois sinais, o título funcionando
+  sem `inicioIso`, e zero requisição quando não há nem horário nem nome).
 - **Dois marcadores no evento, e o do TÍTULO é o que vale mais.** `montarResumoEvento` põe
   `· #48292471` no fim do título e `montarDescricaoEvento` põe `[deal:48292471]` na descrição. O do
   título é o mais valioso porque **o assunto do e-mail do Gemini reproduz o título entre aspas**

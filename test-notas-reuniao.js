@@ -22,6 +22,8 @@ const {
   marcadorNota,
   nomeAnexoNota,
   montarTextoNota,
+  casarAtividadePorTitulo,
+  tokensDistintivos,
 } = require('./src/notas-reuniao');
 
 let passou = 0;
@@ -307,6 +309,70 @@ console.log('\n=== A cascata e a regra de ambiguidade ===');
 }
 
 // ------------------------------------------------------------
+console.log('\n=== Casamento por titulo contra as Atividades do Moskit ===');
+// Reuniao marcada A MAO nao tem telefone, nem e-mail de participante, nem #dealId: os 6 passos
+// voltavam vazios. O sinal que sobra e o par de nomes do titulo, que a MESMA pessoa digitou na
+// Atividade do CRM. MEDIDO em 04/09/2026 nas duas primeiras orfas reais.
+{
+  const at = (id, dealId, subject) => ({ id, subject, deals: [{ id: dealId }] });
+
+  checar('palavra de todo titulo nao e sinal (consulta/online caem fora)', tokensDistintivos('Consulta On-line-').length === 0, tokensDistintivos('Consulta On-line-').length);
+  checar('nomes proprios sobrevivem',
+    JSON.stringify(tokensDistintivos('Consulta On-line- Iury e Gleydson')) === JSON.stringify(['iury', 'gleydson']),
+    tokensDistintivos('Consulta On-line- Iury e Gleydson'));
+  checar('acento e caixa nao mudam o token', tokensDistintivos('Reunião — JOÃO').includes('joao'),
+    tokensDistintivos('Reunião — JOÃO'));
+
+  const atividades = [
+    at(1, 48715620, 'Retorno - Iury e Gleydson'),
+    at(2, 48457749, 'Consulta- Berto e Gustavo'),
+    at(3, 99999999, 'Consulta online'),
+  ];
+  checar('caso real: o par advogado+cliente acha o negocio certo', JSON.stringify(casarAtividadePorTitulo('Consulta On-line- Iury e Gleydson', atividades)) === JSON.stringify([48715620]), JSON.stringify(casarAtividadePorTitulo('Consulta On-line- Iury e Gleydson', atividades)));
+  checar('   e o outro par acha o outro', JSON.stringify(casarAtividadePorTitulo('Consulta on-line- Berto e Gustavo', atividades)) === JSON.stringify([48457749]), JSON.stringify(casarAtividadePorTitulo('Consulta on-line- Berto e Gustavo', atividades)));
+
+  // A guarda que impede isto de virar maquina de falso positivo. MEDIDO: 'Gustavo' sozinho bate
+  // em 15 negocios da conta — um primeiro nome nao e identidade.
+  checar('UM nome sozinho nao casa nada (minimo de 2 tokens distintivos)', casarAtividadePorTitulo('Consulta - Gustavo', atividades).length === 0, casarAtividadePorTitulo('Consulta - Gustavo', atividades).length);
+  checar('titulo sem nome nenhum tambem nao', casarAtividadePorTitulo('Consulta online', atividades).length === 0, casarAtividadePorTitulo('Consulta online', atividades).length);
+  checar('titulo vazio/nulo nao quebra', casarAtividadePorTitulo(null, atividades).length === 0, casarAtividadePorTitulo(null, atividades).length);
+
+  // Exige TODOS os tokens: metade do par nao serve.
+  checar('token a mais no titulo que a atividade nao tem => nao casa', casarAtividadePorTitulo('Consulta - Iury e Gleydson e Marcos', atividades).length === 0, casarAtividadePorTitulo('Consulta - Iury e Gleydson e Marcos', atividades).length);
+
+  // Duas atividades do MESMO negocio contam como um candidato (nao viram ambiguidade falsa).
+  const duasDoMesmo = [at(1, 48715620, 'Retorno - Iury e Gleydson'), at(2, 48715620, 'Iury e Gleydson - consulta online')];
+  checar('duas atividades do mesmo negocio => um candidato', JSON.stringify(casarAtividadePorTitulo('Iury e Gleydson', duasDoMesmo)) === JSON.stringify([48715620]), JSON.stringify(casarAtividadePorTitulo('Iury e Gleydson', duasDoMesmo)));
+
+  // E dois negocios diferentes casando viram DOIS candidatos — quem decide e a cascata, que para.
+  const doisNegocios = [at(1, 111111, 'Iury e Gleydson'), at(2, 222222, 'Retorno Iury e Gleydson')];
+  checar('negocios diferentes => dois candidatos (a cascata vai recusar)', casarAtividadePorTitulo('Iury e Gleydson', doisNegocios).length === 2, casarAtividadePorTitulo('Iury e Gleydson', doisNegocios).length);
+}
+
+console.log('\n=== O passo novo na cascata: ULTIMO, e candidato unico ou nada ===');
+{
+  const sinaisVazios = { emails: [], tituloEvento: 'Consulta On-line- Iury e Gleydson', eventoId: 'ev1' };
+  const r = decidirDeal(sinaisVazios, { porTituloAtividade: [48715620] });
+  checar('acha pelo titulo quando nada mais achou', r.dealId === 48715620, r.dealId);
+  checar('   com metodo proprio no rodape da nota', r.metodo === 'atividade_titulo', r.metodo);
+  checar('   e confianca media (e semelhanca de texto, nao marcador)', r.confianca === 'media', r.confianca);
+
+  const ambiguo = decidirDeal(sinaisVazios, { porTituloAtividade: [111, 222] });
+  checar('dois candidatos => orfao, nunca o primeiro', ambiguo.dealId === null, ambiguo.dealId);
+  checar('   e o diagnostico diz em que passo a ambiguidade apareceu', ambiguo.diagnostico.ambiguoEm === 'atividade_titulo', ambiguo.diagnostico.ambiguoEm);
+
+  // O ponto de ser o ULTIMO: um sinal deterministico sempre vence a semelhanca de texto.
+  const comMarcador = decidirDeal({ ...sinaisVazios, dealIdNoTitulo: 48292471 }, { porTituloAtividade: [48715620] });
+  checar('marcador no titulo vence o casamento por texto', comMarcador.dealId === 48292471, comMarcador.dealId);
+  checar('   pelo passo de sempre', comMarcador.metodo === 'titulo_deal_id', comMarcador.metodo);
+
+  // E o passo aparece no diagnostico mesmo quando nao acha nada (senao ninguem descobre que rodou).
+  const nada = decidirDeal(sinaisVazios, {});
+  checar('o passo consta no diagnostico mesmo vazio',
+    nada.diagnostico.passos.some((p) => p.metodo === 'atividade_titulo'),
+    nada.diagnostico.passos.map((p) => p.metodo));
+}
+
 console.log('\n=== Marcador e nome do anexo ===');
 
 {

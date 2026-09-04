@@ -146,6 +146,7 @@ const {
   moverParaEstagio, criarNotaMoskit, aplicarViradaCobranca, atualizarNegocioMoskit,
   handleAgendamentoCalendar, listarAtividadesMoskit, finalizarCiclo,
   listarStagesMoskit,
+  buscarDealsPorAtividade,
   aplicarGateCasoDescrito, deveEsperarCasoDescrito, deveEsperarCamposObrigatorios, aplicarPadroesDeterministicosDeOrigem, detectarRespostaPerguntaOrigem, registrarBriefing, mergeDados,
   mesclarParaCrm, derivarAdvogadoDaArea, detectarOpcoesInvalidas, registrarOpcoesInvalidas,
   rejeitarAssuntoQueEhArea,
@@ -864,6 +865,43 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     rede.get = () => ({ status: 500, data: null, headers: {} });
     const r = await listarAtividadesMoskit();
     igual('erro na primeira pagina → devolve lista vazia, nao lanca', r.atividades.length, 0);
+  }
+
+  console.log('\n=== buscarDealsPorAtividade: UMA varredura, DOIS sinais (horario e titulo) ===');
+  // Baixar ~20 paginas de /activities e usar so o horario era desperdicio — e o horario foi
+  // justamente o que falhou nas duas primeiras orfas reais (a atividade do Gustavo estava 3h antes
+  // da reuniao; as do Gleydson, em outros dias). O casamento por titulo sai da MESMA lista.
+  {
+    limpar();
+    const tipoConsulta = moskitIds.ATIVIDADE_TIPO.reuniao;
+    const atividades = [
+      { id: 1, subject: 'Retorno - Iury e Gleydson', type: { id: tipoConsulta }, dueDate: '2026-08-28T18:00:00Z', deals: [{ id: 48715620 }] },
+      { id: 2, subject: 'Consulta- Berto e Gustavo', type: { id: tipoConsulta }, dueDate: '2026-08-18T14:00:00Z', deals: [{ id: 48457749 }] },
+    ];
+    rede.get = () => ({ status: 200, data: atividades, headers: {} });
+
+    // Reuniao das 17:30Z de 24/08: NENHUMA atividade cai na janela de 90 min — o horario nao resolve.
+    const r = await buscarDealsPorAtividade('2026-08-24T17:30:00Z', 'Consulta On-line- Iury e Gleydson');
+    igual('horario nao acha nada (a atividade e de outro dia)', r.ids.length, 0);
+    igual('   mas o titulo acha o negocio certo', JSON.stringify(r.idsPorTitulo), JSON.stringify([48715620]));
+    igual('   com UMA unica varredura de /activities (a lista e reusada)', de('GET', '/activities').length, 1);
+  }
+  {
+    // Sem evento na agenda nao ha inicioIso — antes a funcao saia na primeira linha e nem baixava a
+    // lista. Agora o titulo (que vem do assunto do e-mail) ainda e material de casamento.
+    limpar();
+    const tipoConsulta = moskitIds.ATIVIDADE_TIPO.reuniao;
+    rede.get = () => ({ status: 200, data: [{ id: 9, subject: 'Consulta- Berto e Gustavo', type: { id: tipoConsulta }, deals: [{ id: 48457749 }] }], headers: {} });
+    const r = await buscarDealsPorAtividade(null, 'Consulta on-line- Berto e Gustavo');
+    igual('sem horario, o titulo sozinho ainda casa', JSON.stringify(r.idsPorTitulo), JSON.stringify([48457749]));
+  }
+  {
+    // E sem nenhum dos dois sinais a varredura cara NAO acontece.
+    limpar();
+    rede.get = () => ({ status: 200, data: [], headers: {} });
+    const r = await buscarDealsPorAtividade(null, 'Consulta online');
+    igual('sem horario e sem nome no titulo => zero requisicao', de('GET', '/activities').length, 0);
+    igual('   e nenhum candidato', r.idsPorTitulo.length + r.ids.length, 0);
   }
 
   // ============================================================
