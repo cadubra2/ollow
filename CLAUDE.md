@@ -25,9 +25,11 @@ node test-telefone.js    # roda um arquivo de teste isolado (mesmo padrão para 
 
 `npm test` roda `rodar-testes.js`, que executa em sequência (parando no primeiro que falhar):
 `test-telefone.js`, `test-moskit-ids.js`, `test-atividade-moskit.js`, `test-evidencia.js`,
-`test-fila.js`, `test-payload.js`, `test-rotas.js`, `test-pipeline.js`, `test-agenda-dry-run.js`,
-`test-guards-internos.js`, `test-agendamento-bloco-mensagens.js`, `test-transcricao.js`,
-`test-zapsign.js`, `test-notas-reuniao.js`, `test-cliente-retorno.js`, `test-cliente-retorno-flags.js`.
+`test-briefing.js`, `test-fila.js`, `test-payload.js`, `test-rotas.js`, `test-pipeline.js`,
+`test-agenda-dry-run.js`, `test-bloqueio-campos-obrigatorios-dry-run.js`, `test-guards-internos.js`, `test-agendamento-bloco-mensagens.js`,
+`test-transcricao.js`, `test-zapsign.js`, `test-notas-reuniao.js`,
+`test-cliente-retorno.js`, `test-cliente-retorno-flags.js`, `test-reuniao-retorno.js`,
+`test-reuniao-retorno-flags.js`.
 Todos usam `DB_PATH` apontando para um arquivo inexistente (banco descartável) —
 **nunca** deixe um teste abrir `conversations.db` de produção.
 
@@ -83,6 +85,55 @@ Escrevem em dados reais de produção (Moskit e/ou banco real):
   recusado pela rede determinística (que é o comportamento correto). Só leitura — abre o banco de
   produção num handle readonly e usa `DB_PATH` descartável para o boot do `index.js`. Foi ele que
   revelou os dois defeitos descritos em "O eco da data-âncora" e "Propagação de dia corrigido".
+- `avaliar-extracao.js [--so-gratis] [--limite N] [--concorrencia N] [--rubrica] [--sem-estado]
+  [--so-com-desfecho] [--seed N] [--rotulo <txt>]` —
+  **linha de base da qualidade da extração**, para que "melhorou" deixe de ser opinião. Duas camadas:
+  a **camada 0 é grátis** e mede sobre o corpus inteiro o que ele já prova sozinho (silêncio por
+  `last_action`, conversas acima de 100 mensagens que o polling trunca, mensagens que são só
+  placeholder de anexo — **separando áudio, que é transcrito, do que de fato se perdeu** —,
+  preenchimento dos 22 campos e o perfil dos resumos que a produção gravou, com a contagem dos
+  literais "Não mencionado"); a **camada 1 chama a OpenAI** e atribui cada conversa ao portão que a
+  engoliu, refazendo a cadeia de `processarConversaDirect` com as funções exportadas (B1 inviável,
+  B2 confiança < 6, B3 sem caso descrito, **B4 briefing engolido por `pendentes.length`**). Só
+  leitura, com as proteções do `replay-dupla-confirmacao.js` mais uma: `MOSKIT_BASE`/`ZAPSIGN_BASE`
+  apontados para `127.0.0.1:9`, para que escrita acidental falhe alto em vez de gravar no CRM.
+  **Concorrência 2, não mais**: com 4 o teto de tokens por minuto da conta derrubou 163 das 277
+  conversas de uma rodada. A saída bruta tem telefone, nome e caso — está no `.gitignore`; só o
+  `avaliacoes/agregado-*.json` (contagens) é versionado.
+  **O EIXO DO TÍTULO, acrescentado em 02/09/2026 — e a falta dele era o buraco mais sério do
+  instrumento.** A queixa do dono é sobre o *nome do negócio*, e o script media o resumo em detalhe e
+  **descartava o assunto**: o replay guardava `resumo_novo` e o assunto era extraído, usado e
+  esquecido. "O campo `assunto` está preenchido" é outra pergunta — `"Consulta jurídica"` está
+  preenchido e não serve. Agora cada conversa sai classificada em `assunto_especifico` ·
+  `titulo_generico` · `titulo_so_nome` · `assunto_igual_a_area`, com o título montado pela **função da
+  produção** (`montarPayloadMoskit`, nunca uma cópia da regra `${nome} - ${assunto}`), mais
+  `assunto_bruto` (antes de `rejeitarAssuntoQueEhArea`, para saber quantas vezes o modelo erra e a
+  proteção pega), `assunto_ancorado` (fração dos tokens do assunto presentes **literalmente** no
+  texto da conversa) e `linhas_uteis_do_resumo` (tópico com conteúdo, não com "não mencionado" —
+  contar caracteres não distingue os dois). As observações passam a sair **emitidas × válidas por
+  tipo**: a diferença é o que a conferência de trecho literal reprovou, e é ela que separa "o modelo
+  não emite esse tipo" de "emite e é barrado" — consertos opostos.
+  ⚠️ **`assunto_ancorado` é diagnóstico, NUNCA portão — e a primeira rodada do instrumento já provou
+  por quê.** Havia a ideia de exigir "≥50% dos tokens do assunto presentes no texto" como proteção
+  substituta para liberar evidência de *tema*. MEDIDO em 02/09/2026 (chat 558695411529): o cliente
+  escreveu "os documentos necessário", "comprei uma casa da minha mãe", "acordo de compra e vendas";
+  o modelo devolveu **"Documentação de Propriedade Imobiliária"** — caracterização jurídica correta e
+  útil, com ancoragem **zero**, porque nenhuma dessas palavras foi dita. Na mesma rodada o
+  **placeholder** "Consulta jurídica" pontuou **0,5**, porque "consulta" aparece em qualquer conversa
+  de escritório. Um portão desses reprovaria a síntese boa e aprovaria o placeholder. A confusão era
+  entre duas coisas diferentes: ancorar o **trecho da observação** (citação literal de uma mensagem,
+  que `conferirTrecho` em `src/evidencia.js` já exige, e que é impossível fabricar a partir do prompt)
+  e ancorar as **palavras do assunto**, que é síntese por natureza. A proteção correta é a primeira.
+  A métrica continua valendo para o outro caso — invenção do nada, como o deal 48423360, em que o
+  tema saiu do perfil de um sócio escrito **no prompt** — e é lida caso a caso, junto de
+  `titulo_classe`.
+  Duas correções de amostragem no mesmo passo: `--limite N` **sorteia pela seed** em vez de
+  `slice(0, N)` sobre a ordem de `chat_id` (que é telefone — com 197 das 277 conversas `inviavel`,
+  uma fatia de 30 virava ~22 B1 e media quase nada), e `--so-com-desfecho` exclui `inviavel`/`interno`
+  sem deal. E a rubrica humana caiu de **40 para 20 linhas**: das 40, **18 tinham as duas colunas de
+  resumo vazias** — só 16 comparavam. Agora só entra conversa com algo a julgar, estratificada por
+  desfecho do título, com a coluna nova `titulo_do_deal_serve__sim_nao`. Vinte linhas julgáveis valem
+  mais que 40 com 45% em branco: a atenção do dono é o recurso escasso, não o número de linhas.
 - `test-cenarios-classificacao.js` e `test-simulacao.js` — chamam a OpenAI de verdade mas não têm
   asserção automática de pass/fail; servem para inspeção manual, não regressão.
 - `sondar-notas.js [dealId]` — mede, contra as APIs reais, os contratos que a rotina de notas de
@@ -127,15 +178,65 @@ Escrevem em dados reais de produção (Moskit e/ou banco real):
   concentrados no dia 10/08/2026, quando o auto-deploy foi testado com vários `pm2 restart` em
   sequência. **Só leitura**, mas a Fase 2 varre a conta inteira (~300 requisições), então fica fora do
   `npm test`.
-- `recuperar-origem-perdida.js` — dos deals sem origem, separa quem o modelo já examinou e
-  genuinamente não achou nada (fallback correto) de quem teve `last_data` apagado pelo bug de
-  `'inviavel'`/`'interno'` mas ainda tem a conversa intacta em `messages`. Regex sobre o texto
-  (instagram/página de sócio, site, indicação, vídeo/Youtube — inspirado em `src/moskit-ids.js`
-  `ORIGEM` mas escrito como linguagem natural, não como opção canônica). **Zero chamada de IA, só
-  leitura**. Cuidado com falso positivo ao estender o vocabulário: "google" sozinho pega o convite do
-  Google Meet/Calendar que toda consulta agendada insere no texto, e termos sem `\b` (limite de
-  palavra) pegam substring dentro de outra palavra ("danos materi**AIS**" bateu em `matéria`
-  sem o delimitador) — os dois já mediram falso positivo real em 21/08/2026 e foram corrigidos.
+- `auditar-crm-coletar.js [--confirmar] [--retomar=<dir>] [--so-fases=A,B,C,D] [--notas-max=N]
+  [--notas-paginas=N]` e `auditar-crm-relatar.js [<dir>] [--parado-dias=N] [--db=<caminho>]` — a
+  auditoria do CRM em **dois** scripts, e a separação é o ponto: o coletor é a única coisa que toca a
+  API (~1.260 requisições, ~20 min) e grava um snapshot cru em `auditoria-crm/<timestamp>/` (JSONL
+  append-only, `manifesto.json` com cursor de retomada e os quirks medidos na rodada); o relatório é
+  **100% offline** e deriva os CSVs em segundos. Assim calibrar um limiar ou mudar o corte de "deal
+  parado" custa 3 segundos, não outra varredura. **Zero escrita, e a garantia não é a revisão de
+  código:** o coletor instala um interceptor no axios que **lança em qualquer requisição que não seja
+  `GET`** — e como `require('axios')` devolve sempre a mesma instância, a trava vale também para o
+  código reusado de dentro do `index.js` (`acharEmColecaoDoDeal`, `listarAtividadesMoskit`). O
+  relatório vai além e bloqueia *toda* requisição, de qualquer método. `test-auditoria-crm.js` verifica
+  que a trava dispara — garantia que ninguém checa não é garantia. O coletor também lê os headers de
+  rate limit (piso de 300ms, espera quando a cota da janela acaba, **429 com backoff 1/2/4/8/16s
+  repetindo a MESMA página** — avançar o cursor num 429 pularia 10 registros em silêncio) e registra
+  o mínimo observado no manifesto. A **fase D (notas) exige `--confirmar`**: é a mais cara, e sem ela
+  o script imprime a contagem e o custo estimado e para. Duas ressalvas que o relatório repete no
+  cabeçalho: notas existem só para o **conjunto candidato**, então deal sem nota lida sai como
+  `nao_avaliado_nota_nao_lida` e **nunca** como "sem resumo"; e o `conversations.db` local sendo antigo
+  subestima toda coluna do lado local — o relatório calcula a idade do banco e grita se passar de 7
+  dias. Saída em `auditoria-crm/<ts>/relatorios/`: `00-inventario.csv` (um deal por linha, um booleano
+  por problema — é o que se ordena) mais os drill-downs `01-duplicidade-deals` (com
+  `MESMO_TELEFONE_CONTATOS_DIFERENTES`, a assinatura do bug de 24/08), `02-campos-obrigatorios`,
+  `03-nome-generico` (a coluna decisiva é `assunto_no_last_data`: "Fulano - Consulta jurídica" cujo
+  `last_data.assunto` diz "Abatimento do FIES" é **rename recuperável**, não dado faltando),
+  `04-resumo`, `05-contatos-duplicados`, `06-deals-parados`, `07-por-origem` e
+  `08-campos-personalizados`. **Só leitura**, mas varre a conta inteira, então fica fora do `npm test`.
+  A pasta `auditoria-crm/` está no `.gitignore`: é o artefato mais sensível que este repositório
+  produz — nome, telefone e caso de ~4.265 pessoas em texto puro.
+- `recuperar-origem-perdida.js [--aplicar]` — dos deals sem origem, separa quem o modelo já examinou
+  e genuinamente não achou nada (fallback correto) de quem teve `last_data` apagado pelo bug de
+  `'inviavel'`/`'interno'` mas ainda tem a conversa intacta em `messages`. **Reescrito em 02/09/2026**
+  para usar a MESMA função que roda em produção (`aplicarPadroesDeterministicosDeOrigem`, importada
+  de `index.js`, em vez de uma cópia local de regex) — a mesma pergunta ("essa conversa tem sinal de
+  origem?") não pode ter duas respostas diferentes dependendo de qual caminho de código a examina.
+  Zero chamada de IA. Sem `--aplicar` é só leitura (o comportamento de sempre); com `--aplicar`
+  **escreve no Moskit real**: para cada deal com sinal detectado, confere de novo no CRM (não no
+  snapshot local) que o campo Origem ainda está vazio/"Não identificado" — se a equipe já corrigiu na
+  mão nesse meio-tempo, pula sem barulho — e faz um PUT que só troca o campo Origem, preservando todo
+  o resto do deal (mesmo padrão de `corrigir-tipo-consulta.js`: nunca reconstrói o payload do zero).
+  Cuidado com falso positivo ao estender o vocabulário: "google" sozinho pega o convite do Google
+  Meet/Calendar que toda consulta agendada insere no texto, termos sem `\b` (limite de palavra) pegam
+  substring dentro de outra palavra ("danos materi**AIS**" bateu em `matéria`), e "artigo"/"amigo"/
+  "parente" sozinhos são comuns em conversa jurídica sem ser sobre origem ("artigo 927 do código
+  civil", "meu amigo teve um problema parecido") — por isso a versão que RODA (produção) exige mais
+  contexto que a versão original só-leitura deste script (verbo de consumo — "vi/li um artigo" — ou
+  substantivo de indicação explícito, nunca a palavra solta).
+  **`--aplicar` exige `createdBy` e, em deal fechado, `closeDate`/`lostReason` no payload — MEDIDO em
+  02/09/2026 na primeira rodada real contra os 17 candidatos.** Um PUT preservando nome/status/stage/
+  responsible/contacts/activities mas **sem** `createdBy` volta `422 {"messageError":"Id cannot be
+  null","field":"createdBy.id"}` (deal 48412103) — o Moskit exige o campo mesmo num PUT que só troca
+  um custom field; `atualizarNegocioMoskit` (index.js) nunca sofre disso porque sempre manda um valor
+  fixo (`LAYLA_USER_ID`), mas aqui o certo é preservar o criador ORIGINAL do GET, não forçar. Deal
+  `LOST`/`WON` tem uma segunda exigência: sem `closeDate` e `lostReason` (quando aplicável) o PUT volta
+  422 nos dois campos (deal 48317782) — mesmo padrão já documentado para `atualizarNegocioMoskit` em
+  "Integrações externas" abaixo (`status`/`closeDate`/`lostReason` preservados do GET), só que faltava
+  neste script. Das 17 correções da rodada real: 12 já estavam certas no CRM (o snapshot local do
+  `conversations.db` estava atrasado — a proteção "confere de novo antes do PUT" pulou todas sem
+  sobrescrever), e as 5 que precisavam de escrita batiam nesses dois 422 até os campos serem
+  adicionados; as 5 fecharam com 200 depois da correção.
 - `reprocessar-nota-reuniao.js <gmailMessageId> <dealId> [--aplicar]` — religa à mão uma nota de
   reunião que ficou órfã (o id vem no aviso do Telegram). Sem `--aplicar` só imprime a nota que
   iria; com `--aplicar` **escreve no CRM**.
@@ -182,11 +283,17 @@ src/
   mensagens.js           deduplicação e ordenação cronológica de mensagens do WhatsApp
   moskit-ids.js          TODOS os IDs/campos do Moskit — fonte única, ver abaixo
   briefing.js            texto da nota de briefing pré-consulta (cabeçalho determinístico + hash)
+  csv.js                 escrita de CSV — UMA implementação. Havia três cópias do escape espalhadas
+                         pelos scripts de estudo e uma estava errada (misturava JSON.stringify, que
+                         escapa aspas como \", com valores crus não citados): a planilha abria sem
+                         erro mostrando dado na coluna errada. Regra única: todo campo sai citado
+  duplicidade.js         detecção de deal duplicado por nome+caso (filtro tipo IDF, containment) —
+                         lógica pura extraída de estudar-deals-duplicados.js para o relatório de
+                         auditoria usar a MESMA regra calibrada em 24/08, em vez de uma cópia
   cliente-retorno.js     cliente que já foi atendido e volta com caso novo: se a consulta já aconteceu,
                          se o caso descrito é posterior a ela e se o tema mudou (tudo sem rede)
   notas-reuniao.js       notas do Gemini → nota no negócio: parse do assunto, cascata que escolhe o
-                         deal, filtro de ancoragem sobre a saída da IA, texto da nota, nome do anexo
-                         (tudo sem rede)
+                         deal, texto da nota (só o link da transcrição), nome do anexo (tudo sem rede)
   telefone.js            normalização de telefone e detecção de números internos (equipe)
   transcricao.js         transcrição de áudios do cliente via OpenAI (contrato: nunca lança)
   zapsign.js             contrato de prestação de serviço: campos do template, valor por extenso,
@@ -197,7 +304,7 @@ docs/pop/                POP oficial do processo de negócio (HTML + PDF) — fo
 ### Classificação do deal: como o erro é evitado e como é corrigido
 
 Área do direito / responsável / assunto / origem foram a maior fonte de dado errado no CRM (deal
-48423360 entrou como LGPD sendo Direito Administrativo). Cinco camadas, todas em `index.js` salvo nota:
+48423360 entrou como LGPD sendo Direito Administrativo). Seis camadas, todas em `index.js` salvo nota:
 
 1. **Evidência**: `aplicarGateCasoDescrito` só deixa área/advogado/assunto irem ao CRM se houver
    observação validada `cliente_descreveu_caso`/`equipe_descreveu_caso` ([src/evidencia.js](src/evidencia.js)).
@@ -213,9 +320,87 @@ docs/pop/                POP oficial do processo de negócio (HTML + PDF) — fo
 5. **Reconciliação**: `reconciliarClassificacao` compara CRM x decisão do bot e corrige o que o
    próprio bot escreveu; roda a cada `RECONCILIACAO_INTERVAL_MS` (padrão 30 min) e sob demanda em
    `GET /auditoria-classificacao` (dry-run; `?aplicar=1`, `?incluir-legado=1`).
+6. **Campos obrigatórios na CRIAÇÃO** (`deveEsperarCamposObrigatorios`, 02/09/2026): decisão do
+   escritório depois de medir deals nascendo incompletos no CRM. Nenhuma das camadas acima impedia a
+   *criação* em si — `criarNegocioMoskit`/`montarPayloadMoskit` nunca validaram nada, um campo vazio
+   era simplesmente omitido do payload (`buscarIdOpcao` retorna `null`) e o deal nascia incompleto sem
+   erro nenhum. `origem`/`tipo_consulta` em particular não tinham gate nenhum (só `area_direito`/
+   `advogado_responsavel`/`assunto` tinham proteção parcial via `deveEsperarCasoDescrito`). Agora, no
+   mesmo ponto de decisão de `deveEsperarCasoDescrito` (antes de `buscarOuCriarContato`, para não criar
+   contato à toa em todo ciclo que vira `'aguardar'`), a criação também é bloqueada se qualquer um dos
+   5 `CAMPOS_OBRIGATORIOS` estiver pendente (`camposPendentes`, calculado sobre os dados **mesclados**
+   com o histórico, não os crus da rodada). **Mesmas duas exceções** de `deveEsperarCasoDescrito`:
+   dupla confirmação de horário fechada ou bloco de condições enviado — nesses casos o deal ainda nasce
+   incompleto de propósito, porque o evento no Google Calendar/Meet e o contrato ZapSign dependem de um
+   `dealId` já existir.
+   ⚠️ **`origem` na prática nunca aciona o gate**: `mesclarParaCrm` força `origem = 'Nao identificado'`
+   sempre que fica vazia depois do merge (proteção anterior, 21/08/2026 — ver "Integrações externas").
+   Isso significa que `camposPendentes` nunca vê `origem` vazia neste ponto — o gate novo protege de
+   fato os outros 4 campos (`assunto`, `tipo_consulta`, `area_direito`, `advogado_responsavel`); origem
+   continua podendo nascer como o fallback genérico "Nao identificado", nunca como campo ausente.
+   **Nasce em dry-run** (`BLOQUEIO_CAMPOS_OBRIGATORIOS_DRY_RUN`, padrão `true` — só loga
+   `🔍 [dry-run] bloquearia...`, sem alterar `acao`): diferente do gate de caso descrito (já validado em
+   produção), esta é uma regra nova cujo pior cenário — lead nunca sair de `'aguardar'` por um bug de
+   merge/extração — é mais caro que o problema que resolve (deal incompleto, mas ao menos existente e
+   rastreável). Setar `BLOQUEIO_CAMPOS_OBRIGATORIOS_DRY_RUN=false` liga o bloqueio de verdade; até lá,
+   `grep "\[dry-run\] bloquearia"` no log mede quantos ciclos seriam bloqueados e por quais campos.
+   Regressão em `test-pipeline.js` (bloqueio real, flag fixada em `'false'` no topo do arquivo — mesmo
+   padrão de `AGENDA_MOSKIT_DRY_RUN`) e em `test-bloqueio-campos-obrigatorios-dry-run.js` (o modo
+   padrão, detecta e loga mas cria mesmo assim — arquivo próprio pelo mesmo motivo de
+   `test-agenda-dry-run.js`: a flag é lida como `const` no require, os dois valores não cabem no mesmo
+   processo).
 
 **Autoria**: `custom_fields_bot`/`campos_travados` guardam o que o bot escreveu (inclusive o nome do
 deal, chave `__name`). Valor divergente disso = correção humana → campo travado para sempre, com nota.
+
+**O título congelado no placeholder — corrigido em 02/09/2026, uma linha em `camposPendentes`.**
+`assunto` está em `CAMPOS_OBRIGATORIOS` desde o início, e o comentário acima dele sempre disse por
+quê: "para que um deal criado sem tema no nome seja cobrado nos ciclos seguintes". **O código
+contradizia esse comentário.** `camposPendentes` tratava `assunto = "Consulta jurídica"` como
+*preenchido* — mas esse é o **placeholder honesto que o prompt manda usar** quando ninguém descreveu
+o caso, não um assunto. Consequência em cadeia: assunto nunca voltava a "pendentes" → o prompt
+informava "nenhum campo pendente" → o modelo escolhia a ação `nota` → `nota` não faz `PUT` → **o nome
+do deal ficava congelado no placeholder para sempre**, mesmo depois de `last_data` já ter o tema real.
+MEDIDO no corpus: deal 48407608 chamado só "Rayra Pureza" com `last_data.assunto = "Abatimento do
+FIES"`; o mesmo em 48287898 ("Adoção") e 48206720 ("Rescisão de contrato"). O dado existia e nunca
+subia para o título. Agora `ASSUNTO_NEUTRO` conta como pendente (`ehAssuntoNeutro` normaliza acento e
+caixa, então o `"consulta juridica"` sem acento que o prompt pede também casa), e a regra é **só do
+assunto** — nenhum outro campo obrigatório muda. Efeito deliberado: essas conversas voltam de `nota`
+para `atualizar_campos`, ou seja voltam a fazer `PUT`. Isso só é seguro porque a autoria por
+`__name` preserva renomeação humana, e é exatamente isso que a regressão em `test-pipeline.js`
+("assunto placeholder conta como PENDENTE" + "e o PUT que isso libera continua respeitando
+renomeação humana") trava: se ela cair, a linha volta atrás.
+
+**O placeholder do modelo apagava um assunto real herdado — achado em 03/09/2026, `mergeDados`.**
+Investigando o [PLANO-CORRECAO-QUALIDADE-DEALS.md](PLANO-CORRECAO-QUALIDADE-DEALS.md) (Fase 2), 4
+deals do bot tinham assunto real capturado numa auditoria de 02/09 e voltaram ao placeholder
+`"Consulta jurídica"` num pull fresco do `conversations.db` de produção 1 dia depois — sem ninguém ter
+corrigido nada na mão. Um dos quatro é **o próprio deal 48407608 (Rayra Pureza)**, citado ACIMA como
+o exemplo que motivou a correção do título congelado (`last_data.assunto = "Abatimento do FIES"` em
+02/09) — hoje seu `last_data.assunto` está **vazio**. A correção de 02/09 funcionou; um bug diferente
+comeu o dado de novo depois.
+
+Causa: `mergeDados(anteriores, novos)` só preserva o valor antigo quando o `novos[key]` é `null`/
+`undefined`/`'null'` — mas o modelo **nunca omite** `assunto`, ele preenche com o placeholder neutro
+sempre que a rodada não tem caso novo (é a própria instrução do prompt). O placeholder é uma string
+não-nula, então `mergeDados` o tratava como dado novo de verdade e sobrescrevia um assunto real de uma
+rodada anterior — silenciosamente, porque o único log de "descartado" fica em
+`aplicarGateCasoDescrito`, que roda DEPOIS do merge (dentro de `sanitizarClassificacao`, chamada por
+`mesclarParaCrm`) e só nula um assunto que NÃO é o placeholder — o placeholder sempre "passava",
+inclusive por cima de um valor bom que ele acabara de substituir. **`_casoDescritoValidado` nunca
+protegia isso**: ele impede o gate de renular *area_direito*/*advogado_responsavel* validados antes,
+mas assunto placeholder nem chega a ser nulado pelo gate — o dano já tinha acontecido um passo antes,
+no merge. REPRODUZIDO deterministicamente (sem chamada de IA): `mesclarParaCrm(rodada1, { assunto:
+'Consulta jurídica' }, [])` sobre uma `rodada1` com assunto real devolvia o placeholder, apagando o
+real. Fix: `mergeDados` agora trata o placeholder como "sem novidade" (mesmo efeito de `null`) só
+quando já existe um assunto real herdado — placeholder sobre placeholder, ou assunto real novo sobre
+assunto real antigo, continuam funcionando como antes. Regressão em `test-pipeline.js`
+("mesclarParaCrm: placeholder do modelo nao apaga assunto real herdado", com os dois controles: sem
+assunto anterior o placeholder passa normal, e assunto real novo continua substituindo o antigo).
+⚠️ **O fix impede a corrupção dali pra frente — não recupera os deals já afetados.** Só os 4 achados
+por acaso (por terem um snapshot de auditoria anterior pra comparar) têm o valor antigo conhecido; não
+há como saber quantos outros na base de 106 deals do bot perderam assunto do mesmo jeito sem deixar
+rastro.
 
 **Dois buracos estruturais, achados em 21/08/2026 por `diagnosticar-classificacao.js` (script novo,
 só leitura — mede 6 causas raiz de origem/área/advogado vazios antes de decidir o que corrigir):**
@@ -457,6 +642,67 @@ risco de evento duplicado.
   o **inverso** de `FUNIL_DRY_RUN`: sem a variável, a agenda funciona. Aquelas flags seguram palpite
   de IA sobre funil; esta guarda uma regra determinística, então nasce ligada.
 
+### Notas no Moskit: só pendência vira nota, sucesso de rotina não
+
+**Decisão de 02/09/2026.** O escritório reclamou do volume de notas no histórico de cada negócio.
+Mapeados os 43 pontos do código que chamavam `criarNotaMoskit` (fora do Briefing e das notas de
+reunião, cada um com seção própria), a resposta dividiu as notas em duas famílias e cortou uma delas:
+
+- **Família A (fica)** — aviso de PROBLEMA ou PENDÊNCIA que exige ação humana: campo travado por
+  correção manual, valor da IA fora da lista do CRM, falha ao criar/remarcar Atividade no Moskit,
+  sugestão em modo dry-run (`FUNIL_DRY_RUN`/`FUNIL_FECHAMENTO_DRY_RUN`/`AGENDA_MOSKIT_DRY_RUN`/
+  `REUNIAO_RETORNO_DRY_RUN`), pagamento confirmado SEM comprovante verificado, comprovante que não
+  confere, contrato não gerado por falta de dado, falha real na API do ZapSign, pendência ou erro de
+  agendamento, divergência entre o que a dupla confirmação apurou e o que a IA entendeu, aviso de
+  cliente de retorno em caso ambíguo, recusa/falha de assinatura do contrato. Praticamente todas já
+  disparavam Telegram no mesmo fluxo — a nota aqui é o registro que fica quando alguém abre aquele
+  negócio específico depois, não a única forma de alerta.
+- **Família B (saiu)** — confirmação de que uma ação **deu certo**, sem exigir nada de ninguém: deal
+  movido de estágio, negócio fechado como GANHO/PERDIDO, pagamento confirmado com comprovante
+  verificado, reunião agendada/remarcada com sucesso, atividade criada tardiamente pela auto-cura,
+  contrato enviado/assinado, cliente de retorno detectado (nos dois call sites: no negócio antigo e
+  no novo), campos preenchidos/atualizados, link do Meet adicionado, atividade religada ao negócio,
+  classificação reconciliada. Em cada um desses ~18 pontos a **ação em si continua acontecendo** —
+  só a linha `criarNotaMoskit(...)` foi removida; onde já existia Telegram, ele continua igual.
+
+Duas exceções deliberadas dentro da família B, mantidas em A por decisão do usuário: pagamento
+confirmado **sem** comprovante (sinal fraco, vale registrar) e os avisos de dry-run (que pedem
+revisão manual explícita, mesmo sem ainda ter havido um "erro"). O Briefing pré-consulta e a nota de
+reunião do Gemini (link da transcrição) ficaram de fora dessa varredura de propósito — são as duas
+notas que o usuário pediu para manter, cada uma com sua própria seção abaixo.
+
+**Decisão de 03/09/2026 — a Família A INTEIRA saiu do Moskit também.** O pedido seguinte do usuário
+foi direto: "quero que os problemas só vá para o telegram". Os 19 pontos listados acima como Família A
+deixaram de chamar `criarNotaMoskit` — **só Briefing e nota de reunião ainda postam no deal.** Em 9
+desses pontos já existia um `enviarTelegram` cobrindo o mesmo evento (às vezes com o mesmo hash de
+dedup da nota, às vezes incondicional): a nota simplesmente saiu, o Telegram continua igual. Nos outros
+10, o Telegram teve que ser criado ou ajustado:
+- **8 pontos sem Telegram nenhum** ganharam um `enviarTelegram` novo, equivalente ao texto da nota
+  removida: campo travado por correção manual (`atualizarNegocioMoskit`), falha ao remarcar Atividade
+  no Moskit nos 4 branches (`atualizarAtividadeMoskit`), pagamento sem comprovante e comprovante que
+  não confere (`handlePagamentoConfirmado`), atividade não lançada por `AGENDA_MOSKIT_DRY_RUN`
+  (`registrarConsultaNaAgendaMoskit`), recusa de assinatura e falha de e-mail do ZapSign
+  (`processarWebhookZapSign`). Nenhum ganhou hash de dedup novo — mesma frequência que a nota tinha
+  antes, só o canal mudou (a maioria é evento único, não polling repetido; a exceção é a sugestão de
+  `FUNIL_DRY_RUN`, que repetiria a cada ciclo — aceitável porque `FUNIL_DRY_RUN=false` está ligado em
+  produção e esse caminho fica inerte hoje).
+- **2 casos eram deliberadamente silenciosos no Telegram** para não virar "ruído diário": a divergência
+  entre o horário que a dupla confirmação fechou e o que a IA entendeu (`handleAgendamentoCalendar`,
+  `agendamento_divergencia_hash`) e a pendência de agendamento de ROTINA — falta só a confirmação de um
+  lado, sem remarcação/descarte/urgência (`registrarAgendamentoPendente`, a condição do Telegram em
+  `if (hashMudou || urgente)`, antes restrita a `remarcacao || descartados.length`). Confirmado
+  explicitamente com o usuário: agora os dois avisam no Telegram também, usando o MESMO hash que já
+  gatava a nota — sem isso, remover a nota apagaria esses dois eventos de qualquer lugar visível.
+- **Caso especial**: a nota híbrida de `handleAgendamentoCalendar` ("consulta marcada no Moskit mas
+  Google falhou") foi apagada sem substituto próprio — `registrarErroAgendamento` (chamada logo depois,
+  já tinha Telegram com `agendamento_erro_hash`) ganhou um parâmetro `naAgendaMoskit` para carregar essa
+  nuance no texto, em vez de duplicar aviso.
+
+`avisarRetornoUmaVez` perdeu o parâmetro `nota` (não é mais chamado por nenhum dos dois call sites,
+`abrirNovoAtendimento` e o ramo `ambiguo` de `processarConversaDirect`) — só `telegrama` continua.
+Regressões atualizadas em `test-pipeline.js`, `test-agenda-dry-run.js`, `test-reuniao-retorno-flags.js`
+e `test-cliente-retorno-flags.js` (assertos de `notas()` trocados por `telegrams()` nos 19 pontos).
+
 ### Briefing pré-consulta: a nota "📋 Briefing · vN · data" no deal
 
 O advogado abre o negócio no CRM minutos antes da consulta. Se a conversa parou no dia anterior, a
@@ -471,9 +717,15 @@ uma nota no deal com o estado atual da conversa, e o bot reprocessa de propósit
   o **cabeçalho** é determinístico, montado em código (cliente, telefone, horário da consulta —
   esvazia o campo se não houver); a **narrativa** é o `resumo_atendimento` que a IA produz. A saída
   muda de formato sem depender de o modelo "aprender" o novo cabeçalho.
-- **O resumo do prompt ganhou 6 seções** (`Caso` / `Objetivo` / `Urgencia·prazo` / `Ja tentou` /
-  `Pendencias` / `Documentos citados`), com regra de ouro: campo que não apareceu na conversa sai
-  "Nao mencionado.", nunca "—" vazio nem chute.
+- **As 6 seções são VOCABULÁRIO, não teto** (`Caso` / `Objetivo` / `Urgencia·prazo` / `Ja tentou` /
+  `Pendencias` / `Documentos citados`). Cada uma pode ocupar mais de uma linha quando o caso tem mais
+  a dizer, e **seção sem informação é omitida por completo** — nada de "Nao mencionado". Era o
+  contrário até 02/09/2026: o prompt mandava "estruture em 6 linhas" e mandava escrever o literal,
+  e o **exemplo** do próprio prompt o escrevia três vezes (exemplo few-shot ensina mais que
+  instrução — trocar a regra sem trocar o exemplo não teria mudado nada). Medido nos 74 resumos que a
+  produção gravou: **105 literais, 1,46 por resumo de 6 linhas**, mediana de 330 chars. Depois:
+  **0,07 por resumo**, mediana **472**. A regra copiada é a nº 4 do prompt de notas
+  (`src/notas-reuniao.js`), que já resolvia isso no outro lado do sistema.
 - **Hash sobre o texto final** (cabeçalho + narrativa, fora título/versão/data): valor novo,
   narrativa nova ou mudança de horário repostam; só a data do título passando para a frente não.
 - **Aguardar mudança não basta.** O refresh da conversa depende de mensagem nova, e consulta marcada
@@ -486,6 +738,32 @@ uma nota no deal com o estado atual da conversa, e o bot reprocessa de propósit
 - **Migração.** Linhas com `briefing_added=1` e sem `briefing_hash` adotam o hash sem repostar (a
   nota já existe); linhas com hash do formato antigo (de 4 linhas) repostam naturalmente no próximo
   reprocessamento — virada de formato sem script de backfill.
+- **Pendência é DITA, não é motivo para não postar** (`BRIEFING_SEM_PENDENTES`, padrão ligado).
+  Quando falta campo obrigatório, o cabeçalho ganha uma última linha
+  `⚠️ Ainda não confirmado: área do direito, advogado responsável` (rótulo legível, o mapa está em
+  `src/briefing.js`), e a nota vai. **Isto consertou um beco sem saída que nascia de duas regras
+  certas sozinhas:** `aplicarGateCasoDescrito` anula `area_direito` e `advogado_responsavel` de
+  propósito quando ninguém descreveu o caso (`index.js:1301-1302`, decisão de 12/08/2026 — melhor
+  vazio que adivinhado), os dois estão em `CAMPOS_OBRIGATORIOS`, e este ramo só chamava
+  `registrarBriefing` com `pendentes.length === 0` — enquanto o ramo `criar` chamava sempre
+  (`index.js:4209`). Conversa com deal e sem caso descrito **não podia receber briefing nenhum, por
+  construção**: resumo pedido à OpenAI, pago, escrito e descartado sem uma linha de log. Medido em
+  02/09/2026 (`node avaliar-extracao.js`, 277 conversas): **19 barradas, 14 com resumo pronto**, e em
+  todas as 14 quem segurou foram exatamente esses dois campos. Depois do conserto: **0 barradas, 18
+  postando com a lacuna anotada**. O gate do caso descrito ficou intacto de propósito — é ele que
+  protege o CRM de palpite. `BRIEFING_SEM_PENDENTES=false` volta ao comportamento antigo sem
+  redeploy, e o espelho do `avaliar-extracao.js` segue a mesma flag (é assim que a medição
+  antes/depois continua possível).
+- ⚠️ **O resumo anterior NÃO vai no prompt, e essa é a diferença entre melhorar o prompt e não
+  melhorar nada.** A regra "atualize APENAS o que identificou agora" fazia o modelo **copiar o
+  `resumo_atendimento` da rodada passada palavra por palavra**, e com ele o formato antigo inteiro.
+  Medido em 02/09/2026 nas MESMAS 40 conversas, com o prompt novo em vigor nas duas rodadas: com o
+  resumo anterior no prompt, **1,62** literal "não mencionado" por resumo e mediana **300** chars;
+  sem ele, **0** literais e mediana **466**. Enquanto o texto velho viajava junto, toda melhoria era
+  invisível para conversa que já tinha `last_data` — que é justamente o caso do
+  `refrescarBriefingsPertoDaConsulta`, o briefing que o advogado lê minutos antes da consulta. Hoje
+  `extrairDadosAtendimento` remove só essa chave do JSON que vai ao prompt (os outros campos
+  continuam indo, e `mergeDados` segue preservando o resumo antigo se o modelo devolver `null`).
 - **`processar_pendentes.js` reposta no mesmo formato** (mesmo `src/briefing.js`), para a nota
   religada nunca sair com cara diferente da rotina.
 - Regressões em `test-briefing.js` (módulo puro) e `test-pipeline.js` (call sites, versão, migração,
@@ -495,8 +773,34 @@ uma nota no deal com o estado atual da conversa, e o bot reprocessa de propósit
 
 O que acontece **dentro** da consulta não voltava para o CRM. `sincronizarNotasReuniao` (`index.js`,
 a cada `NOTAS_SYNC_INTERVAL_MS`, padrão 10 min) lê os e-mails de notas do Gemini, descobre a que
-negócio pertencem, extrai os dados jurídicos com a OpenAI e escreve uma nota no deal. A decisão fica
-em [src/notas-reuniao.js](src/notas-reuniao.js) (puro, sem rede); o `index.js` só busca o que ela pede.
+negócio pertencem e escreve uma nota no deal com o **link** da transcrição. A decisão fica em
+[src/notas-reuniao.js](src/notas-reuniao.js) (puro, sem rede); o `index.js` só busca o que ela pede.
+
+**Decisão de 02/09/2026 — a nota deixou de ser uma extração por IA em 5 seções e virou só o link.**
+Até aqui a nota era o "BRIEFING DE ATENDIMENTO E ALINHAMENTO ESTRATÉGICO": um prompt convertia o
+corpo do e-mail + a transcrição do Doc em 10 campos (perfil do cliente, objeto, estratégia jurídica,
+honorários, contexto pessoal), com um filtro de ancoragem numérica sobre a saída do modelo. O
+escritório pediu para reduzir o volume de notas no deal, e a instrução final foi específica: só o
+link do resumo/transcrição da reunião (a extração por IA sai do fluxo inteiramente), mais o resumo do
+atendimento comercial por WhatsApp que o Briefing pré-consulta já cobre (ver seção própria, sem
+mudança nenhuma). Achado que reforçou a decisão: em produção `NOTAS_REUNIAO_DRY_RUN=true`, então
+aquela extração rodava — e **pagava** OpenAI/Gemini a cada ciclo — sem nunca chegar a escrever a
+nota de verdade no CRM; a simplificação também elimina esse custo. `montarTextoNota` agora é só:
+título (com o número da reunião, quando identificado, e a data), `📎 Transcrição completa anexada na
+aba Arquivos deste negócio` (só quando o anexo em PDF — inalterado, ver seção seguinte — já foi
+confirmado no CRM), `Fonte: {link do Google Doc}` e `Vínculo: {método} (confiança X)` para auditoria.
+Removidos de `src/notas-reuniao.js`: `CAMPOS`, `PROMPT_SISTEMA_NOTAS`, `montarMensagensExtracao`,
+`validarExtracao`/`conferirAncoragem` (o filtro de ancoragem numérica) e `ehExtracaoAtual`; de
+`index.js`: `extrairComIaDeNotas` (a escolha OpenAI/Gemini com fallback), `geminiChat` e o arquivo
+`src/gemini.js` inteiro (tradução de mensagens pro formato Gemini — sem consumidor depois da
+extração sair). **Reunião sem transcrição não gera nota nenhuma**: sem `docId` (nenhum Doc
+referenciado no evento nem no e-mail), ou com `docId` presente mas o Drive confirmando que o Doc não
+existe/não está acessível (`anexarDocNoDeal` devolvendo `motivo: 'export_falhou'` — veredito
+permanente, não uma falha transitória que a retomada ainda vai tentar), a linha vai para o estado
+terminal novo `SEM_TRANSCRICAO` sem escrever nada no deal — postar um link morto não é "útil". O
+resto da máquina de estados (cascata de identificação, dedup por marcador, retomada de `POSTANDO`,
+Doc duplicado, `registrarFalhaNota`/`NOTAS_MAX_TENTATIVAS`, `conferirSilencioNotas`) é a mesma
+infraestrutura de idempotência de antes — só o que vira texto da nota mudou.
 
 - **O e-mail é o gatilho; o evento da agenda é o enriquecimento.** Assunto real:
   `Notas: "Consulta — Lia 🇧🇷💛💚 (Berto)" de 14/08/2026`, de `gemini-notes@google.com`. O evento
@@ -507,9 +811,6 @@ em [src/notas-reuniao.js](src/notas-reuniao.js) (puro, sem rede); o `index.js` s
   **Não confundir com `meetings-noreply@google.com`**, que manda
   `Problema com as notas: ...` quando o Gemini FALHA — esse e-mail não tem nota nenhuma dentro e
   viraria uma nota vazia no negócio do cliente.
-- **O corpo do e-mail já traz o resumo inteiro**; o Doc só acrescenta a transcrição literal, e só
-  existe se alguém a ligou na reunião. Por isso o corpo é obrigatório e o Doc é *best-effort*: falha
-  no `drive.files.export` marca o rodapé e segue, nunca impede a nota.
 - **Candidato único ou órfão, sem exceção.** Duas consultas às 15h com advogados diferentes fariam a
   nota do caso de um cliente cair no negócio de outro — dentro do CRM isso é vazamento de sigilo, e
   ninguém detecta lendo, porque a nota parece plausível no negócio errado. Quando um passo devolve
@@ -570,7 +871,7 @@ em [src/notas-reuniao.js](src/notas-reuniao.js) (puro, sem rede); o `index.js` s
   - `registrarFalhaNota` **desiste** após `NOTAS_MAX_TENTATIVAS` (padrão 3, o mesmo de
     `src/fila.js` e pelo mesmo motivo: cada tentativa custa uma chamada de IA com o texto inteiro).
     Antes a coluna era incrementada e **nunca lida** — um e-mail com deal apagado voltava a cada 10
-    min para sempre, pagando OpenAI, sem avisar ninguém. Ao desistir: estado terminal, rótulo
+    min para sempre, sem avisar ninguém. Ao desistir: estado terminal, rótulo
     `Notas/Erro` e Telegram com o comando de religar.
   - `conferirSilencioNotas` avisa após `NOTAS_SILENCIO_DIAS` (padrão 10) **sem nenhum e-mail novo**.
     Repare no que é medido: a última vez que a busca devolveu ALGUMA mensagem, gravada em
@@ -581,8 +882,8 @@ em [src/notas-reuniao.js](src/notas-reuniao.js) (puro, sem rede); o `index.js` s
   aplicado DEPOIS de o estado virar terminal, e o `messages.list` do mesmo ciclo roda logo em seguida.
   Se o índice de busca do Gmail atrasar, ou se a retomada falhar antes de conseguir rotular, a mesma
   mensagem volta na lista — e os dois `if` de retomada de `processarNotaReuniao` não casam mais (o
-  estado deixou de ser `POSTANDO`), então ela seria reprocessada do zero: nova chamada de OpenAI e uma
-  **segunda nota** no prontuário do cliente. O marcador não cobre isso, porque só é consultado dentro
+  estado deixou de ser `POSTANDO`), então ela seria reprocessada do zero: uma **segunda nota** no
+  prontuário do cliente. O marcador não cobre isso, porque só é consultado dentro
   do ramo `POSTANDO`. Por isso a guarda de `ESTADOS_TERMINAIS` é a primeira coisa da função.
   `dealIdForcado` atravessa de propósito (é o único jeito de ressuscitar um órfão) — menos em
   `CONCLUIDO`, onde religar **lança**, porque só criaria a segunda nota.
@@ -599,72 +900,6 @@ em [src/notas-reuniao.js](src/notas-reuniao.js) (puro, sem rede); o `index.js` s
   12345678 do processo administrativo", um número que o cliente leu em voz alta, viraria vínculo de
   confiança *alta* com um negócio qualquer. A transcrição nem chega em `extrairSinais`: não existe
   parâmetro para ela, e há teste garantindo que continue assim.
-- **A nota é o "BRIEFING DE ATENDIMENTO E ALINHAMENTO ESTRATÉGICO", e o contrato de extração É a
-  estrutura dele.** Cinco seções, montadas por `montarTextoNota` a partir das 10 chaves de `CAMPOS`
-  ([src/notas-reuniao.js](src/notas-reuniao.js)): *1. Contexto do Cliente & Histórico Fático* (perfil,
-  histórico processual anterior, situação/urgência, diretrizes internas da equipe), *2. Do Objeto*
-  (escopo formal da contratação), *3. Da Estratégia Jurídica* (via eleita e foro, fundamentação,
-  superação de óbices), *4. Da Proposta de Honorários* e *5. Contexto Pessoal/Social*. Não existe
-  template em outro lugar — trocar `CAMPOS` é trocar o formato da nota.
-  **Vaivém de 20→21/08/2026**: em 20/08 o escritório removeu a seção de contexto do cliente e fundiu
-  a estratégia num parágrafo único (`objeto`/`estrategia`/`honorarios`, 3 seções). Em 21/08, testar
-  esse formato reduzido contra um segundo caso real (assessoria administrativa de Fies para
-  convocação em curso de Medicina, "Iury e Rayssa Coutinho") expôs dois problemas que o primeiro caso
-  de teste (aluno de medicina/TRF3) não mostrava: (a) muito **papo social/pessoal sem relação com o
-  caso** (outro emprego do cliente, aspirações de carreira, rede de contatos) vazava para dentro do
-  perfil, porque a regra de "seja exaustivo" não distinguia relevância; (b) **"Via Eleita & Foro"
-  ficava vazia** — e a seção de Estratégia Jurídica sumia inteira — em atendimentos que são só
-  assessoria administrativa/documental, sem ação judicial. A decisão final: reverter para as 4 seções
-  originais, **mais** um campo novo (`contexto_pessoal_social`, 5ª seção) para isolar o papo social sem
-  descartá-lo, e `via_eleita_foro` passou a aceitar via administrativa também, não só judicial.
-  **Validado com chamadas reais à OpenAI contra 3 casos diferentes** (mandado de segurança/TRF3,
-  assessoria de Fies, equiparação salarial, abatimento de Fies por atuação na COVID) — não só teste
-  determinístico com fixture. Isso pegou dois bugs que fixture nenhum pegaria: (1) a IA às vezes
-  aninhava os campos em sub-objetos por seção (`{"DO OBJETO": {"objeto": "..."}}`), o que fazia
-  `validarExtracao` não reconhecer nenhuma chave e a extração sair `vazia: true` — corrigido com uma
-  instrução explícita de "objeto JSON PLANO" + um esqueleto de exemplo no prompt; (2)
-  `contexto_pessoal_social` é o campo mais propenso a violar a regra de "nunca escreva não
-  mencionado" (regra 4), porque toda reunião jurídica É só sobre o caso — reforçado com um aviso
-  específico nesse campo depois de aparecer no caso do FIES (Sandino Rocha, sem nenhum papo social).
-  **`honorarios` é lista livre de `{etapa, valor, condicao}`, não cinco campos fixos.** Campo fixo é
-  convite a preencher: perguntado sobre "Êxito Intermediário (Etapa 2)" num atendimento em que só se
-  falou de entrada, o modelo devolve um valor plausível — e número inventado no campo de honorários é
-  o pior erro que esta rotina pode cometer. As cinco etapas canônicas vivem no **prompt**, como
-  vocabulário preferido. Um valor em reais dito num contexto alheio ao caso (ex.: salário do cliente em
-  outro emprego) vai para `contexto_pessoal_social`, nunca para `honorarios` — é a instrução do prompt
-  que evita essa confusão, não o filtro de ancoragem (que só confere presença do dígito na fonte, não
-  a que campo ele pertence).
-  **Texto puro, sem Markdown**: o `description` do Moskit é exibido cru, então `**` e `##` virariam
-  sujeira justamente no documento que o advogado abre antes de redigir a peça.
-  `vazia` deixou de ser "resumo em branco" e passou a ser *nenhum* campo de sustentação
-  (`CAMPOS_SUSTENTACAO`: `perfil_qualificacao`/`historico_processual_anterior`/
-  `situacao_atual_urgencia`/`objeto`) preenchido — `contexto_pessoal_social` ou honorários sozinhos,
-  sem nenhum desses, é o retrato do modelo que preencheu o formulário sem ter lido a reunião.
-  **A extração guardada é reusada só se seguir o contrato de hoje** (`ehExtracaoAtual`, conferido no
-  `index.js` antes de reaproveitar uma linha em `EXTRAIDO`). Campo ausente vira seção ausente, então
-  uma linha extraída sob contrato antigo entregaria ao cliente um briefing com cabeçalho e rodapé e
-  nada no meio; uma chamada de IA a mais custa menos que isso.
-- **Filtro de ancoragem sobre a saída da IA** (`validarExtracao`, o análogo de `src/evidencia.js`):
-  todo valor monetário, CPF/CNPJ, número CNJ, **citação legal** e data que apareça na extração e
-  **não** apareça no
-  texto-fonte (comparando só os dígitos, para pontuação diferente não gerar falso alarme) é **marcado
-  inline** com `[⚠ não localizado no texto]` e vira aviso no rodapé. Marca em vez de apagar de
-  propósito: o falso positivo é real (o valor pode ter sido dito por extenso) e apagar destruiria um
-  dado que o advogado precisa — o risco a matar não era a presença do número, era a **confiança** que
-  ele transmite.
-  **Dinheiro é comparado como NÚMERO, não como cadeia de dígitos.** MEDIDO no e-mail real de
-  07/08/2026: o Gemini escreve `"precificada em 5000 reais"`, sem formatação de moeda. Se o modelo
-  devolver isso como `R$ 5.000,00` — que é o mesmo valor, formatado — a comparação por dígitos
-  procuraria `500000` num texto que tem `5000` e marcaria um valor **certo** como não localizado.
-  Falso alarme no campo de honorários é pior que nenhum aviso: ensina o advogado a ignorar o símbolo.
-  Documento, processo e data continuam por dígitos, onde a identidade é a própria sequência.
-  **Citação legal entrou no filtro quando o briefing ganhou o campo de fundamentação.** Pedir "os
-  dispositivos discutidos" é exatamente o convite para o modelo completar "a LDB" com
-  "(Lei 9.394/96)" de memória — o número sai perfeito, e é por isso que ninguém desconfia. A norma é
-  conferida **bloco a bloco**, nunca pela cadeia inteira: `"9.394/96"` vira `9394` e `96` (o ponto é
-  separador de milhar e sai antes; quem separa é `/` e `-`), e bloco com menos de 3 dígitos é
-  ignorado — senão `"art. 47"` seria marcado em toda peça do escritório. Sem o bloco a bloco, a fonte
-  dizendo "Lei 9.394" e o modelo acrescentando o ano fariam uma citação **certa** virar alarme.
 - **Credencial separada.** `google-oauth-token-notas.json`, cliente OAuth próprio, porta 8092
   (`autorizar-google-notas.js`). O token do bot tem escopo só de Calendar; somar Gmail/Drive a ele
   exigiria refazer o consentimento, e um consentimento refeito pode invalidar o refresh token em uso
@@ -885,15 +1120,12 @@ busca o que ela pede. Desligada por padrão (`REUNIAO_RETORNO_ATIVO`) e, quando 
   Moskit (sem chat) ficaria travada em "aguardando_pagamento" para sempre, esperando um comprovante
   de uma consulta que já foi paga. Determinístico por desenho: o critério é a consulta realizada, não
   o título que a equipe digitou (que abriria um contorno do gate de pagamento).
-- **A nota do Gemini ganha o número da reunião no cabeçalho** (`— REUNIÃO N`), calculado por
+- **A nota do Gemini ganha o número da reunião no título** (`— REUNIÃO N`), calculado por
   `numeroDaReuniao(reunioes, dataIso)` a partir da **data** do assunto do e-mail (que não tem hora) —
   nunca do contador atual, porque o e-mail da reunião 1 pode chegar depois de a reunião 2 já estar
   aberta. Dia com mais de uma reunião é ambíguo de propósito e não numera nada (mesmo "candidato
-  único ou nada" de `decidirDeal`). **O formato de 5 seções não muda** — só a numeração; um segundo
-  formato exigiria versionar a coluna `extracao`, que hoje não tem esse campo. Risco coberto no
-  prompt: reunião de acompanhamento pode não ter `perfil_qualificacao`/`objeto`, e
-  `CAMPOS_SUSTENTACAO` vazio descartaria a nota inteira (`vazia: true` → `ERRO_PERMANENTE`) —
-  `situacao_atual_urgencia` agora carrega o estado atual do caso nesse cenário.
+  único ou nada" de `decidirDeal`). Desde 02/09/2026 a nota é só o link (ver seção própria) — a
+  numeração é a única coisa que este recurso ainda acrescenta a ela.
 - **O briefing pré-reunião também é numerado, mas por um vocabulário diferente do da agenda.**
   O título usa contagem simples e sequencial (`Reunião 1`, `Reunião 2`, ...) — é o que o usuário pediu
   — enquanto o cabeçalho da nota usa o mesmo `rotuloCompromisso` da agenda (`Consulta:`/`Retorno N:`).
@@ -958,6 +1190,33 @@ busca o que ela pede. Desligada por padrão (`REUNIAO_RETORNO_ATIVO`) e, quando 
   varrido tudo. Ver `listarAtividadesMoskit`. Atenção: em `/contacts` quem pagina é o
   `x-moskit-listing-next-page-token` (`buscarOuCriarContato`) — o mecanismo **difere por endpoint**,
   não assuma. `deal.status` só aceita `OPEN`/`WON`/`LOST`.
+  MEDIDO em 02/09/2026 (`auditar-crm-coletar.js`), fechando três incógnitas que estavam em aberto:
+  **`/contacts` também ignora `limit=100`** — devolve 10 como todo o resto, então o `limit: 100` de
+  `importarContatosMoskit` nunca teve efeito e uma varredura de contatos custa ~427 requisições, não
+  ~43. **Os headers de rate limit existem e são úteis**: `x-ratelimit-limit-second` = 6,
+  `x-ratelimit-limit-minute` = 240, com `x-ratelimit-remaining-second`/`-minute` e `ratelimit-reset`
+  em toda resposta — **nenhum código de produção os lê** (só o coletor da auditoria, que registra o
+  mínimo observado no manifesto justamente para embasar a decisão de retrofitar isso ou não).
+  E existem **três rotas de metadados** que o projeto nunca usou: `GET /customFields` (7 campos, com
+  `module` DEAL/CONTACT e `type`), `GET /pipelines` (2) e `GET /stages` (9, cada um com
+  `pipeline: {id}` — é o que liga stage a funil, porque o deal traz só `stage: {id}` e nenhuma
+  referência ao funil). `GET /customFields/{id}` **não** lista as opções do campo, então rótulo de
+  opção continua vindo só de `src/moskit-ids.js`; id desconhecido tem de sair como `id:NNN`, nunca
+  como nome inventado. Duas consequências diretas: `MOSKIT_IDS.CF` conhece 5 dos 7 campos da conta
+  (falta `CF_y5lm56iyiY7rKDwW`, "Tipo de ação de massa" de DEAL, e `CF_oJZmPVS9iGBykqgv`, o homônimo
+  de CONTACT), e `MOSKIT_IDS.STAGE` conhece 7 dos 9 (falta os dois do funil "Consulta Jurídica"
+  `93725`). Apareceu também um valor de `origin` fora da lista conhecida: **`'API V2'`**, em deals de
+  2021.
+  **Sobre o `CF_y5lm56iyiY7rKDwW`, cuidado com a conclusão fácil.** A suposição natural — "o código
+  não conhece, então está vazio, então é esperado" — foi MEDIDA na varredura completa de 02/09/2026 e
+  **é falsa**: o campo está preenchido em **1.669 dos 3.096 deals** (58,1% dos do Moskit Boost, 21,7%
+  dos manuais), com **20 ids de opção distintos**, em deals criados de 2022 a 2026. Ele é usado
+  ativamente pelo escritório. Quem NÃO o preenche é o bot: 2 dos 106 deals `BOT_WHATSAPP`. Isso
+  inverte a leitura — num deal criado pelo bot, esse campo vazio pode ser lacuna real, e não ruído,
+  porque todo o resto da operação o preenche. Se ele deve entrar em `CAMPOS_OBRIGATORIOS` é decisão
+  do dono; o que não se pode é tratá-lo como campo morto. Nenhum dos 20 ids de opção está em
+  `src/moskit-ids.js`, e `GET /customFields/{id}` não os lista — para rotulá-los alguém tem de ler as
+  opções na tela do CRM.
   **Em `/deals` (listagem) o mesmo padrão se repete, e por anos ninguém tinha testado `?start=`.**
   `page`/`limit` são ignorados em silêncio (sempre os ~10 mais recentes) — por isso
   `auditoria-funil-completo` e o comentário antigo diziam "não há paginação real para `/deals`". MEDIDO
@@ -1013,6 +1272,33 @@ busca o que ela pede. Desligada por padrão (`REUNIAO_RETORNO_ATIVO`) e, quando 
   rodada anterior). Fecha o caso dos 3 deals de 21/08/2026 que ficaram com o campo literalmente
   ausente no CRM, não só "Não identificado". Regressão em `test-pipeline.js`
   ("aplicarPadroesDeterministicosDeOrigem").
+  **Vocabulário ampliado e três frentes, 02/09/2026 — decisão do escritório: "Não identificado" pode
+  continuar sendo aceito na criação (não é gate de bloqueio, ver `deveEsperarCamposObrigatorios`
+  acima), mas a automação deve tentar ao MÁXIMO identificar antes disso.** `aplicarPadroesDeterministicosDeOrigem`
+  só cobria Instagram (via sócio) e "site do escritório" — um subconjunto pequeno perto do que já
+  era demonstrável por regex. Três frentes, todas usando o MESMO vocabulário (nenhuma duplicação):
+  (1) **mais padrões deterministicos** — JusBrasil, Youtube, Instagram genérico, Artigo/Matéria/
+  Notícia, indicação de amigos/parentes/clientes, VSL-Tráfego pago, Landing Page, e "achei/pesquisei
+  no Google" com contexto de busca — cada um **mais conservador** que a heurística de auditoria que
+  já existia em `recuperar-origem-perdida.js` (que era pensada para revisão humana, não para forçar
+  campo sem revisão): "artigo"/"matéria"/"notícia" sozinhos ficaram de fora (em conversa jurídica é
+  bem mais provável ser "artigo da lei" que "artigo de blog" — só conta com verbo de consumo, "vi/li
+  um artigo"), "amigo"/"parente" sozinhos também ficaram de fora (comuns sem ser sobre origem — só
+  conta com indicação explícita), e "google" isolado continua de fora (mesma armadilha do convite do
+  Meet). (2) **`detectarRespostaPerguntaOrigem`** — o gap real medido acima (deal 48317782) vira regra
+  determinística: reconhece a pergunta da equipe ("como você conheceu...") e usa a resposta
+  IMEDIATAMENTE seguinte do cliente, sem depender do modelo lembrar a cada rodada. Chamada **antes**
+  dos padrões genéricos (mais específico primeiro) e o texto dos padrões genéricos passou a
+  considerar **só as mensagens do cliente** — sem essa restrição, a própria pergunta da equipe
+  listando as opções ("1.Indicação 2.Artigo 3.Instagram 4.Youtube") acionaria o padrão de Instagram
+  antes mesmo de o cliente responder qualquer coisa. (3) **regra 2 do prompt reforçada** com os
+  exemplos que faltavam (JusBrasil, Artigo, VSL, Landing Page) e a instrução explícita de que "Não
+  identificado" só é aceitável quando a conversa REALMENTE não tem nenhum sinal, nunca por não ter
+  procurado — ganho esperado pequeno (o gap medido do modelo já era só 7% quando ele processa a
+  conversa inteira), mas soma com as duas camadas de código acima. **`recuperar-origem-perdida.js`
+  ganhou `--aplicar`** (ver "Scripts manuais" acima) para corrigir o histórico com a MESMA função que
+  passou a rodar em produção. Regressão em `test-pipeline.js` ("vocabulario ampliado" e
+  "detectarRespostaPerguntaOrigem", incluindo os quatro casos de falso-positivo evitado).
   **`PUT /deals/{id}` tem que reenviar `activities`, senão o Moskit recusa o negócio inteiro.** MEDIDO
   em 19/08/2026 no deal 48441223: o PUT é *full replace*, e **omitir** `activities` significa para o
   Moskit "desvincule estas atividades" — o que ele recusa quando alguma já foi concluída, devolvendo
@@ -1065,6 +1351,30 @@ busca o que ela pede. Desligada por padrão (`REUNIAO_RETORNO_ATIVO`) e, quando 
   existia antes. Regressão em `test-pipeline.js` ("buscarOuCriarContato: falha na busca..." e
   "buscarDealPorContato: pagina de verdade..."). Os 14 pares já criados continuam duplicados no CRM —
   correção de código não desfaz o que já aconteceu; religar/mesclar é trabalho manual da equipe.
+  **A SEGUNDA causa de contato duplicado, achada em 03/09/2026: o telefone era comparado INTEIRO, e o
+  mesmo número com e sem DDI não casava.** A correção de 24/08 tratou "rede instável ≠ contato novo";
+  esta trata "formato diferente ≠ pessoa diferente". `buscarOuCriarContato` usava
+  `phoneDigits.slice(-13)` como chave do espelho e `.includes(phoneDigits)` na busca da API — e
+  `.includes` só casa quando o número SALVO é igual ou mais longo que o buscado. Um lead que já
+  existia no Moskit Boost gravado em formato local (`8694751616`) nunca casava com o número que chega
+  do WhatsApp (`558694751616`): virava contato novo + deal duplicado, toda vez. MEDIDO: na aba
+  "Agendamento de Consulta", **46 dos 87 negócios abertos tinham outro negócio no mesmo telefone pelos
+  últimos 8 dígitos, contra 20 pela comparação inteira** — e os 8 pares que sobreviveram à checagem
+  manual eram todos "lead antigo do Boost + deal que o bot criou sem reconhecê-lo". Achado por acaso:
+  um par (Jéssica) que a primeira análise classificou como "telefone diferente" era `558694751616` x
+  `8694751616`. **A comparação certa já existia no projeto e não era usada aqui**: `mesmoTelefone`
+  (`src/telefone.js`) compara os últimos `SUFIXO_COMPARACAO` (8) dígitos, e o comentário dela diz
+  literalmente "sobrevivem a diferenças de DDI/nono dígito" — é a mesma regra que `ehInterno` usa pra
+  decidir se um número é da equipe. Duas respostas diferentes para "esses dois telefones são a mesma
+  pessoa?" dependendo do caminho de código é exatamente o que `src/moskit-ids.js` existe pra evitar.
+  Agora: a busca na API usa `mesmoTelefone`, e o espelho local tenta a chave exata primeiro (índice da
+  PK) e só então um fallback por sufixo — que **desiste quando é ambíguo**, porque dois contatos
+  diferentes com o mesmo sufixo não elegem vencedor por palpite (mesmo "candidato único ou nada" de
+  `decidirDeal`); nesse caso segue para a busca na API, que sabe desempatar. A chave da tabela
+  continua sendo `slice(-13)` de propósito: `moskit_contacts.phone` é PRIMARY KEY e já tem ~4k linhas
+  gravadas nesse formato — trocar o formato exigiria migração sem ganho nenhum, já que o fallback
+  cobre o caso. Regressões em `test-pipeline.js` ("mesmo telefone com e sem DDI e o MESMO cliente":
+  espelho, ambiguidade e busca na API).
 - **Google Calendar**: OAuth2 com conta real do escritório (`autorizar-google.js`, roda uma vez,
   interativo) — necessário para gerar link de Meet e convidar participantes por e-mail.
 - **Telegram**: notifica comprovantes recebidos e conversas descartadas da fila após

@@ -49,6 +49,10 @@ const Database = require('better-sqlite3');
 const axios = require('axios');
 const MOSKIT_IDS = require('./src/moskit-ids');
 const clienteRetorno = require('./src/cliente-retorno');
+// A comparacao de nome+caso da Fase 2 mora em src/duplicidade.js desde 02/09/2026, para o relatorio
+// de auditoria (auditar-crm-relatar.js) usar a MESMA regra em vez de uma copia que diverge sozinha —
+// o mesmo motivo pelo qual src/moskit-ids.js existe. Este arquivo so orquestra e imprime.
+const duplicidade = require('./src/duplicidade');
 require('./index.js'); // so para confirmar que o boot nao lanca com este DB_PATH descartavel
 
 const LIMIAR_SIMILARIDADE = Number(process.env.DUPLICIDADE_LIMIAR_SIMILARIDADE) || 0.5;
@@ -57,16 +61,8 @@ const MOSKIT_BASE = process.env.MOSKIT_BASE || 'https://api.moskitcrm.com/v2';
 const apiHeaders = { apikey: process.env.MOSKIT_API_KEY };
 const PAUSA_MS = Number(process.env.RECONCILIACAO_PAUSA_MS) || 300;
 const MAX_PAGINAS = Number(process.env.MAX_PAGINAS_DEALS) || 500;
-const NOME_LIMIAR = Number(process.env.DUPLICIDADE_NOME_LIMIAR) || 0.75;
-const CASO_LIMIAR = Number(process.env.DUPLICIDADE_CASO_LIMIAR) || 0.4;
-// Tokens sozinhos nao distinguem pessoa nenhuma ("de", "da"...) e um token presente em mais que isso
-// na conta inteira e comum demais pra servir de sinal (evita bucket gigante tipo "silva"/"maria").
-const STOPWORDS_NOME = new Set(['de', 'da', 'do', 'dos', 'das', 'e', 'dr', 'dra', 'sr', 'sra']);
-const TOKEN_BUCKET_MAX = Number(process.env.DUPLICIDADE_TOKEN_BUCKET_MAX) || 400;
-
-const AREA_ID_PARA_LABEL = Object.fromEntries(
-  Object.entries(MOSKIT_IDS.AREA_DIREITO).map(([label, id]) => [id, label])
-);
+// Limiares e stopwords vivem em src/duplicidade.js (mesma leitura de env, mesmos numeros).
+const { LIMIARES_PADRAO, AREA_ID_PARA_LABEL } = duplicidade;
 
 function parseJsonSeguro(texto, padrao) {
   try {
@@ -80,15 +76,7 @@ function parseJsonSeguro(texto, padrao) {
 // Jaccard sobre tokens normalizados (MOSKIT_IDS.normalizarChave: minusculo/sem-acento/sem-pontuacao).
 // Sinal NOVO desta auditoria, a producao nao usa nada parecido — serve so para priorizar revisao
 // manual, nunca para decidir sozinho (por isso nao entra em cliente-retorno.js).
-function similaridadeTexto(a, b) {
-  const tokA = new Set(MOSKIT_IDS.normalizarChave(a).split(' ').filter(Boolean));
-  const tokB = new Set(MOSKIT_IDS.normalizarChave(b).split(' ').filter(Boolean));
-  if (!tokA.size || !tokB.size) return 0;
-  let inter = 0;
-  for (const t of tokA) if (tokB.has(t)) inter++;
-  const uniao = new Set([...tokA, ...tokB]).size;
-  return uniao ? inter / uniao : 0;
-}
+const { similaridadeTexto } = duplicidade;
 
 // Mesma comparacao de src/cliente-retorno.js:decidirRetorno (linhas 144-166), reaplicada fora do
 // runtime — aqui nao temos mensagens/obsValidas do atendimento antigo, so o par
@@ -280,20 +268,8 @@ function fase1(caminhoBanco) {
 // FASE 2 — rede real contra o Moskit (--sondar-crm)
 // ---------------------------------------------------------------------------------------------
 
-// "{nome} - {assunto}" (montarPayloadMoskit, index.js:1433-1436) — so o PRIMEIRO " - " conta, porque
-// o assunto em si pode conter um traco ("Guarda - regulamentacao de visitas").
-function extrairNomeCaso(nomeDeal) {
-  const nome = String(nomeDeal || '');
-  const idx = nome.indexOf(' - ');
-  if (idx === -1) return { nomeParte: nome, casoParte: null };
-  return { nomeParte: nome.slice(0, idx), casoParte: nome.slice(idx + 3) };
-}
-
-function tokensDoTexto(texto) {
-  return MOSKIT_IDS.normalizarChave(texto)
-    .split(' ')
-    .filter((t) => t.length >= 2 && !STOPWORDS_NOME.has(t));
-}
+// Split "{nome} - {assunto}" e tokenizacao: src/duplicidade.js.
+const { extrairNomeCaso, tokensDoTexto } = duplicidade;
 
 // MEDIDO na primeira rodada (24/08/2026): boa parte dos ~2793 deals do Moskit Boost/manuais NAO
 // segue o padrao "{nome} - {assunto}" do bot — vem como "Remoção - Gleibson" (o nome da PESSOA cai
@@ -308,32 +284,7 @@ function tokensDoTexto(texto) {
 // nao conta como sinal sozinho. So os tokens RAROS (poucos deals na conta inteira os usam) sao
 // especificos o bastante pra apontar pra uma pessoa/caso real. E o mesmo raciocinio de IDF, aplicado
 // sem nenhuma biblioteca externa.
-function calcularFrequenciaTokens(deals) {
-  const freq = new Map();
-  for (const d of deals) {
-    for (const t of new Set(d.tokensCompletos)) {
-      freq.set(t, (freq.get(t) || 0) + 1);
-    }
-  }
-  return freq;
-}
-
-// Containment (intersecao / menor conjunto), mais tolerante que Jaccard pra nome: "Ana Paula Silva"
-// vs "Ana Paula" tem containment 1.0 (o nome curto e um subconjunto legitimo do longo), Jaccard puniria.
-function similaridadeContainment(tokensA, tokensB) {
-  const a = new Set(tokensA);
-  const b = new Set(tokensB);
-  if (!a.size || !b.size) return 0;
-  let inter = 0;
-  for (const t of a) if (b.has(t)) inter++;
-  return inter / Math.min(a.size, b.size);
-}
-
-function decodificarArea(entityCustomFields) {
-  const campo = (entityCustomFields || []).find((c) => c.id === MOSKIT_IDS.CF.AREA_DIREITO);
-  const idOpcao = campo?.options?.[0];
-  return idOpcao ? (AREA_ID_PARA_LABEL[idOpcao] || `id:${idOpcao}`) : null;
-}
+const { calcularFrequenciaTokens, similaridadeContainment, decodificarArea } = duplicidade;
 
 async function paginarTodosDeals() {
   const deals = [];
@@ -358,21 +309,7 @@ async function paginarTodosDeals() {
       contactsNaListagem = Array.isArray(lote[0].contacts) && lote[0].contacts.length > 0;
       console.log(`  ℹ️ contacts[] vem na listagem? ${contactsNaListagem ? 'sim' : 'nao'} (${contactsNaListagem ? 'sinal de mesmo-contato disponivel sem GET extra' : 'sem sinal de mesmo-contato nesta varredura'})`);
     }
-    for (const d of lote) {
-      const { nomeParte, casoParte } = extrairNomeCaso(d.name);
-      deals.push({
-        id: d.id,
-        name: d.name || '',
-        origin: d.origin || null,
-        status: d.status || null,
-        dateCreated: d.dateCreated || null,
-        contactId: Array.isArray(d.contacts) && d.contacts.length ? d.contacts[0].id : null,
-        nomeParte,
-        casoParte,
-        tokensCompletos: tokensDoTexto(d.name), // nome INTEIRO — nao confia em qual lado do "-" tem a pessoa
-        areaLabel: decodificarArea(d.entityCustomFields),
-      });
-    }
+    for (const d of lote) deals.push(duplicidade.normalizarDeal(d));
     pagina++;
     if (pagina % 25 === 0) console.log(`  ... ${pagina} paginas lidas, ${deals.length} deals vistos`);
     if (lote.length < 10) break; // pagina incompleta = fim da lista
@@ -398,16 +335,8 @@ async function paginarTodosDeals() {
 // Moskit Boost), mas dentro de SO os deals do bot pode nao ser — recalcula por universo, nunca reusa
 // a frequencia da conta inteira quando o universo mudou (--so-bot).
 function aplicarFrequenciaTokens(deals) {
-  const freq = calcularFrequenciaTokens(deals);
-  const LIMIAR_GENERICO = Number(process.env.DUPLICIDADE_TOKEN_DOCFREQ_MAX) || 5;
-  for (const d of deals) {
-    // dedupe: token repetido dentro do MESMO nome ("...Pessoa De Aguiar... Lucas Pessoa") empurraria
-    // o mesmo indice de deal duas vezes no bucket de montarParesCandidatos, formando um par consigo
-    // mesmo (i,i) — nao e duplicidade nenhuma, e artefato de tokenizacao.
-    d.tokensEspecificos = [...new Set(d.tokensCompletos.filter((t) => (freq.get(t) || 0) <= LIMIAR_GENERICO))];
-    d.freqTokens = freq;
-  }
-  console.log(`ℹ️ ${deals.length} deal(s) no universo comparado; token generico = aparece em mais de ${LIMIAR_GENERICO} deal(s) DESSE universo\n`);
+  const { docFreqMax } = duplicidade.aplicarFrequenciaTokens(deals);
+  console.log(`ℹ️ ${deals.length} deal(s) no universo comparado; token generico = aparece em mais de ${docFreqMax} deal(s) DESSE universo\n`);
   return deals;
 }
 
@@ -415,66 +344,7 @@ function aplicarFrequenciaTokens(deals) {
 // que compartilha >=2 tokens especificos, ou 1 token raro o bastante (docFreq<=2 — aparece em no
 // maximo 2 deals da conta inteira) — um unico token comum-mas-nao-genérico sozinho (ex. um primeiro
 // nome bem distribuido) nao basta.
-function montarParesCandidatos(deals) {
-  const porToken = new Map();
-  deals.forEach((d, i) => {
-    for (const t of d.tokensEspecificos) {
-      if (!porToken.has(t)) porToken.set(t, []);
-      porToken.get(t).push(i);
-    }
-  });
-
-  const tokensCompartilhados = new Map(); // "i_j" -> Set de tokens
-  for (const [token, indices] of porToken) {
-    if (indices.length < 2 || indices.length > TOKEN_BUCKET_MAX) continue;
-    for (let a = 0; a < indices.length; a++) {
-      for (let b = a + 1; b < indices.length; b++) {
-        const i = indices[a], j = indices[b];
-        if (i === j) continue; // defesa extra: nunca formar par de um deal consigo mesmo
-        const chave = i < j ? `${i}_${j}` : `${j}_${i}`;
-        if (!tokensCompartilhados.has(chave)) tokensCompartilhados.set(chave, new Set());
-        tokensCompartilhados.get(chave).add(token);
-      }
-    }
-  }
-
-  const freq = deals[0]?.freqTokens || new Map();
-  const candidatos = [];
-  for (const [chave, tokens] of tokensCompartilhados) {
-    const raroBastante = tokens.size >= 2 || [...tokens].some((t) => (freq.get(t) || 0) <= 2);
-    if (!raroBastante) continue;
-    candidatos.push(chave.split('_').map(Number));
-  }
-  return candidatos;
-}
-
-function classificarParNomeCaso(a, b) {
-  const nomeIgual = a.nomeParte && b.nomeParte
-    && MOSKIT_IDS.normalizarChave(a.nomeParte) === MOSKIT_IDS.normalizarChave(b.nomeParte);
-  // Similaridade calculada so sobre os tokens ESPECIFICOS (sem os genericos) — mede quanto do que e
-  // DISTINTIVO em cada nome aparece no outro, ignorando tipo-de-caso e sobrenome populacional.
-  const nomeSimilaridade = similaridadeContainment(a.tokensEspecificos, b.tokensEspecificos);
-
-  const casoSimilaridade = (a.casoParte && b.casoParte) ? similaridadeTexto(a.casoParte, b.casoParte) : null;
-  const areaIgual = a.areaLabel && b.areaLabel ? a.areaLabel === b.areaLabel : null;
-  const mesmoContato = a.contactId && b.contactId ? a.contactId === b.contactId : null;
-
-  if (!nomeIgual && nomeSimilaridade < NOME_LIMIAR && mesmoContato !== true) return null;
-
-  // "Area igual" sozinho NUNCA e prova de mesmo caso (so 11 areas possiveis na conta inteira — duas
-  // pessoas diferentes caem na mesma o tempo todo). So conta com o contato batendo no CRM ou o texto
-  // do "caso" de fato parecido.
-  const casoParece = mesmoContato === true || (casoSimilaridade !== null && casoSimilaridade >= CASO_LIMIAR);
-
-  let categoria;
-  if (casoParece) categoria = 'mesmo_nome_mesmo_caso';
-  else if (casoSimilaridade !== null || areaIgual !== null) categoria = 'mesmo_nome_caso_diferente';
-  else categoria = 'mesmo_nome_sem_info_de_caso';
-
-  return {
-    categoria, nomeIgual, nomeSimilaridade, casoSimilaridade, areaIgual, mesmoContato,
-  };
-}
+const { montarParesCandidatos, classificarParNomeCaso } = duplicidade;
 
 function relatorioFase2(deals, pares) {
   const grupos = { mesmo_nome_mesmo_caso: [], mesmo_nome_caso_diferente: [], mesmo_nome_sem_info_de_caso: [] };
@@ -486,7 +356,7 @@ function relatorioFase2(deals, pares) {
     grupos[r.categoria].push({ a, b, ...r });
   }
 
-  console.log(`\n📊 FASE 2 — pares candidatos por nome parecido/igual (limiar nome ${NOME_LIMIAR}, limiar caso ${CASO_LIMIAR}):\n`);
+  console.log(`\n📊 FASE 2 — pares candidatos por nome parecido/igual (limiar nome ${LIMIARES_PADRAO.nome}, limiar caso ${LIMIARES_PADRAO.caso}):\n`);
   console.log(`  ⚠️ mesmo_nome_mesmo_caso: ${grupos.mesmo_nome_mesmo_caso.length}  (candidato principal a duplicidade real)`);
   console.log(`     mesmo_nome_caso_diferente: ${grupos.mesmo_nome_caso_diferente.length}  (pode ser retorno legitimo — pessoa homonima ou caso novo)`);
   console.log(`     mesmo_nome_sem_info_de_caso: ${grupos.mesmo_nome_sem_info_de_caso.length}  (nome bate, mas nao ha assunto/area/contato pra confirmar)`);

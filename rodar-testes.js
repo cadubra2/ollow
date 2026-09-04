@@ -18,6 +18,7 @@ const path = require('path');
 
 const TESTES = [
   'test-telefone.js',
+  'test-auditoria-crm.js',
   'test-moskit-ids.js',
   'test-atividade-moskit.js',
   'test-evidencia.js',
@@ -27,6 +28,7 @@ const TESTES = [
   'test-rotas.js',
   'test-pipeline.js',
   'test-agenda-dry-run.js',
+  'test-bloqueio-campos-obrigatorios-dry-run.js',
   'test-guards-internos.js',
   'test-agendamento-bloco-mensagens.js',
   'test-transcricao.js',

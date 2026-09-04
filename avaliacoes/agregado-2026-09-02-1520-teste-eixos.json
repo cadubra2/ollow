@@ -1,0 +1,158 @@
+{
+  "gerado_em": "2026-09-02T18:20:37.456Z",
+  "opcoes": {
+    "soGratis": false,
+    "rubrica": false,
+    "semEstado": false,
+    "limite": 25,
+    "concorrencia": 2,
+    "seed": 42
+  },
+  "modelo": "gpt-4o-mini",
+  "camada0": {
+    "conversas": 277,
+    "mensagens": 8730,
+    "por_acao": {
+      "inviavel": 197,
+      "interno": 10,
+      "aguardar": 19,
+      "atualizar_campos": 24,
+      "criar": 21,
+      "nota": 6
+    },
+    "acima_de_100_mensagens": 26,
+    "mensagens_mediana": 11,
+    "placeholders_de_anexo": 393,
+    "placeholders_de_audio_transcrito": 80,
+    "conteudo_perdido": 313,
+    "conteudo_perdido_do_cliente": 165,
+    "conversas_com_placeholder": 97,
+    "placeholders_por_tipo": {
+      "equipe - image": 77,
+      "equipe - audio": 28,
+      "equipe - file": 66,
+      "equipe - arquivo nomeado": 3,
+      "cliente - arquivo nomeado": 26,
+      "cliente - image": 67,
+      "cliente - imagem": 28,
+      "cliente - audio": 52,
+      "cliente - figurinha": 1,
+      "cliente - file": 43,
+      "outro": 2
+    },
+    "com_last_data": 74,
+    "sem_resumo": 2,
+    "resumo_chars": {
+      "min": 59,
+      "mediana": 330,
+      "max": 572
+    },
+    "literais_nao_mencionado": 105,
+    "literais_por_resumo": 1.46,
+    "preenchimento_por_campo": {
+      "nome": 64,
+      "assunto": 59,
+      "origem": 72,
+      "advogado_responsavel": 58,
+      "captacao": 57,
+      "tipo_consulta": 69,
+      "area_direito": 63,
+      "pagamento_confirmado": 72,
+      "data_hora_consulta": 26,
+      "email_cliente": 3,
+      "estagio_funil_sugerido": 0,
+      "modalidade_consulta": 46,
+      "status_negocio_sugerido": 0,
+      "motivo_perda_sugerido": 0,
+      "resumo_atendimento": 72,
+      "cpf": 0,
+      "profissao": 0,
+      "estado_civil": 0,
+      "endereco": 0,
+      "valor_honorarios_inicial": 0,
+      "valor_honorarios_liminar": 0,
+      "valor_mensalidade": 0
+    },
+    "base_do_preenchimento": 74
+  },
+  "camada1": {
+    "por_portao": {
+      "B1_inviavel": 18,
+      "ok_atualizar_campos": 3,
+      "modelo_aguardar": 3,
+      "ok_atualizar_campos_com_lacuna": 1
+    },
+    "b4_descartados": 0,
+    "campos_que_seguraram": {
+      "assunto": 1,
+      "area_direito": 1,
+      "advogado_responsavel": 1
+    },
+    "perfil_do_resumo": {
+      "resumos": 7,
+      "resumo_chars": {
+        "min": 105,
+        "mediana": 419,
+        "max": 627
+      },
+      "literais_nao_mencionado": 0,
+      "literais_por_resumo": 0,
+      "preenchimento_da_rodada": {
+        "nome": 6,
+        "assunto": 7,
+        "origem": 7,
+        "advogado_responsavel": 3,
+        "captacao": 5,
+        "tipo_consulta": 7,
+        "area_direito": 3,
+        "pagamento_confirmado": 7,
+        "data_hora_consulta": 2,
+        "email_cliente": 1,
+        "estagio_funil_sugerido": 0,
+        "modalidade_consulta": 7,
+        "status_negocio_sugerido": 0,
+        "motivo_perda_sugerido": 0,
+        "resumo_atendimento": 7,
+        "cpf": 0,
+        "profissao": 0,
+        "estado_civil": 0,
+        "endereco": 0,
+        "valor_honorarios_inicial": 0,
+        "valor_honorarios_liminar": 0,
+        "valor_mensalidade": 0
+      },
+      "preenchimento_acumulado": {
+        "nome": 7,
+        "assunto": 6,
+        "origem": 7,
+        "advogado_responsavel": 5,
+        "captacao": 6,
+        "tipo_consulta": 7,
+        "area_direito": 5,
+        "pagamento_confirmado": 7,
+        "data_hora_consulta": 2,
+        "email_cliente": 1,
+        "estagio_funil_sugerido": 0,
+        "modalidade_consulta": 7,
+        "status_negocio_sugerido": 0,
+        "motivo_perda_sugerido": 0,
+        "resumo_atendimento": 7,
+        "cpf": 0,
+        "profissao": 0,
+        "estado_civil": 0,
+        "endereco": 0,
+        "valor_honorarios_inicial": 0,
+        "valor_honorarios_liminar": 0,
+        "valor_mensalidade": 0
+      },
+      "base_do_preenchimento": 7
+    },
+    "uso": {
+      "chamadas": 32,
+      "entrada": 103397,
+      "saida": 4176
+    },
+    "custo_usd": 0.01801515,
+    "modelo": "gpt-4o-mini"
+  }
+}

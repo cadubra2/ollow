@@ -102,6 +102,59 @@ console.log('\n=== hashTextoBriefing: dedup ===');
   checar('  mudanca de horario muda o hash', hashTextoBriefing(comHorarioA) !== hashTextoBriefing(comHorarioB), true);
 }
 
+console.log('\n=== linha de pendencia: briefing com lacuna anotada, em vez de briefing nenhum ===');
+
+{
+  // O portao antigo era `pendentes.length === 0` no ramo atualizar_campos, e ele nunca abria quando
+  // ninguem descrevia o caso: aplicarGateCasoDescrito anula area_direito e advogado_responsavel de
+  // proposito, e os dois sao obrigatorios. Resultado medido em 02/09/2026: 14 resumos pagos e
+  // descartados em 277 conversas. Agora a lacuna e DITA, e estes testes vigiam a linha que a diz.
+  const SEM_CASO = { modalidade_consulta: 'online', resumo_atendimento: NARRATIVA };
+  const comPendentes = montarTextoBriefing({
+    dados: SEM_CASO, contato: 'Maria', telefone: '5586987654321',
+    pendentes: ['area_direito', 'advogado_responsavel'],
+  });
+  checar('  linha de pendencia aparece', comPendentes.includes('⚠️ Ainda não confirmado:'), comPendentes);
+  checar('  com rotulo legivel, nao com o slug',
+    comPendentes.includes('área do direito, advogado responsável')
+    && !comPendentes.includes('area_direito'), comPendentes);
+  checar('  a narrativa continua vindo depois', comPendentes.includes(`\n\n${NARRATIVA}`), comPendentes);
+  checar('  a linha de pendencia e a ULTIMA do cabecalho',
+    comPendentes.split('\n\n')[0].split('\n').pop().startsWith('⚠️'), comPendentes.split('\n\n')[0]);
+
+  const semPendentes = montarTextoBriefing({
+    dados: SEM_CASO, contato: 'Maria', telefone: '5586987654321', pendentes: [],
+  });
+  checar('  lista vazia nao produz linha', !semPendentes.includes('Ainda não confirmado'), semPendentes);
+
+  const ausente = montarTextoBriefing({ dados: SEM_CASO, contato: 'Maria', telefone: '5586987654321' });
+  checar('  argumento ausente nao produz linha (compatibilidade)',
+    !ausente.includes('Ainda não confirmado'), ausente);
+  checar('  ausente e lista vazia dao o MESMO texto', ausente === semPendentes, { ausente, semPendentes });
+
+  // Sem isto o briefing nao se atualiza quando um campo e finalmente preenchido: o texto muda, mas
+  // se o hash nao mudasse, registrarBriefing trataria como "briefing inalterado" e nao repostaria.
+  const doisPendentes = hashTextoBriefing(comPendentes);
+  const umPendente = hashTextoBriefing(montarTextoBriefing({
+    dados: SEM_CASO, contato: 'Maria', telefone: '5586987654321', pendentes: ['area_direito'],
+  }));
+  checar('  mudar o conjunto de pendentes muda o hash', doisPendentes !== umPendente, true);
+  checar('  preencher tudo muda o hash', doisPendentes !== hashTextoBriefing(semPendentes), true);
+
+  // Campo fora do mapa de rotulos nao pode sumir da nota nem quebrar: cai como o proprio slug.
+  const desconhecido = montarTextoBriefing({
+    dados: SEM_CASO, contato: 'Maria', telefone: '5586987654321', pendentes: ['campo_novo_qualquer'],
+  });
+  checar('  slug sem rotulo cadastrado aparece cru, em vez de desaparecer',
+    desconhecido.includes('⚠️ Ainda não confirmado: campo_novo_qualquer'), desconhecido);
+
+  // Nada de nada: sem dados e sem narrativa, o texto continua vazio — a linha de pendencia sozinha
+  // nao pode fazer registrarBriefing postar uma nota sem conteudo nenhum.
+  const soPendentes = montarTextoBriefing({ dados: {}, pendentes: ['assunto'] });
+  checar('  so pendentes, sem narrativa: texto NAO fica vazio mas tambem nao inventa cabecalho',
+    soPendentes === '⚠️ Ainda não confirmado: assunto', soPendentes);
+}
+
 console.log('\n=== limparTelefone ===');
 
 {

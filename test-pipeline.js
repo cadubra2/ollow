@@ -28,6 +28,10 @@ process.env.FUNIL_FECHAMENTO_DRY_RUN = 'true';
 // impede que um .env de producao com a flag ligada faca esses testes passarem por engano, sem
 // escrever nada. O caminho desligado tem arquivo proprio: test-agenda-dry-run.js.
 process.env.AGENDA_MOSKIT_DRY_RUN = 'false';
+// Mesmo motivo: BLOQUEIO_CAMPOS_OBRIGATORIOS_DRY_RUN nasce em 'true' (so loga). O caminho que
+// realmente precisa de regressao e o bloqueio LIGADO — o caminho dry-run (loga mas cria mesmo assim)
+// tem arquivo proprio: test-bloqueio-campos-obrigatorios-dry-run.js.
+process.env.BLOQUEIO_CAMPOS_OBRIGATORIOS_DRY_RUN = 'false';
 // Mesmo motivo: fixar os limites da reconciliacao de vinculo (defaults identicos aos de producao)
 // para o teste nao depender de um .env que esteja em outro valor.
 process.env.VINCULO_MAX_TENTATIVAS = '3';
@@ -62,16 +66,13 @@ for (const metodo of ['get', 'post', 'put', 'patch', 'delete']) {
 }
 
 // ---------- dublê da OpenAI ----------
-// openaiChat fala HTTPS direto (sem SDK), entao o dublê e no https.request — e ele existe tambem para
-// tapar um buraco antigo: processarNotaReuniao chama a OpenAI de verdade, e este arquivo nao
-// interceptava https.request. Rodar a suite numa maquina com OPENAI_API_KEY valida gastava credito, e
-// sem rede a chamada virava unhandledRejection.
+// openaiChat fala HTTPS direto (sem SDK), entao o dublê e no https.request. Rodar a suite numa
+// maquina com OPENAI_API_KEY valida gastava credito, e sem rede a chamada virava unhandledRejection.
 //
-// Fila explicita por cenario; sem resposta enfileirada, devolve `{}` — que para a rotina de notas
-// significa 'extracao vazia' (caminho ja tratado) e nunca uma extracao inventada que passasse por boa.
+// Fila explicita por cenario; sem resposta enfileirada, devolve `{}`.
 const httpsModulo = require('https');
 const { EventEmitter } = require('events');
-const openai = { respostas: [], prompts: [] };
+const openai = { respostas: [], prompts: [], hosts: [] };
 httpsModulo.request = (opcoes, cb) => {
   const corpo = [];
   const res = new EventEmitter();
@@ -80,11 +81,13 @@ httpsModulo.request = (opcoes, cb) => {
     write: (c) => corpo.push(String(c)),
     destroy: () => {},
     end: () => {
+      openai.hosts.push(opcoes && opcoes.hostname);
       openai.prompts.push(corpo.join(''));
       const resposta = openai.respostas.shift() || {};
+      const texto = JSON.stringify(resposta);
       setImmediate(() => {
         cb(res);
-        res.emit('data', JSON.stringify({ choices: [{ message: { content: JSON.stringify(resposta) } }] }));
+        res.emit('data', JSON.stringify({ choices: [{ message: { content: texto } }] }));
         res.emit('end');
       });
     },
@@ -119,7 +122,7 @@ google.calendar = () => ({
 const {
   moverParaEstagio, criarNotaMoskit, aplicarViradaCobranca, atualizarNegocioMoskit,
   handleAgendamentoCalendar, listarAtividadesMoskit, finalizarCiclo,
-  aplicarGateCasoDescrito, deveEsperarCasoDescrito, aplicarPadroesDeterministicosDeOrigem, registrarBriefing, mergeDados,
+  aplicarGateCasoDescrito, deveEsperarCasoDescrito, deveEsperarCamposObrigatorios, aplicarPadroesDeterministicosDeOrigem, detectarRespostaPerguntaOrigem, registrarBriefing, mergeDados,
   mesclarParaCrm, derivarAdvogadoDaArea, detectarOpcoesInvalidas, registrarOpcoesInvalidas,
   reconciliarClassificacao, reconciliarPendenciasAgendamento, reconciliarVinculoAtividades, montarPayloadMoskit,
   refrescarBriefingsPertoDaConsulta,
@@ -131,6 +134,7 @@ const {
   sincronizarAtividadesMoskit, comSufixoDealId, comMarcadorDeal,
   processarConversaDirect, montarHistorico, equipeEnviouCondicoesDeValor,
   janelaAtendimento, consultaDoAtendimento, lerDealsAnteriores, abrirNovoAtendimento, avisarRetornoUmaVez,
+  camposPendentes, ASSUNTO_NEUTRO,
 } = require('./index');
 const { lerFila, salvarFila } = require('./src/fila');
 const moskitIds = require('./src/moskit-ids');
@@ -390,8 +394,9 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     igual('1 PUT no deal', puts.length, 1);
     igual('   price sobe para 35000', puts[0].corpo.price, 35000);
     igual('   estagio atual preservado (PUT e full replace)', puts[0].corpo.stage.id, 179388);
-    igual('1 nota explicando a virada', notas().length, 1);
-    checar('   a nota cita a reclassificacao', notas()[0].corpo.description.includes('PAGA'));
+    // Decisao de 02/09/2026: a virada bem-sucedida deixou de virar nota (confirmacao de rotina) —
+    // so o PUT do valor/price e o alerta condicional de baixo (evento ja na agenda) permanecem.
+    igual('nenhuma nota (sucesso de rotina, nao vira mais nota)', notas().length, 0);
     igual('sem evento na agenda → nenhum Telegram', telegrams().length, 0);
   }
   {
@@ -462,26 +467,30 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     limpar();
     const row = semear(CHAT, { deal_id: 20 });
     await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, false, row, SO_CLIENTE);
-    igual('so o cliente aceitou → 1 nota de pendencia', notas().length, 1);
-    checar('   a nota diz que NAO foi lancada', notas()[0].corpo.description.includes('NÃO lançada'));
-    checar('   e diz o que falta', notas()[0].corpo.description.includes('DA EQUIPE'));
+    // Pendencia de ROTINA (so falta a confirmacao de um lado, sem remarcacao/descarte/urgencia): ate
+    // 02/09/2026 isso so virava nota, de proposito, pra nao virar ruido diario no Telegram. Com a
+    // nota removida, o Telegram passou a ser o unico alerta tambem para este caso.
+    igual('so o cliente aceitou → nenhuma nota (pendencia nao vira mais nota)', notas().length, 0);
+    igual('   1 Telegram de pendencia', telegrams().length, 1);
+    checar('   o Telegram diz que NAO foi lancada', telegrams()[0].corpo.text.includes('NÃO lançada'));
+    checar('   e diz o que falta', telegrams()[0].corpo.text.includes('DA EQUIPE'));
     igual('   NENHUM evento criado', agenda.insert.length, 0);
     checar('   hash de pendencia gravado', !!linha(CHAT).agendamento_pendente_hash);
 
-    // Sem o hash, a mesma nota sairia a cada ciclo de 5 min enquanto a conversa nao mudasse.
-    const anterior = notas().length;
+    // Sem o hash, o mesmo Telegram sairia a cada ciclo de 5 min enquanto a conversa nao mudasse.
+    const anterior = telegrams().length;
     await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, false, linha(CHAT), SO_CLIENTE);
-    igual('repetir identico → nenhuma nota nova (dedup por hash)', notas().length, anterior);
+    igual('repetir identico → nenhum Telegram novo (dedup por hash)', telegrams().length, anterior);
 
     const outro = { ...SO_CLIENTE, cliente: { ...ACEITE, horario_iso: '2026-08-06T10:00:00' } };
     await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, false, linha(CHAT), outro);
-    igual('horario diferente → nota nova', notas().length, anterior + 1);
+    igual('horario diferente → Telegram novo', telegrams().length, anterior + 1);
   }
   {
     limpar();
     const row = semear(CHAT, { deal_id: null });
     await handleAgendamentoCalendar(null, { ...DADOS }, CHAT, false, row, SO_CLIENTE);
-    igual('sem dealId → nenhuma nota', notas().length, 0);
+    igual('sem dealId → nenhum alerta', notas().length + telegrams().length, 0);
   }
   {
     limpar();
@@ -495,15 +504,16 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     // inclusive um horario que a equipe apenas PROPOS e o cliente nunca respondeu.
     //
     // Esta conversa tambem NAO tem atividade_moskit_id — a auto-cura roda de qualquer forma (ela
-    // nao depende de dupla confirmacao nesta rodada, so do evento no Google ja existir), entao
-    // aparece 1 nota a mais alem da de "nao remarcada".
+    // nao depende de dupla confirmacao nesta rodada, so do evento no Google ja existir), mas a
+    // criacao bem-sucedida da atividade deixou de virar nota (confirmacao de rotina) — so a
+    // pendencia de "nao remarcada" continua saindo.
     limpar();
     const row = semear(CHAT, { deal_id: 20, evento_calendar_criado: 1, evento_calendar_id: 'ev1', evento_calendar_data: '2026-08-05T17:30:00' });
     await handleAgendamentoCalendar(20, { ...DADOS, data_hora_consulta: '2026-08-09T09:00:00' }, CHAT, false, row, SO_CLIENTE);
     igual('reuniao existente sem dupla confirmacao → NAO remarca', agenda.patch.filter((p) => p.requestBody?.start).length, 0);
     checar('   a auto-cura ainda cria a atividade que faltava', atividadesCriadas().length === 1);
-    igual('   2 notas: atividade criada agora + "nao remarcada"', notas().length, 2);
-    checar('   uma delas com o texto certo de "nao remarcada"', notas().some((n) => n.corpo.description.includes('NÃO remarcada')));
+    igual('   nenhuma nota (pendencia de "nao remarcada" so avisa no Telegram)', notas().length, 0);
+    checar('   1 Telegram com o texto certo de "nao remarcada"', telegrams().some((t) => t.corpo.text.includes('NÃO remarcada')));
     checar('   titulo/descricao ainda podem ser corrigidos (nao movem nada)', agenda.get.length >= 1);
   }
 
@@ -526,13 +536,13 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
       atividade_moskit_id: ID_ATIVIDADE,
     });
     await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, false, row, apuracaoPerto);
-    igual('reuniao perto (2h) + pendencia → 1a rodada: 1 nota + 1 Telegram', notas().length, 1);
+    igual('reuniao perto (2h) + pendencia → 1a rodada: nenhuma nota, 1 Telegram', notas().length, 0);
     igual('   Telegram disparado', telegrams().length, 1);
 
     // Rodada seguinte, EXATAMENTE a mesma apuracao (mesmo hash de conteudo) — sem a escalada por
     // proximidade isso seria deduplicado em silencio, igual ao comportamento de antes desta mudanca.
     await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, false, linha(CHAT), apuracaoPerto);
-    igual('   2a rodada, mesmo conteudo → NENHUMA nota nova (dedup de nota continua)', notas().length, 1);
+    igual('   2a rodada, mesmo conteudo → continua sem nota', notas().length, 0);
     igual('   MAS o Telegram repete (bypass por proximidade)', telegrams().length, 2);
   }
   {
@@ -547,11 +557,11 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
       atividade_moskit_id: ID_ATIVIDADE,
     });
     await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, false, row, apuracaoLonge);
-    igual('reuniao longe (10 dias) → 1a rodada: 1 nota + 1 Telegram', notas().length, 1);
+    igual('reuniao longe (10 dias) → 1a rodada: nenhuma nota, 1 Telegram', notas().length, 0);
     igual('   Telegram disparado', telegrams().length, 1);
 
     await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, false, linha(CHAT), apuracaoLonge);
-    igual('   2a rodada, mesmo conteudo, longe → dedup normal (nenhuma nota nova)', notas().length, 1);
+    igual('   2a rodada, mesmo conteudo, longe → dedup normal (nenhum Telegram novo)', notas().length, 0);
     igual('   e NENHUM Telegram novo (sem escalada por proximidade)', telegrams().length, 1);
   }
   {
@@ -570,14 +580,14 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
       atividade_moskit_id: ID_ATIVIDADE,
     });
     await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, false, row, apuracaoDivergente);
-    igual('divergencia de conteudo → 1 nota + 1 Telegram', notas().length, 1);
-    checar('   a nota cita o que esta na agenda', notas()[0].corpo.description.includes('Agenda atual mostra'));
-    checar('   e sinaliza a divergencia', notas()[0].corpo.description.includes('diferente do que foi comunicado'));
+    igual('divergencia de conteudo → nenhuma nota, 1 Telegram', notas().length, 0);
+    checar('   o Telegram cita o que esta na agenda', telegrams()[0].corpo.text.includes('Agenda atual'));
+    checar('   e sinaliza a divergencia', telegrams()[0].corpo.text.includes('diferente do que foi comunicado'));
     checar('   o Telegram cita os dois horarios', telegrams()[0]?.corpo?.text?.includes('Agenda atual') && telegrams()[0]?.corpo?.text?.includes('Horário relatado'));
 
     // Mesma divergencia de novo → dedup por conteudo continua valendo (nao esta na janela de urgencia).
     await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, false, linha(CHAT), apuracaoDivergente);
-    igual('   repetir a MESMA divergencia → nenhuma nota nova', notas().length, 1);
+    igual('   repetir a MESMA divergencia → continua sem nota', notas().length, 0);
     igual('   nenhum Telegram novo', telegrams().length, 1);
   }
 
@@ -663,9 +673,11 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     igual('   banco: evento_calendar_data = horario confirmado', r.evento_calendar_data, '2026-08-05T17:30:00');
     igual('   banco: hash de pendencia limpo', r.agendamento_pendente_hash, null);
 
-    checar('   nota cita a evidencia das duas pernas',
-      notas()[0].corpo.description.includes('pode ser sim') && notas()[0].corpo.description.includes('marquei sua consulta'));
-    checar('   com comprovante verificado, a nota nao alerta', notas()[0].corpo.description.includes('comprovante verificado'));
+    // Decisao de 02/09/2026: a confirmacao de sucesso do agendamento deixou de virar nota
+    // (confirmacao de rotina) — o Telegram (notificarTelegramMeet) e quem avisa a equipe agora.
+    checar('   nenhuma nota de "reuniao agendada" (confirmacao de rotina, nao vira mais nota)',
+      !notas().some((n) => (n.corpo.description || '').includes('Reunião agendada no Google Calendar')),
+      notas().map((n) => n.corpo.description));
   }
 
   {
@@ -717,10 +729,14 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
   }
 
   {
+    // Decisao de 02/09/2026: a confirmacao de sucesso deixou de virar nota — sem comprovante ou
+    // com ele, o agendamento bem-sucedido nao posta nada no deal.
     limpar();
     const row = semear(CHAT, { deal_id: 20 });
     await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, false, row, CONFIRMADO);
-    checar('sem comprovante → a nota avisa em destaque', notas()[0].corpo.description.includes('SEM comprovante verificado'));
+    checar('sem comprovante → tambem nenhuma nota de "reuniao agendada" (so o Telegram avisa)',
+      !notas().some((n) => (n.corpo.description || '').includes('Reunião agendada no Google Calendar')),
+      notas().map((n) => n.corpo.description));
   }
   {
     // Regressao principal do bug "reuniao marcada muito cedo": o horario enviado NAO pode depender
@@ -937,8 +953,13 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     igual('   apontando para o evento que o bot acabou de criar', marca?.evento_calendar_id, 'ev1');
     igual('   e para o deal', marca?.deal_id, 20);
 
-    checar('   a nota do negocio avisa que entrou na agenda do Moskit',
-      notas()[0]?.corpo.description.includes('agenda do Moskit'));
+    // Decisao de 02/09/2026: a confirmacao de sucesso deixou de virar nota — a trava
+    // anti-evento-duplicado acima e o Telegram (notificarTelegramMeet) e que provam que funcionou.
+    // (Outras notas de PENDENCIA, ex. contrato faltando dados, continuam existindo — nao e o caso
+    // que este teste verifica.)
+    checar('   nenhuma nota de "reuniao agendada" (confirmacao de rotina, nao vira mais nota)',
+      !notas().some((n) => (n.corpo.description || '').includes('Reunião agendada no Google Calendar')),
+      notas().map((n) => n.corpo.description));
   }
   {
     // MEDIDO em 14/08/2026 contra a API real (deals 48474073 e 48464876): o Moskit devolveu 2xx com id
@@ -974,9 +995,8 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, true, row, CONFIRMADO);
 
     igual('religacao tambem falha → banco AINDA guarda o atividade_moskit_id (existe, so nao vinculada)', linha(CHAT).atividade_moskit_id, ID_ATIVIDADE);
-    checar('   nota avisa que a atividade NAO ficou vinculada ao negocio',
-      notas().some((n) => n.corpo.description.includes('NAO ficou vinculada')));
-    checar('   e o Telegram tambem avisa (nao pode depender so da nota)',
+    igual('   nenhuma nota (aviso de vinculo agora so no Telegram)', notas().length, 0);
+    checar('   o Telegram avisa que a atividade NAO ficou vinculada ao negocio',
       telegrams().some((t) => JSON.stringify(t.corpo).includes('vínculo com o negócio')));
   }
   {
@@ -1033,8 +1053,11 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     // 10:00 em Fortaleza = 13:00Z. As duas agendas movem juntas; se so o Google mover, a agenda do
     // CRM continua mostrando o horario velho — que parece certo e esta errado.
     igual('   com o novo horario como instante absoluto', atividadesRemarcadas()[0].corpo.dueDate, '2026-08-06T13:00:00.000Z');
-    checar('   e a nota avisa que a agenda do Moskit acompanhou',
-      notas()[0]?.corpo.description.includes('Agenda do Moskit'));
+    // Decisao de 02/09/2026: a remarcacao bem-sucedida deixou de virar nota — o PUT na atividade
+    // acima e o Telegram (notificarTelegramMeet) e que provam que as duas agendas moveram juntas.
+    checar('   nenhuma nota de "reuniao remarcada" (confirmacao de rotina, nao vira mais nota)',
+      !notas().some((n) => (n.corpo.description || '').includes('Reunião remarcada para')),
+      notas().map((n) => n.corpo.description));
   }
   {
     // Conversa com evento no Google mas sem Atividade no Moskit — o caso real achado em 14/08/2026
@@ -1070,8 +1093,11 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     igual('     10:00 em Fortaleza = 13:00Z', putsRemarcacao[0]?.corpo?.dueDate, '2026-08-06T13:00:00.000Z');
     igual('   banco: atividade_moskit_id passa a existir', linha(CHAT).atividade_moskit_id, ID_ATIVIDADE);
     checar('   e entra na trava anti-duplicado', !!sincronizada(ID_ATIVIDADE));
-    checar('   com uma nota avisando que a atividade foi criada agora',
-      notas().some((n) => n.corpo.description.includes('foi criada agora')));
+    // Decisao de 02/09/2026: a auto-cura e a remarcacao bem-sucedidas deixaram de virar nota — os
+    // PUTs de vinculo e remarcacao acima ja provam que a atividade nasceu e foi movida corretamente.
+    checar('   nenhuma nota de "atividade criada agora" nem "reuniao remarcada"',
+      !notas().some((n) => /foi criada agora|Reunião remarcada para/.test(n.corpo.description || '')),
+      notas().map((n) => n.corpo.description));
     igual('   e o evento do Google e remarcado normalmente', agenda.patch.filter((p) => p.requestBody?.start).length, 1);
   }
   {
@@ -1098,9 +1124,9 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     const row = semear(CHAT, { deal_id: 20 });
     await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, true, row, CONFIRMADO);
     igual('POST /activities falhou → o evento do Google foi criado assim mesmo', agenda.insert.length, 1);
-    igual('   banco: atividade_moskit_id fica nulo (proximo ciclo nao tenta de novo, ver nota)', linha(CHAT).atividade_moskit_id, null);
-    checar('   uma nota avisa que a consulta NAO entrou na agenda do Moskit',
-      notas().some((n) => n.corpo.description.includes('NAO entrou na agenda do Moskit')));
+    igual('   banco: atividade_moskit_id fica nulo (proximo ciclo nao tenta de novo, ver Telegram)', linha(CHAT).atividade_moskit_id, null);
+    checar('   um Telegram avisa que a consulta NAO entrou na agenda do Moskit',
+      telegrams().some((t) => t.corpo.text.includes('NAO entrou na agenda do Moskit')));
     checar('   e nenhuma atividade fica marcada como sincronizada', !sincronizada(ID_ATIVIDADE));
   }
   {
@@ -1110,7 +1136,7 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     const row = semear(CHAT, { deal_id: 20 });
     await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, true, row, CONFIRMADO);
     igual('POST /activities 200 sem id → tratado como falha', linha(CHAT).atividade_moskit_id, null);
-    checar('   com aviso no negocio', notas().some((n) => n.corpo.description.includes('NAO entrou na agenda do Moskit')));
+    checar('   com aviso no negocio', telegrams().some((t) => t.corpo.text.includes('NAO entrou na agenda do Moskit')));
   }
 
   // "consulta_agendada" ficou orfa desde que foi mapeada em MOSKIT_STAGE_MAP: nada disparava o
@@ -1123,7 +1149,7 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     const row = semear(CHAT, { deal_id: 20 });
     await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, true, row, CONFIRMADO);
     checar('evento criado agora + estagio anterior → avanca pra "consulta agendada"',
-      notas().some((n) => n.corpo.description.includes('consulta agendada')), notas());
+      telegrams().some((t) => t.corpo.text.includes('Avanço de estágio sugerido')), telegrams());
   }
   {
     // Ramo que faltava cobertura: evento JA existia (nao e criado de novo) e a dupla confirmacao
@@ -1133,7 +1159,7 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     const row = semear(CHAT, { deal_id: 20, evento_calendar_criado: 1, evento_calendar_id: 'ev1', evento_calendar_data: '2026-08-05T17:30:00' });
     await handleAgendamentoCalendar(20, { ...DADOS, data_hora_consulta: '2026-08-05T17:30:00' }, CHAT, true, row, CONFIRMADO);
     checar('evento que ja existia + dupla confirmacao valida → tambem avanca',
-      notas().some((n) => n.corpo.description.includes('consulta agendada')), notas());
+      telegrams().some((t) => t.corpo.text.includes('Avanço de estágio sugerido')), telegrams());
   }
   {
     // Guarda de prioridade: deal ja avancou alem de "consulta agendada" (ex: aguardando_condicao,
@@ -1142,8 +1168,8 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     rede.get = () => ({ status: 200, data: { stage: { id: 285584 } } }); // aguardando_condicao
     const row = semear(CHAT, { deal_id: 20 });
     await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, true, row, CONFIRMADO);
-    checar('deal ja avancado → NENHUMA nota de "consulta agendada"',
-      !notas().some((n) => n.corpo.description.includes('consulta agendada')), notas());
+    checar('deal ja avancado → NENHUM Telegram de "consulta agendada"',
+      !telegrams().some((t) => t.corpo.text.includes('Avanço de estágio sugerido')), telegrams());
   }
   {
     // Marcar como criado sem evento faria o bot achar que a consulta esta na agenda quando nao esta —
@@ -1159,13 +1185,11 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     igual('   sem evento_calendar_id', linha(CHAT).evento_calendar_id, null);
     igual('   MAS a Atividade do Moskit foi criada mesmo assim (desacoplado do Google)', linha(CHAT).atividade_moskit_id, ID_ATIVIDADE);
     checar('   e entra na trava anti-duplicado (sem apontar pra nenhum evento)', !!sincronizada(ID_ATIVIDADE));
-    igual('   nenhuma nota de SUCESSO do Google (📅)', notas().filter((n) => n.corpo.description.startsWith('📅')).length, 0);
-    checar('   1 nota combinada: Moskit marcado + Google/Meet NAO criado',
-      notas().some((n) => n.corpo.description.startsWith('🗓️') && n.corpo.description.includes('NÃO foi criado')), notas());
-    checar('   1 nota de FALHA do agendamento (a mesma que dispara Telegram)',
-      notas().some((n) => n.corpo.description.startsWith('❌') && n.corpo.description.includes("reading 'htmlLink'")));
+    igual('   nenhuma nota (Google/Moskit combinado agora so no Telegram)', notas().length, 0);
+    checar('   1 Telegram avisando que a consulta JA ENTROU no Moskit mas o Google falhou',
+      telegrams().some((t) => t.corpo.text.includes('NÃO agendada') && t.corpo.text.includes("reading 'htmlLink'") && t.corpo.text.includes('JÁ ENTROU')), telegrams());
     checar('   e o estagio AVANCA (a atividade do Moskit conta como consulta marcada)',
-      notas().some((n) => n.corpo.description.includes('consulta agendada')));
+      telegrams().some((t) => t.corpo.text.includes('Avanço de estágio sugerido')));
   }
   {
     // Os DOIS falham: Google (falha real de API) e a Atividade do Moskit tambem. Nem estagio nem
@@ -1182,14 +1206,13 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, true, row, CONFIRMADO);
     igual('os dois falharam → atividade_moskit_id continua nulo', linha(CHAT).atividade_moskit_id, null);
     igual('   evento_calendar_criado continua 0', linha(CHAT).evento_calendar_criado, 0);
-    checar('   nota de falha da Atividade (criarAtividadeMoskit)',
-      notas().some((n) => n.corpo.description.includes('NAO entrou na agenda do Moskit')));
-    checar('   nota de falha do agendamento (Google)',
-      notas().some((n) => n.corpo.description.startsWith('❌') && n.corpo.description.includes("reading 'htmlLink'")));
-    checar('   sem nenhuma nota de sucesso (nem 📅 nem 🗓️ combinada)',
-      !notas().some((n) => n.corpo.description.startsWith('📅') || (n.corpo.description.startsWith('🗓️') && n.corpo.description.includes('NÃO foi criado'))));
+    igual('   nenhuma nota (falhas agora so avisam no Telegram)', notas().length, 0);
+    checar('   Telegram de falha da Atividade (criarAtividadeMoskit)',
+      telegrams().some((t) => t.corpo.text.includes('NAO entrou na agenda do Moskit')));
+    checar('   Telegram de falha do agendamento (Google) — NEM Google NEM Moskit',
+      telegrams().some((t) => t.corpo.text.includes("reading 'htmlLink'") && t.corpo.text.includes('NEM no Google NEM no Moskit')));
     checar('   e SEM avanco de estagio (nada foi marcado em agenda nenhuma)',
-      !notas().some((n) => n.corpo.description.includes('consulta agendada')));
+      !telegrams().some((t) => t.corpo.text.includes('Avanço de estágio sugerido')));
   }
   {
     // Horario invalido com dupla confirmacao VALIDA nao pode ser silencioso. Antes era `return null`
@@ -1203,9 +1226,9 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, true, row, apuracaoRuim);
     igual('horario invalido → nenhum evento, sem crash', agenda.insert.length, 0);
     igual('   banco intocado', linha(CHAT).evento_calendar_criado, 0);
-    igual('   1 nota de FALHA (a equipe fica sabendo)', notas().filter((n) => n.corpo.description.startsWith('❌')).length, 1);
-    checar('   a nota cita o valor recusado', notas()[0].corpo.description.includes('amanha de tarde'));
-    igual('   e nenhuma nota de sucesso', notas().filter((n) => n.corpo.description.startsWith('📅')).length, 0);
+    igual('   1 Telegram de FALHA (a equipe fica sabendo)', telegrams().length, 1);
+    checar('   o Telegram cita o valor recusado', telegrams()[0].corpo.text.includes('amanha de tarde'));
+    igual('   e nenhuma nota (Telegram e o unico canal agora)', notas().length, 0);
   }
   {
     // Eco da data-ancora: o valor que o modelo copiou da "ultima mensagem desta conversa" e o defeito
@@ -1216,7 +1239,7 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
       const row = semear(CHAT, { deal_id: 20 });
       await handleAgendamentoCalendar(20, { ...DADOS }, CHAT, true, row, { ...CONFIRMADO, horarioIso: ruim });
       igual(`eco "${ruim}" → nenhum evento`, agenda.insert.length, 0);
-      igual('   com nota de falha', notas().filter((n) => n.corpo.description.startsWith('❌')).length, 1);
+      igual('   com Telegram de falha', telegrams().length, 1);
     }
   }
   {
@@ -1260,8 +1283,9 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
       apuracao: NADA, acao: 'nota', resumo: 'ok',
     });
     igual('estagio sugerido em dry-run → NENHUM PUT', de('PUT', '/deals/123').length, 0);
-    igual('   so uma nota de sugestao', notas().length, 1);
-    checar('   marcada como dry-run', notas()[0].corpo.description.includes('dry-run'));
+    igual('   nenhuma nota (sugestao agora so no Telegram)', notas().length, 0);
+    igual('   so um Telegram de sugestao', telegrams().length, 1);
+    checar('   marcado como dry-run', telegrams()[0].corpo.text.includes('dry-run'));
   }
   {
     limpar();
@@ -1299,10 +1323,9 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
       obsValidas: [{ tipo: 'equipe_declarou_ganho', msg_idx: 0, trecho: 'assinou o contrato' }],
     });
     igual('ganho em dry-run → NENHUM PUT', de('PUT', '/deals/123').length, 0);
-    igual('   so uma nota de sugestao', notas().length, 1);
-    checar('   marcada como dry-run', notas()[0].corpo.description.includes('dry-run'));
-    checar('   a nota cita o nome do cliente', notas()[0].corpo.description.includes('Fulano de Tal'));
+    igual('   nenhuma nota (sugestao agora so no Telegram)', notas().length, 0);
     const tg = telegrams()[0]?.corpo?.text || '';
+    checar('   marcado como dry-run', tg.includes('dry-run'));
     checar('   o Telegram avisa com o nome do cliente', tg.includes('Fulano de Tal'));
     checar('   ...com o telefone', tg.includes(CHAT));
     checar('   ...com o deal id', tg.includes('123'));
@@ -1319,7 +1342,7 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
       obsValidas: [{ tipo: 'cliente_declarou_perdido', msg_idx: 0, trecho: 'vou contratar outro advogado' }],
     });
     igual('perdido (evidencia do CLIENTE) em dry-run → NENHUM PUT', de('PUT', '/deals/123').length, 0);
-    igual('   so uma nota de sugestao', notas().length, 1);
+    igual('   nenhuma nota (sugestao agora so no Telegram)', notas().length, 0);
     const tgPerdido = telegrams()[0]?.corpo?.text || '';
     checar('   o Telegram avisa o resultado "perdido"', tgPerdido.includes('perdido'));
     checar('   ...com o motivo', tgPerdido.includes('fechou com outro escritorio'));
@@ -1387,6 +1410,78 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     igual('sem caso mas com bloco de condicoes → segue (consulta ja cobrada)', deveEsperarCasoDescrito('criar', false, NADA_CONF, true), false);
     igual('acao "nota" nao e afetada pelo gate', deveEsperarCasoDescrito('nota', false, NADA_CONF, false), false);
     igual('acao "atualizar_campos" nao e afetada', deveEsperarCasoDescrito('atualizar_campos', false, NADA_CONF, false), false);
+  }
+
+  console.log('\n=== gate dos campos obrigatorios: criar sem os 5 completos espera ===');
+  {
+    const NADA_CONF = { confirmado: false, motivo: 'falta_ambos' };
+    const CONF = { confirmado: true, horarioIso: '2026-08-12T14:00:00' };
+    const COMPLETOS = { assunto: 'Guarda', origem: 'Instagram', tipo_consulta: 'consulta paga', area_direito: 'Direito de Familia', advogado_responsavel: 'Bruno' };
+    const FALTA_UM = { ...COMPLETOS, advogado_responsavel: null };
+
+    igual('nenhum campo preenchido, sem gatilho forte → espera', deveEsperarCamposObrigatorios({}, NADA_CONF, false), true);
+    igual('falta so 1 campo, sem gatilho forte → espera', deveEsperarCamposObrigatorios(FALTA_UM, NADA_CONF, false), true);
+    igual('os 5 completos → segue', deveEsperarCamposObrigatorios(COMPLETOS, NADA_CONF, false), false);
+    igual('incompleto mas com dupla confirmacao de horario → segue (agenda/Meet/ZapSign dependem do dealId)', deveEsperarCamposObrigatorios(FALTA_UM, CONF, false), false);
+    igual('incompleto mas com bloco de condicoes enviado → segue (consulta ja cobrada)', deveEsperarCamposObrigatorios(FALTA_UM, NADA_CONF, true), false);
+    igual('assunto placeholder neutro conta como pendente aqui tambem', deveEsperarCamposObrigatorios({ ...COMPLETOS, assunto: ASSUNTO_NEUTRO }, NADA_CONF, false), true);
+  }
+
+  // ============================================================
+  // Teste de integracao via processarConversaDirect: prova que o WIRING (o ponto exato onde o gate
+  // entra, ANTES de buscarOuCriarContato) funciona de ponta a ponta, nao so a funcao pura isolada
+  // acima. A excecao de dupla confirmacao de horario ja esta coberta so no teste unitario (simular
+  // apuracao.confirmado de verdade via pipeline exigiria reconstruir toda a cadeia de observacoes de
+  // horario com mensagens realistas — redundante com o que a funcao pura ja prova isoladamente); a
+  // excecao do bloco de condicoes E testada aqui porque e barata (so uma mensagem com o texto padrao).
+  console.log('\n=== gate dos campos obrigatorios: bloqueio de ponta a ponta via processarConversaDirect ===');
+  {
+    const CHAT_INCOMPLETO = '5586999990098';
+    const MSGS_INCOMPLETO = [
+      { role: 'cliente', text: 'Boa tarde, gostaria de saber sobre um caso de inventario', timestamp: '2026-08-01T10:00:00Z' },
+    ];
+    const CLASSIFICACAO_OK = { classificacao: 'criar_negocio', justificativa: 'lead viavel' };
+    // Falta "tipo_consulta" de proposito: e um dos campos que hoje NAO tem gate nenhum (junto de
+    // origem — mas origem tem fallback automatico em mesclarParaCrm que forca "Nao identificado"
+    // quando fica vazia, entao nunca chega vazia neste ponto; tipo_consulta nao tem esse fallback e
+    // e um alvo real do gate).
+    const extracaoIncompleta = () => ({
+      acao: 'criar', justificativa: 'caso descrito, falta tipo_consulta', confianca: 9,
+      dados: { nome: 'Marcos', assunto: 'Inventario', area_direito: 'Direito de Familia', advogado_responsavel: 'Bruno', tipo_consulta: null, origem: 'Instagram' },
+      observacoes: [{ tipo: 'cliente_descreveu_caso', msg_idx: 0, trecho: 'caso de inventario' }],
+    });
+
+    // ---- sem gatilho forte: bloqueia, nenhum deal nem contato criados ----
+    limpar();
+    db.prepare('DELETE FROM conversations WHERE chat_id = ?').run(CHAT_INCOMPLETO);
+    db.prepare('DELETE FROM moskit_contacts WHERE phone = ?').run(CHAT_INCOMPLETO);
+    semear(CHAT_INCOMPLETO, { messages: JSON.stringify(MSGS_INCOMPLETO) });
+    rede.get = (url) => (url.includes('/contacts') || url.includes('/deals') ? { status: 200, data: [] } : { status: 200, data: {} });
+    openai.respostas = [CLASSIFICACAO_OK, extracaoIncompleta()];
+    openai.prompts = [];
+    await processarConversaDirect(CHAT_INCOMPLETO);
+
+    igual('sem tipo_consulta, sem gatilho forte → last_action vira aguardar', linha(CHAT_INCOMPLETO).last_action, 'aguardar');
+    igual('   nenhum negocio criado', dealsCriados().length, 0);
+    igual('   nenhum contato criado (bloqueia ANTES de buscarOuCriarContato)', de('POST', '/contacts').length, 0);
+
+    // ---- com bloco de condicoes ja enviado: excecao preservada, deal nasce mesmo incompleto ----
+    limpar();
+    db.prepare('DELETE FROM conversations WHERE chat_id = ?').run(CHAT_INCOMPLETO);
+    db.prepare('DELETE FROM moskit_contacts WHERE phone = ?').run(CHAT_INCOMPLETO);
+    semear(CHAT_INCOMPLETO, { messages: JSON.stringify(MSGS_INCOMPLETO.concat([{ role: 'equipe', text: BLOCO_CONDICOES_PAGA, timestamp: '2026-08-01T10:05:00Z' }])) });
+    rede.get = (url) => (url.includes('/deals/') ? { status: 200, data: { id: 8001, status: 'OPEN', stage: { id: 179388 }, activities: [], entityCustomFields: [] } } : { status: 200, data: [] });
+    rede.post = (url) => {
+      if (url.includes('/contacts')) return { status: 201, data: { id: 4343 } };
+      if (url.includes('/deals')) return { status: 200, data: { id: 8001 } };
+      if (url.includes('/activities')) return { status: 200, data: { id: ID_ATIVIDADE } };
+      return { status: 200, data: {} };
+    };
+    openai.respostas = [CLASSIFICACAO_OK, extracaoIncompleta()];
+    openai.prompts = [];
+    await processarConversaDirect(CHAT_INCOMPLETO);
+
+    igual('sem tipo_consulta, MAS com bloco de condicoes enviado → deal nasce mesmo incompleto (excecao preservada)', dealsCriados().length, 1);
   }
 
   // ============================================================
@@ -1460,17 +1555,18 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     igual('divergencia = correcao manual → nao lanca', erro, null);
     igual('   o PUT NAO leva o LGPD do bot', String(areaNoPut(32)), String([ADMIN]));
     igual('   campo travado', String(registro(CHAT_AUT).travados), String([ID_AREA]));
-    igual('   uma nota avisando a trava', notas().length, 1);
-    checar('   ...com o nome do campo', (notas()[0].corpo.description || '').includes('Área do Direito'), notas()[0].corpo.description);
+    igual('   nenhuma nota (trava agora so avisa no Telegram)', notas().length, 0);
+    igual('   um Telegram avisando a trava', telegrams().length, 1);
+    checar('   ...com o nome do campo', telegrams()[0].corpo.text.includes('Área do Direito'), telegrams()[0].corpo.text);
   }
   {
-    // Trava e permanente: no ciclo seguinte o bot nem tenta, e nao repete a nota.
+    // Trava e permanente: no ciclo seguinte o bot nem tenta, e nao repete o aviso.
     limpar();
     semear(CHAT_AUT, { deal_id: 33, custom_fields_bot: JSON.stringify({ [ID_AREA]: [LGPD] }), campos_travados: JSON.stringify([ID_AREA]) });
     rede.get = getsDeAutoria(ADMIN);
     igual('campo travado → nao lanca', await esperarErro(() => atualizarNegocioMoskit(33, DADOS_LGPD, 555, { chatId: CHAT_AUT })), null);
     igual('campo travado continua fora do PUT', String(areaNoPut(33)), String([ADMIN]));
-    igual('   nota de trava nao se repete', notas().length, 0);
+    igual('   Telegram de trava nao se repete', telegrams().length, 0);
   }
   {
     // Campo vazio no CRM: nao ha correcao humana para preservar, o bot preenche normalmente.
@@ -1585,6 +1681,44 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     igual('sem dealId → nao posta nada', await registrarBriefing(null, CHAT_BRIEF, CTX_BRIEF({ nome: 'Fulano', resumo_atendimento: RESUMO_A })), false);
     igual('   nenhuma chamada de rede', rede.chamadas.length, 0);
   }
+  // ============================================================
+  // O CALL SITE com campo obrigatorio pendente. Este era o defeito: no ramo atualizar_campos o
+  // briefing so era postado com `pendentes.length === 0`, e como aplicarGateCasoDescrito anula
+  // area_direito e advogado_responsavel quando ninguem descreveu o caso (e os dois sao
+  // obrigatorios), conversa sem caso descrito nunca recebia briefing nenhum. Medido em 02/09/2026:
+  // 19 conversas barradas em 277, 14 delas com o resumo pronto e pago. Agora posta com a lacuna
+  // dita — e o que este bloco vigia e que `pendentes` CHEGA ao texto da nota, nao so ao console.
+  console.log('\n=== briefing com campo obrigatorio pendente: posta com a lacuna anotada ===');
+  {
+    limpar();
+    semear(CHAT_BRIEF, { deal_id: 42 });
+    const postou = await registrarBriefing(42, CHAT_BRIEF, CTX_BRIEF(
+      { nome: 'Fulano', resumo_atendimento: RESUMO_B },
+      { pendentes: ['area_direito', 'advogado_responsavel'] },
+    ));
+    igual('com pendentes → POSTA (antes nao postava nada)', postou, true);
+    checar('   a nota diz o que falta, com rotulo legivel',
+      corpo().includes('⚠️ Ainda não confirmado: área do direito, advogado responsável'), corpo());
+    checar('   a narrativa continua na nota', corpo().includes('remoção por motivo de saúde'), corpo());
+    checar('   nenhum nome de coluna vaza para a nota', !corpo().includes('area_direito'), corpo());
+  }
+  {
+    // Preencher os campos e reprocessar tem de repostar: o texto mudou (a linha de lacuna saiu), e
+    // sem hash novo o advogado ficaria lendo para sempre a nota que diz que falta area.
+    const postou = await registrarBriefing(42, CHAT_BRIEF, CTX_BRIEF(
+      { nome: 'Fulano', area_direito: 'Direito Administrativo', advogado_responsavel: 'Berto', resumo_atendimento: RESUMO_B },
+      { pendentes: [] },
+    ));
+    igual('lacuna preenchida → reposta com nota nova', postou, true);
+    // A ULTIMA nota, nao a primeira: este bloco nao chama limpar() de proposito (o hash da nota
+    // anterior e justamente o que faz a reposta acontecer), entao notas()[0] ainda e a v1.
+    const ultimo = notas()[notas().length - 1]?.corpo?.description || '';
+    igual('   duas notas na trilha, nao uma reescrita', notas().length, 2);
+    checar('   e a linha de lacuna desaparece da nota nova', !ultimo.includes('Ainda não confirmado'), ultimo);
+    checar('   a nota v1 continua no historico dizendo o que faltava',
+      (notas()[0]?.corpo?.description || '').includes('Ainda não confirmado'), notas()[0]?.corpo?.description);
+    igual('   versao incrementada', linha(CHAT_BRIEF).briefing_versao, 2);
+  }
 
   // ============================================================
   // O furo que sobrou depois do gate: mergeDados ressuscitava o palpite antigo gravado em last_data e o
@@ -1632,6 +1766,34 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
   }
 
   // ============================================================
+  // ACHADO em 03/09/2026 (investigando por que deals do bot com assunto real perdiam o dado sozinhos):
+  // o modelo, seguindo a propria instrucao do prompt, devolve `assunto: "Consulta juridica"` (nao
+  // omite o campo) em toda rodada sem caso novo — e mergeDados tratava isso como dado novo de verdade,
+  // apagando um assunto real capturado numa rodada anterior. `_casoDescritoValidado` so protegia
+  // area/advogado; assunto nunca teve protecao porque o gate deixa o placeholder passar sempre.
+  console.log('\n=== mesclarParaCrm: placeholder do modelo nao apaga assunto real herdado ===');
+  {
+    const rodada1 = mesclarParaCrm(null, { nome: 'Jose Carlos', assunto: 'Pericia de readaptacao', area_direito: 'Direito Previdenciario' }, OBS_CASO);
+    igual('rodada 1 (com evidencia): assunto real entra', rodada1.assunto, 'Pericia de readaptacao');
+
+    const rodada2 = mesclarParaCrm(rodada1, { assunto: 'Consulta jurídica' }, []);
+    igual('rodada 2 (so placeholder, sem caso novo): assunto real sobrevive', rodada2.assunto, 'Pericia de readaptacao');
+  }
+  {
+    // Controle: se NUNCA existiu assunto real, o placeholder tem que continuar passando normalmente
+    // (e o comportamento intencional para deal novo sem caso descrito ainda).
+    const mesclado = mesclarParaCrm(null, { nome: 'Fulano', assunto: 'Consulta jurídica' }, []);
+    igual('sem assunto anterior: placeholder passa normalmente', mesclado.assunto, 'Consulta jurídica');
+  }
+  {
+    // Controle: assunto real NOVO (nao placeholder) continua atualizando por cima do antigo — a
+    // protecao e so contra o placeholder especificamente, nao contra assunto mudar de verdade.
+    const rodada1 = mesclarParaCrm(null, { assunto: 'Pericia de readaptacao' }, OBS_CASO);
+    const rodada2 = mesclarParaCrm(rodada1, { assunto: 'Aposentadoria por invalidez' }, OBS_CASO);
+    igual('assunto real novo substitui o real antigo normalmente', rodada2.assunto, 'Aposentadoria por invalidez');
+  }
+
+  // ============================================================
   // Regra deterministica de origem: "pagina/instagram do socio" e "site do escritorio" nao podem
   // depender do modelo lembrar disso a cada rodada. MEDIDO em 21/08/2026 (deal 48206716): a regex
   // antiga usava "pagina" sem acento e nunca batia contra "página" (a grafia mais comum), entao a
@@ -1672,6 +1834,137 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     aplicarPadroesDeterministicosDeOrigem(dados, msgs);
     igual('sem sinal nenhum: nao mexe no que a IA ja tinha extraido', dados.origem, 'Instagram');
     igual('   captacao tambem intocada', dados.captacao, 'Iury');
+  }
+
+  // ============================================================
+  // Vocabulario ampliado em 02/09/2026: decisao do escritorio de tentar ao MAXIMO identificar a
+  // origem antes de aceitar "Nao identificado" — expande aplicarPadroesDeterministicosDeOrigem alem
+  // de socio/site, com os mesmos cuidados de falso positivo ja medidos em producao (Google Meet,
+  // "danos materiais").
+  console.log('\n=== aplicarPadroesDeterministicosDeOrigem: vocabulario ampliado ===');
+  {
+    const msgs = [{ role: 'cliente', text: 'Vi um caso parecido no JusBrasil e queria saber se voces atendem isso.' }];
+    igual('JusBrasil', aplicarPadroesDeterministicosDeOrigem({ origem: null }, msgs).origem, 'JusBrasil');
+  }
+  {
+    const msgs = [{ role: 'cliente', text: 'Assisti um video de voces no Youtube sobre esse assunto.' }];
+    igual('Youtube', aplicarPadroesDeterministicosDeOrigem({ origem: null }, msgs).origem, 'Youtube');
+  }
+  {
+    const msgs = [{ role: 'cliente', text: 'Achei o perfil de voces no instagram e resolvi chamar.' }];
+    igual('Instagram generico (sem socio) tambem conta', aplicarPadroesDeterministicosDeOrigem({ origem: null }, msgs).origem, 'Instagram');
+  }
+  {
+    const msgs = [{ role: 'cliente', text: 'Vi um artigo sobre isso e fiquei interessado em conversar.' }];
+    igual('"vi um artigo" com verbo de consumo', aplicarPadroesDeterministicosDeOrigem({ origem: null }, msgs).origem, 'Artigo');
+  }
+  {
+    // Armadilha: "artigo" SOZINHO em conversa juridica e most-likely artigo de LEI, nao artigo de
+    // blog/imprensa. Sem o verbo "vi/li" na frente, nao pode acionar — senao toda mencao a "artigo
+    // 927 do codigo civil" viraria origem="Artigo".
+    const msgs = [{ role: 'cliente', text: 'O advogado me falou do artigo 927 do codigo civil.' }];
+    igual('"artigo" sozinho (artigo de LEI) NAO aciona', aplicarPadroesDeterministicosDeOrigem({ origem: null }, msgs).origem, null);
+  }
+  {
+    const msgs = [{ role: 'cliente', text: 'Fui indicado por um amigo que ja foi cliente de voces.' }];
+    igual('indicacao de amigo com contexto explicito', aplicarPadroesDeterministicosDeOrigem({ origem: null }, msgs).origem, 'Indicacao de/ou amigos e parentes');
+  }
+  {
+    // Armadilha: "amigo"/"parente" SOZINHOS sao comuns em conversa juridica sem ser sobre origem
+    // ("meu amigo teve um problema parecido"). So carrega o sinal com verbo/substantivo de indicacao.
+    const msgs = [{ role: 'cliente', text: 'Meu amigo teve um problema parecido e falou que era complicado.' }];
+    igual('"amigo" sozinho (sem indicacao) NAO aciona', aplicarPadroesDeterministicosDeOrigem({ origem: null }, msgs).origem, null);
+  }
+  {
+    const msgs = [{ role: 'cliente', text: 'Ja sou cliente de voces, tive outro caso com o escritorio ano passado.' }];
+    igual('indicacao de clientes (ja foi cliente)', aplicarPadroesDeterministicosDeOrigem({ origem: null }, msgs).origem, 'Indicacao de clientes');
+  }
+  {
+    const msgs = [{ role: 'cliente', text: 'Vi um anuncio de voces passando no feed.' }];
+    igual('VSL/trafego pago (anuncio)', aplicarPadroesDeterministicosDeOrigem({ origem: null }, msgs).origem, 'VSL - Trafego pago');
+  }
+  {
+    const msgs = [{ role: 'cliente', text: 'Cliquei na landing page de voces sobre direito de familia.' }];
+    igual('Landing Page', aplicarPadroesDeterministicosDeOrigem({ origem: null }, msgs).origem, 'Landing Page');
+  }
+  {
+    const msgs = [{ role: 'cliente', text: 'Pesquisei no google e achei voces.' }];
+    igual('"pesquisei no google" (com contexto de busca) conta como Site', aplicarPadroesDeterministicosDeOrigem({ origem: null }, msgs).origem, 'Site');
+  }
+  {
+    // Armadilha MEDIDA em 21/08/2026 (deal 48219774): todo evento de consulta agendada injeta o
+    // convite do Google Meet/Calendar no texto ("Informacoes de participacao do Google Meet",
+    // "meet.google.com/..."). "google" isolado NUNCA pode acionar, ou toda consulta marcada viraria
+    // origem="Site".
+    const msgs = [{ role: 'equipe', text: 'Segue o convite: Informacoes de participacao do Google Meet meet.google.com/abc-defg-hij' }];
+    igual('"google" isolado (convite do Meet) NAO aciona', aplicarPadroesDeterministicosDeOrigem({ origem: null }, msgs).origem, null);
+  }
+
+  console.log('\n=== detectarRespostaPerguntaOrigem: equipe pergunta, cliente responde (gap real medido, deal 48317782) ===');
+  {
+    const msgs = [
+      { role: 'equipe', text: 'Voce pode nos contar como conheceu o nosso escritorio? 1.Indicacao 2.Artigo 3.Instagram 4.Youtube', timestamp: '2026-08-01T10:00:00Z' },
+      { role: 'cliente', text: 'verifiquei no instagram', timestamp: '2026-08-01T10:01:00Z' },
+    ];
+    const achado = detectarRespostaPerguntaOrigem(msgs);
+    igual('regressao do deal 48317782: resposta "instagram" apos a pergunta e capturada', achado?.origem, 'Instagram');
+    igual('aplicarPadroesDeterministicosDeOrigem usa esse sinal', aplicarPadroesDeterministicosDeOrigem({ origem: null }, msgs).origem, 'Instagram');
+  }
+  {
+    // Regressao MEDIDA no proprio deal 48317782 (produção, 02/09/2026): a resposta real do cliente so
+    // vem depois de 4 anexos e de ele responder a OUTRA pergunta pendente da equipe (enviar o
+    // contrato) — "Essa e a proposta de distrato da empresa" / "Um dos socios do escritorio foi meu
+    // professor" / "Berto Igor" ×2 / SO ENTAO "E verifiquei no instagram que o escritorio atuava
+    // nessa area". Sem pular anexo e sem janela de varias mensagens, a funcao parava na primeira
+    // mensagem de texto do cliente (que nem menciona canal) e perdia o sinal real.
+    const msgs = [
+      { role: 'equipe', text: 'Voce pode nos contar como conheceu o nosso escritorio? 1.Indicacao 2.Artigo 3.Instagram 4.Youtube' },
+      { role: 'cliente', text: '📎 [cliente enviou: contrato.pdf]' },
+      { role: 'cliente', text: '📎 [cliente enviou uma imagem]' },
+      { role: 'cliente', text: 'Essa e a proposta de distrato da empresa' },
+      { role: 'cliente', text: 'Um dos socios do escritorio foi meu professor' },
+      { role: 'cliente', text: 'Berto Igor' },
+      { role: 'cliente', text: 'E verifiquei no instagram que o escritorio atuava nessa area' },
+    ];
+    igual('anexos e mensagens sem canal antes da resposta real nao fazem a funcao desistir', detectarRespostaPerguntaOrigem(msgs)?.origem, 'Instagram');
+  }
+  {
+    // A janela tem limite (5 mensagens de TEXTO do cliente): resposta real MUITO depois da pergunta
+    // (conversa que segue para outros assuntos) nao deve ser atribuida a ela por acaso.
+    const msgs = [
+      { role: 'equipe', text: 'Como voce conheceu o nosso escritorio?' },
+      { role: 'cliente', text: 'Vou pensar' },
+      { role: 'cliente', text: 'Certo' },
+      { role: 'cliente', text: 'Obrigado' },
+      { role: 'cliente', text: 'Ok' },
+      { role: 'cliente', text: 'Combinado' },
+      { role: 'cliente', text: 'Vi no instagram de voces' }, // 6a mensagem de texto — fora da janela de 5
+    ];
+    igual('resposta fora da janela de 5 mensagens de texto nao e atribuida a pergunta', detectarRespostaPerguntaOrigem(msgs), null);
+  }
+  {
+    const msgs = [
+      { role: 'equipe', text: 'Como voce chegou ate a gente?', timestamp: '2026-08-01T10:00:00Z' },
+      { role: 'cliente', text: 'Vi o artigo que voces publicaram', timestamp: '2026-08-01T10:01:00Z' },
+    ];
+    igual('pergunta com outra frase ("como chegou ate a gente") tambem e reconhecida', detectarRespostaPerguntaOrigem(msgs)?.origem, 'Artigo');
+  }
+  {
+    // Sem resposta do cliente logo em seguida (equipe fala de novo, ou conversa acaba): nao inventa.
+    const msgs = [
+      { role: 'equipe', text: 'Como voce conheceu o nosso escritorio?', timestamp: '2026-08-01T10:00:00Z' },
+      { role: 'equipe', text: 'Pode ser por Instagram, indicacao, site...', timestamp: '2026-08-01T10:01:00Z' },
+    ];
+    igual('pergunta sem resposta do cliente → nao aciona', detectarRespostaPerguntaOrigem(msgs), null);
+  }
+  {
+    // A pergunta em si nao tem sinal de canal nenhum — sem a funcao dedicada, o padrao generico de
+    // "instagram" bateria na PROPRIA pergunta da equipe (que lista as opcoes), atribuindo a origem
+    // errada mesmo sem o cliente ter respondido nada ainda.
+    const msgs = [
+      { role: 'equipe', text: 'Voce pode nos contar como conheceu o nosso escritorio? 1.Indicacao 2.Artigo 3.Instagram 4.Youtube', timestamp: '2026-08-01T10:00:00Z' },
+    ];
+    igual('so a pergunta, sem resposta ainda → nao aciona nada', aplicarPadroesDeterministicosDeOrigem({ origem: null }, msgs).origem, null);
   }
 
   // ============================================================
@@ -1834,6 +2127,54 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
   }
 
   // ============================================================
+  // MEDIDO em 03/09/2026 limpando a aba "Agendamento de Consulta": o MESMO cliente salvo com e sem
+  // DDI nao casava, e cada lead que ja existia no Moskit Boost em formato local virava contato novo
+  // + deal duplicado. 46 dos 87 negocios abertos da aba tinham outro negocio no mesmo telefone pelos
+  // ultimos 8 digitos, contra 20 pela comparacao inteira. `mesmoTelefone` (src/telefone.js) sempre
+  // foi a comparacao certa — so nao era usada aqui.
+  console.log('\n=== buscarOuCriarContato: mesmo telefone com e sem DDI e o MESMO cliente ===');
+  {
+    limpar();
+    const comDdi = '558694751616';   // como chega do WhatsApp
+    const semDdi = '8694751616';     // como o Moskit Boost gravou
+    db.prepare('DELETE FROM moskit_contacts WHERE phone = ? OR phone = ?').run(comDdi.slice(-13), semDdi.slice(-13));
+    db.prepare('INSERT INTO moskit_contacts (phone, moskit_id, name, raw_data) VALUES (?, ?, ?, ?)')
+      .run(semDdi.slice(-13), 7777, 'Jéssica', '{}');
+    let contatoCriado = false;
+    rede.post = (url) => { if (url.includes('/contacts')) contatoCriado = true; return { status: 201, data: { id: 9999 } }; };
+    const id = await buscarOuCriarContato(comDdi, 'Jéssica');
+    igual('espelho gravado SEM DDI é achado pelo número COM DDI', id, 7777);
+    checar('   e nenhum contato duplicado foi criado', !contatoCriado);
+  }
+  {
+    // Contraprova da ambiguidade: dois contatos DIFERENTES com o mesmo sufixo não podem eleger um
+    // vencedor no palpite — cai para a busca na API, que é quem sabe desempatar.
+    limpar();
+    db.prepare("DELETE FROM moskit_contacts WHERE phone LIKE '%99887766'").run();
+    db.prepare('INSERT INTO moskit_contacts (phone, moskit_id, name, raw_data) VALUES (?, ?, ?, ?)').run('5586999887766', 111, 'A', '{}');
+    db.prepare('INSERT INTO moskit_contacts (phone, moskit_id, name, raw_data) VALUES (?, ?, ?, ?)').run('5511999887766', 222, 'B', '{}');
+    rede.get = (url) => (url.includes('/contacts') ? { status: 200, data: [] } : { status: 200, data: {} });
+    rede.post = () => ({ status: 201, data: { id: 3333 } });
+    const id = await buscarOuCriarContato('5521999887766', 'C');
+    igual('sufixo ambíguo (2 contatos) → não escolhe nenhum, segue para a API', id, 3333);
+  }
+  {
+    // O outro lado do bug: a busca na API usava `.includes()`, que só casa quando o número salvo é
+    // igual ou MAIS LONGO que o buscado. Aqui o contato existe no CRM gravado sem DDI.
+    limpar();
+    const comDdi = '558694751617';
+    db.prepare('DELETE FROM moskit_contacts WHERE phone = ?').run(comDdi.slice(-13));
+    rede.get = (url) => (url.includes('/contacts')
+      ? { status: 200, data: [{ id: 5555, name: 'Cliente Antigo', phones: [{ number: '(86) 9475-1617' }] }] }
+      : { status: 200, data: {} });
+    let contatoCriado = false;
+    rede.post = (url) => { if (url.includes('/contacts')) contatoCriado = true; return { status: 201, data: { id: 6666 } }; };
+    const id = await buscarOuCriarContato(comDdi, 'Cliente Antigo');
+    igual('contato do CRM gravado sem DDI é achado na busca da API', id, 5555);
+    checar('   e nenhum contato duplicado foi criado', !contatoCriado);
+  }
+
+  // ============================================================
   console.log('\n=== buscarDealPorContato: pagina de verdade (?start=) e nao conclui "nao existe" numa falha ===');
   {
     limpar();
@@ -1899,13 +2240,13 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     checar('   e nao acusa o valor valido', !invalidas.some((i) => i.campo === 'captacao'), invalidas);
 
     igual('primeira vez → avisa', await registrarOpcoesInvalidas(50, CHAT_OPC, invalidas), true);
-    igual('   uma nota no deal', notas().length, 1);
+    igual('   nenhuma nota (so Telegram agora)', notas().length, 0);
     igual('   um aviso no Telegram', telegrams().length, 1);
-    checar('   a nota diz que o campo ficou em branco', (notas()[0].corpo.description || '').includes('Direito Civil'), notas()[0].corpo.description);
+    checar('   o Telegram diz que o campo ficou em branco', (telegrams()[0].corpo.text || '').includes('Direito Civil'), telegrams()[0].corpo.text);
 
     limpar();
     igual('mesmo conjunto → nao repete', await registrarOpcoesInvalidas(50, CHAT_OPC, invalidas), false);
-    igual('   nenhuma nota nova', notas().length, 0);
+    igual('   nenhum Telegram novo', telegrams().length, 0);
   }
 
   // ============================================================
@@ -1935,6 +2276,64 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     rede.get = () => ({ status: 200, data: seq.shift() });
     await esperarErro(() => atualizarNegocioMoskit(61, DADOS, 555, { chatId: CHAT_NOME }));
     igual('titulo renomeado por humano → preservado', de('PUT', '/deals/61')[0]?.corpo?.name, 'URGENTE - Fulano (ver com o Dr. Bruno)');
+  }
+
+  // ============================================================
+  // O BUG 1d, e a regressao que autoriza o conserto.
+  //
+  // camposPendentes considerava assunto = "Consulta juridica" como PREENCHIDO. Como esse e o
+  // placeholder que o proprio prompt manda usar quando ninguem descreveu o caso, o assunto nunca
+  // voltava a "pendentes" -> o prompt dizia "nenhum campo pendente" -> o modelo escolhia a acao
+  // `nota` -> `nota` nao faz PUT -> o titulo ficava congelado no placeholder para sempre, mesmo
+  // depois de o last_data ja ter o tema real (deals 48407608, 48287898 e 48206720 no corpus).
+  //
+  // O conserto faz essas conversas voltarem a fazer PUT, e e por isso que a segunda metade deste
+  // bloco existe: se o PUT deixasse de respeitar renomeacao humana, o conserto viraria um bug pior
+  // que o original — o bot reescrevendo o titulo que a equipe ajustou a mao. Se estes testes
+  // cairem, a linha em camposPendentes volta atras.
+  console.log('');
+  console.log('=== assunto placeholder conta como PENDENTE (descongela o titulo) ===');
+  {
+    const base = { origem: 'Instagram', tipo_consulta: 'consulta gratis', area_direito: 'Direito de Familia', advogado_responsavel: 'Berto' };
+    igual('assunto = "Consulta juridica" → PENDENTE', String(camposPendentes({ ...base, assunto: ASSUNTO_NEUTRO })), 'assunto');
+    // Sem acento e minusculo: e a forma que o prompt manda o modelo devolver, e ehAssuntoNeutro
+    // normaliza os dois lados. Se essa normalizacao quebrar, metade dos casos reais escapa.
+    igual('   sem acento tambem → PENDENTE', String(camposPendentes({ ...base, assunto: 'consulta juridica' })), 'assunto');
+    igual('   com espaco em volta → PENDENTE', String(camposPendentes({ ...base, assunto: '  Consulta Jurídica  ' })), 'assunto');
+    igual('assunto especifico → NAO pendente', String(camposPendentes({ ...base, assunto: 'Abatimento do FIES' })), '');
+    igual('assunto vazio → PENDENTE (comportamento antigo, intacto)', String(camposPendentes({ ...base, assunto: '' })), 'assunto');
+    igual('string "null" → PENDENTE (comportamento antigo, intacto)', String(camposPendentes({ ...base, assunto: 'null' })), 'assunto');
+    // O placeholder NAO pode contaminar os outros campos obrigatorios: "Consulta juridica" e valor
+    // legitimo em nenhum deles, mas a regra e so do assunto e tem de continuar sendo.
+    igual('a regra e SO do assunto', String(camposPendentes({ ...base, assunto: 'Guarda', tipo_consulta: ASSUNTO_NEUTRO })), '');
+  }
+
+  console.log('');
+  console.log('=== e o PUT que isso libera continua respeitando renomeacao humana ===');
+  const CHAT_1D = '5511955550000';
+  {
+    limpar();
+    // Deal que nasceu com o placeholder no titulo, escrito pelo BOT (autoria registrada).
+    semear(CHAT_1D, { deal_id: 70, custom_fields_bot: JSON.stringify({ __name: `Rayra Pureza - ${ASSUNTO_NEUTRO}` }) });
+    let seq = [
+      { id: 70, name: `Rayra Pureza - ${ASSUNTO_NEUTRO}`, entityCustomFields: [] },
+      { id: 70, entityCustomFields: CF_DADOS },
+    ];
+    rede.get = () => ({ status: 200, data: seq.shift() });
+    await esperarErro(() => atualizarNegocioMoskit(70, { ...DADOS, nome: 'Rayra Pureza' }, 555, { chatId: CHAT_1D }));
+    igual('titulo com placeholder escrito pelo bot → recebe o assunto real', de('PUT', '/deals/70')[0]?.corpo?.name, 'Rayra Pureza - Inventario');
+  }
+  {
+    limpar();
+    // Mesmo cenario, mas a equipe renomeou o deal a mao depois. O PUT nao pode desfazer isso.
+    semear(CHAT_1D, { deal_id: 71, custom_fields_bot: JSON.stringify({ __name: `Rayra Pureza - ${ASSUNTO_NEUTRO}` }) });
+    let seq = [
+      { id: 71, name: 'Rayra Pureza - FIES (falar com a Layla antes)', entityCustomFields: [] },
+      { id: 71, entityCustomFields: CF_DADOS },
+    ];
+    rede.get = () => ({ status: 200, data: seq.shift() });
+    await esperarErro(() => atualizarNegocioMoskit(71, { ...DADOS, nome: 'Rayra Pureza' }, 555, { chatId: CHAT_1D }));
+    igual('renomeado a mao → PRESERVADO mesmo com o assunto novo em maos', de('PUT', '/deals/71')[0]?.corpo?.name, 'Rayra Pureza - FIES (falar com a Layla antes)');
   }
 
   // ============================================================
@@ -2014,7 +2413,7 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     igual('   nenhum Telegram', telegrams().length, 0);
   }
   {
-    // Caminho feliz: atividade sem vinculo que o PUT consegue religar — reseta e posta a nota.
+    // Caminho feliz: atividade sem vinculo que o PUT consegue religar — reseta o estado.
     limpar();
     semear(CHAT_VINC, { deal_id: 30, atividade_moskit_id: ATV_VINC });
     rede.get = (url) => url.includes('/activities/')
@@ -2023,7 +2422,8 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     const r8 = await reconciliarVinculoAtividades({ aplicar: true });
     igual('atividade sem vinculo → religada', r8.religadas.length, 1);
     igual('   estado zerado', linha(CHAT_VINC).vinculo_falhas, 0);
-    igual('   nota no deal', notas().length, 1);
+    // Decisao de 02/09/2026: a religacao bem-sucedida deixou de virar nota (confirmacao de rotina).
+    igual('   nenhuma nota (so o PUT de religacao)', notas().length, 0);
   }
 
   // ============================================================
@@ -2076,7 +2476,9 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     igual('   fez 1 PUT', de('PUT', '/deals/70').length, 1);
     igual('   o PUT leva o responsavel da tabela (Iury)', String(putDe(70, CF.RESPONSAVEL)), String([IURY]));
     igual('   ...e preserva a area do CRM (nao volta pro LGPD do last_data)', String(putDe(70, CF.AREA_DIREITO)), String([EDUCACIONAL]));
-    checar('   anota a reconciliacao no deal', notas().some((x) => (x.corpo.description || '').includes('reconciliada')), notas().map((x) => x.corpo.description));
+    // Decisao de 02/09/2026: a reconciliacao bem-sucedida deixou de virar nota — o PUT acima e a
+    // fonte de verdade.
+    igual('   nenhuma nota (so o PUT de reconciliacao)', notas().length, 0);
   }
   {
     // Area vazia no CRM: aí sim o bot preenche com o que apurou.
@@ -2266,10 +2668,10 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
         doc_id: 'doc1', evento_id: 'ev1', deal_id: 123, metodo: 'evento_telefone',
         diagnostico: '{}', ultimo_erro: null,
       });
-      s.avancar.run({ ...camposVazios(), gmail_message_id: id, estado: 'EXTRAIDO', extracao: '{"a":1}', ultimo_erro: null });
+      s.avancar.run({ ...camposVazios(), gmail_message_id: id, estado: 'SEM_TRANSCRICAO', ultimo_erro: null });
 
       // O COALESCE de cada campo e o que permite avancar um passo sem reenviar o que ja se sabe —
-      // sem ele, o passo EXTRAIDO apagaria o deal_id descoberto no passo anterior.
+      // sem ele, este passo apagaria o deal_id descoberto no passo anterior.
       igual(`${rotulo} COALESCE preserva o deal_id`, s.get.get(id).deal_id, 123);
       igual(`${rotulo} COALESCE preserva o doc_id`, s.get.get(id).doc_id, 'doc1');
 
@@ -3222,7 +3624,9 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     // ganho e que a classificacao do caso encerrado nao foi sobrescrita.
     igual('nenhum PUT no negocio antigo', dealsAtualizados().length, 0);
     igual('nenhum negocio criado neste ciclo', dealsCriados().length, 0);
-    checar('nota de retorno no negocio antigo', notas().some((n) => (n.corpo.description || '').includes('caso novo')), notas().map((n) => n.corpo.description));
+    // Decisao de 02/09/2026: o corte bem-sucedido deixou de virar nota no negocio antigo — o
+    // Telegram (abaixo) e deals_anteriores (ja conferido acima) e que registram o que aconteceu.
+    igual('nenhuma nota no negocio antigo (so o Telegram avisa)', notas().length, 0);
     checar('Telegram avisa o escritorio', telegrams().some((t) => (t.corpo.text || '').includes('Cliente de retorno')), telegrams().map((t) => t.corpo.text));
 
     // Conversa muda nunca e reprocessada sozinha: sem reenfileirar, o atendimento novo ficaria aberto e
@@ -3260,7 +3664,11 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
         checar('o modelo nao ve mais o caso do atendimento anterior', !promptExtracao.includes('abatimento do meu FIES'), promptExtracao.slice(0, 200));
     checar('   e ve o caso novo', promptExtracao.includes('despejo'));
 
-    checar('o negocio novo cita o anterior', notas().some((n) => (n.corpo.description || '').includes(`Negócio anterior: ${DEAL_ANTIGO}`)), notas().map((n) => n.corpo.description));
+    // Decisao de 02/09/2026: a nota "Cliente de retorno — Nº atendimento" no negocio novo deixou de
+    // ser postada (confirmacao de rotina) — o vinculo com o negocio anterior continua rastreavel via
+    // deals_anteriores (ja conferido acima), so nao aparece mais como texto no CRM.
+    checar('nenhuma nota cita o negocio anterior (removida, so deals_anteriores guarda o vinculo)',
+      !notas().some((n) => (n.corpo.description || '').includes(`Negócio anterior: ${DEAL_ANTIGO}`)), notas().map((n) => n.corpo.description));
 
     // ---- terceiro atendimento: nao ha teto ----
     // Cliente de escritorio volta mais de uma vez. Uma guarda de "so se ainda nao houve corte" faria o

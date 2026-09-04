@@ -5,6 +5,11 @@
 // Os dados aqui NAO sao inventados: os assuntos, titulos de evento e o formato do anexo foram
 // copiados de e-mails e eventos REAIS da caixa escritoriocr2019@gmail.com, medidos em 16/08/2026.
 // Um teste com assunto plausivel-porem-fake nao provaria nada sobre o formato do Google.
+//
+// DECISAO DE 02/09/2026: a nota deixou de ser uma extracao por IA em 5 secoes e virou so um link —
+// ver o comentario no topo de src/notas-reuniao.js. Os testes da extracao/ancoragem
+// (validarExtracao/conferirAncoragem) e da traducao pro Gemini (src/gemini.js) saíram daqui porque
+// as duas coisas deixaram de existir.
 
 const {
   parseAssuntoGemini,
@@ -14,12 +19,9 @@ const {
   extrairDocIdDeEvento,
   extrairSinais,
   decidirDeal,
-  prepararTextoFonte,
-  validarExtracao,
   marcadorNota,
   nomeAnexoNota,
   montarTextoNota,
-  ehExtracaoAtual,
 } = require('./src/notas-reuniao');
 
 let passou = 0;
@@ -305,178 +307,7 @@ console.log('\n=== A cascata e a regra de ambiguidade ===');
 }
 
 // ------------------------------------------------------------
-console.log('\n=== Texto-fonte e truncagem ===');
-
-{
-  const { texto, truncou } = prepararTextoFonte({ corpo: 'resumo do e-mail', textoDoc: 'transcricao literal' });
-  checar('corpo e Doc entram rotulados', texto.includes('RESUMO ENVIADO POR E-MAIL') && texto.includes('TRANSCRIÇÃO'), texto);
-  checar('sem estouro nao trunca', truncou === false);
-}
-
-{
-  const r = prepararTextoFonte({ corpo: 'so o e-mail', textoDoc: '' });
-  checar('sem Doc a nota ainda sai', r.texto.includes('so o e-mail') && !r.texto.includes('TRANSCRIÇÃO'));
-}
-
-{
-  // A cauda e o que importa: "proximos passos" e "valores" ficam no FIM de uma reuniao. Cortar pela
-  // cabeca preserva justamente o que se quer extrair.
-  // Marcador UNICO na cabeca: enchimento repetido nao serviria, porque o mesmo trecho reapareceria
-  // na cauda preservada e o teste passaria (ou falharia) por acidente.
-  const cabeca = `SO-NO-INICIO ${'enchimento '.repeat(500)}`;
-  const cauda = 'PROXIMOS PASSOS: enviar contrato';
-  const { texto, truncou } = prepararTextoFonte({ corpo: cabeca + cauda, maxChars: 200 });
-  checar('truncagem sinalizada', truncou === true);
-  checar('a CAUDA sobrevive', texto.includes('PROXIMOS PASSOS'), texto.slice(-80));
-  checar('a cabeca foi descartada', !texto.includes('SO-NO-INICIO'));
-  checar('o corte e anunciado no texto', texto.includes('omitido por tamanho'));
-}
-
-// ------------------------------------------------------------
-console.log('\n=== Validacao da saida da IA (filtro de ancoragem) ===');
-
-// E contra ESTA fonte que todo numero da extracao e conferido. Repare que ela cita "art. 47" e
-// "Lei 9.394/96": desde que o briefing ganhou o campo de fundamentacao, citacao legal entrou no
-// filtro, e os dois casos (o numero curto que nao identifica nada e a norma inteira) precisam de
-// cobertura.
-const FONTE = 'O advogado propos honorarios de R$ 3.500,00 divididos em 3x. '
-  + 'O cliente informou o CPF 123.456.789-00 e o processo 0801234-56.2026.8.14.0301. '
-  + 'A audiencia esta marcada para 20/09/2026. Foi citado o art. 47 da Lei 9.394/96.';
-
-{
-  const { extracao, avisos } = validarExtracao({
-    perfil_qualificacao: 'Aluno de Medicina no ultimo periodo.',
-    situacao_atual_urgencia: 'Audiencia em 20/09/2026.',
-    fundamentacao_legal: 'Art. 47 da Lei 9.394/96.',
-    superacao_obices: 'Processo 0801234-56.2026.8.14.0301 instruido com o historico.',
-    honorarios: [{ etapa: 'Entrada / Início da Ação', valor: 'R$ 3.500,00', condicao: 'protocolo em 1o grau' }],
-  }, FONTE);
-
-  checar('valor que existe na fonte passa limpo', extracao.honorarios[0].valor === 'R$ 3.500,00', extracao.honorarios[0]);
-  checar('processo que existe passa limpo', !extracao.superacao_obices.includes('⚠'), extracao.superacao_obices);
-  checar('data que existe passa limpa', !extracao.situacao_atual_urgencia.includes('⚠'), extracao.situacao_atual_urgencia);
-  checar('norma que existe passa limpa', !extracao.fundamentacao_legal.includes('⚠'), extracao.fundamentacao_legal);
-  checar('nada ancorado => nenhum aviso', avisos.length === 0, avisos);
-}
-
-{
-  // O risco que o campo "fundamentacao_legal" abriu: pedir "os dispositivos discutidos" e o convite
-  // para o modelo completar "a LDB" com um numero de lei que ninguem disse. O numero sai perfeito.
-  const { extracao, avisos } = validarExtracao({
-    perfil_qualificacao: 'ok',
-    fundamentacao_legal: 'Aplicacao da Lei 13.105/2015 e do art. 47.',
-  }, FONTE);
-
-  checar('norma INVENTADA e marcada', extracao.fundamentacao_legal.includes('Lei 13.105/2015 [⚠ não localizado'), extracao.fundamentacao_legal);
-  checar('o numero original permanece legivel', extracao.fundamentacao_legal.includes('Lei 13.105/2015'), extracao.fundamentacao_legal);
-  // "art. 47" tem dois digitos: nao identifica norma nenhuma e marcaria toda peca do escritorio.
-  checar('artigo curto NAO vira ruido', !/art\. 47 \[⚠/.test(extracao.fundamentacao_legal), extracao.fundamentacao_legal);
-  checar('aviso nomeia o campo', avisos.some((a) => a.startsWith('fundamentacao_legal:')), avisos);
-}
-
-{
-  // O bloco a bloco: a fonte disse "Lei 9.394" sem o ano, e o modelo completou "/96". Comparar a
-  // cadeia inteira ("939496") procuraria no texto um numero que ninguem escreveu junto e marcaria uma
-  // citacao CERTA — falso alarme no campo de fundamentacao ensina o advogado a ignorar o simbolo.
-  const { extracao } = validarExtracao({ perfil_qualificacao: 'ok', fundamentacao_legal: 'Lei 9.394/96' }, 'o advogado citou a Lei 9.394');
-  checar('ano acrescentado a uma lei que existe na fonte nao vira alarme', !extracao.fundamentacao_legal.includes('⚠'), extracao.fundamentacao_legal);
-}
-
-{
-  const { extracao, avisos } = validarExtracao({
-    perfil_qualificacao: 'ok',
-    honorarios: [
-      { etapa: 'Entrada / Início da Ação', valor: 'R$ 3.500,00', condicao: 'protocolo' },
-      { etapa: 'Êxito Final', valor: 'R$ 9.900,00', condicao: 'transito em julgado' },
-    ],
-  }, FONTE);
-
-  checar('valor inventado no honorario e marcado', extracao.honorarios[1].valor.includes('⚠ não localizado'), extracao.honorarios[1].valor);
-  checar('o numero original continua legivel', extracao.honorarios[1].valor.includes('R$ 9.900,00'), extracao.honorarios[1].valor);
-  checar('a parcela ancorada nao e tocada', extracao.honorarios[0].valor === 'R$ 3.500,00', extracao.honorarios[0].valor);
-  // Sem a etapa no rotulo, um briefing com cinco parcelas nao diria QUAL delas esta suspeita.
-  checar('o aviso diz de qual etapa', avisos.some((a) => a.includes('honorarios (Êxito Final)')), avisos);
-}
-
-{
-  // MEDIDO no e-mail real de 07/08/2026: o Gemini escreve "5000 reais", sem formatacao de moeda. Se o
-  // modelo devolver "R$ 5.000,00" — o MESMO valor, formatado — comparar por cadeia de digitos
-  // procuraria "500000" num texto que tem "5000". Dinheiro se compara como numero.
-  const SEM_MOEDA = 'A causa foi precificada em 5000 reais para a primeira instancia e 1500 reais para recursos.';
-  const { extracao } = validarExtracao({
-    perfil_qualificacao: 'ok',
-    honorarios: [{ etapa: 'Entrada / Início da Ação', valor: 'R$ 5.000,00', condicao: 'primeira instancia' }],
-  }, SEM_MOEDA);
-  checar('"5000 reais" na fonte casa com "R$ 5.000,00" na extracao', !extracao.honorarios[0].valor.includes('⚠'), extracao.honorarios[0].valor);
-}
-
-{
-  const { extracao } = validarExtracao({
-    perfil_qualificacao: 'ok',
-    honorarios: [
-      { condicao: 'quando o juiz decidir' },  // sem etapa e sem valor: nao e parcela nenhuma
-      { etapa: 'Manutenção / Acompanhamento Mensal', valor: 'R$ 800,00/mês' },
-      'texto solto',
-      null,
-    ],
-  }, 'acompanhamento de 800 por mes');
-
-  checar('item sem etapa e sem valor e descartado', extracao.honorarios.length === 1, extracao.honorarios);
-  checar('lixo na lista de honorarios e descartado', extracao.honorarios[0].etapa === 'Manutenção / Acompanhamento Mensal', extracao.honorarios[0]);
-  checar('parcela sem condicao sobrevive', extracao.honorarios[0].condicao === '', extracao.honorarios[0]);
-}
-
-{
-  const { extracao, avisos, vazia } = validarExtracao({
-    perfil_qualificacao: '',
-    resumo_caso: 'campo do contrato antigo',   // chave que nao existe mais
-    honorarios: 'nao e lista',
-  }, FONTE);
-
-  checar('chave fora do contrato e ignorada e registrada', avisos.some((a) => a.includes('resumo_caso')), avisos);
-  checar('honorarios que nao e lista vira lista vazia', Array.isArray(extracao.honorarios) && extracao.honorarios.length === 0, extracao.honorarios);
-  checar('sem campo de sustentacao => extracao vazia', vazia === true);
-}
-
-{
-  checar('objeto sozinho ja sustenta a nota', validarExtracao({ objeto: 'Propositura de mandado de seguranca.' }, FONTE).vazia === false);
-  // Estrategia e preco sem UMA linha de contexto factual e o retrato do modelo que preencheu o
-  // formulario sem ter lido a reuniao — e uma nota assim vai para o prontuario do cliente.
-  const so = validarExtracao({
-    via_eleita_foro: 'Mandado de seguranca',
-    honorarios: [{ etapa: 'Entrada / Início da Ação', valor: 'R$ 3.500,00' }],
-  }, FONTE);
-  checar('estrategia + honorarios SEM contexto ainda e extracao vazia', so.vazia === true, so.extracao);
-  // Campo novo: papo social sozinho, sem nenhum campo do caso, tambem nao sustenta a nota — e o
-  // retrato de uma reuniao que so teve conversa fora do objeto do atendimento.
-  const soSocial = validarExtracao({
-    contexto_pessoal_social: 'Cliente comentou sobre outro emprego e planos de carreira.',
-  }, FONTE);
-  checar('contexto_pessoal_social sozinho ainda e extracao vazia', soSocial.vazia === true, soSocial.extracao);
-}
-
-{
-  // O campo novo (21/08/2026): papo social/pessoal tem lugar proprio, pra nao vazar pro perfil do
-  // cliente nem ser confundido com honorario (ex.: salario de outro emprego, dito de passagem).
-  const { extracao, avisos } = validarExtracao({
-    objeto: 'ok',
-    contexto_pessoal_social: 'Atua em outro emprego (advocacia empresarial), remuneracao de R$ 3.500,00 mensais, cogita mudar de carreira.',
-  }, FONTE);
-  checar('contexto_pessoal_social passa pelo mesmo filtro de ancoragem que os demais campos',
-    !extracao.contexto_pessoal_social.includes('⚠'), extracao.contexto_pessoal_social);
-  checar('nenhum aviso extra so por causa do campo novo', avisos.length === 0, avisos);
-}
-
-{
-  // O index.js reusa a extracao ja gravada para nao pagar OpenAI duas vezes. Uma linha extraida sob o
-  // contrato ANTIGO renderizaria um briefing sem uma unica secao: so cabecalho e rodape no negocio.
-  checar('extracao do contrato atual e reconhecida', ehExtracaoAtual({ objeto: 'x' }) === true);
-  checar('extracao do contrato antigo NAO passa', ehExtracaoAtual({ resumo_caso: 'x', proposta_valores: '' }) === false);
-  checar('lixo nao passa', ehExtracaoAtual(null) === false && ehExtracaoAtual('x') === false);
-}
-
-// ------------------------------------------------------------
-console.log('\n=== Marcador e texto da nota ===');
+console.log('\n=== Marcador e nome do anexo ===');
 
 {
   const a = marcadorNota('19f22dabbca943ac', 'doc123');
@@ -487,84 +318,6 @@ console.log('\n=== Marcador e texto da nota ===');
   checar('marcador muda com a origem', a !== c);
   checar('formato do marcador', /^\[ollow-notas:[0-9a-f]{8}\]$/.test(a), a);
 }
-
-{
-  // O caso real do aluno de medicina (mandado de seguranca negado no TRF3 por deficiencia tecnica do
-  // patrono anterior, agora com nova negativa expressa) — o mesmo caso que motivou a fusao pra 3
-  // secoes em 20/08/2026 e a reversao pra 5 secoes em 21/08/2026, depois de testar contra um segundo
-  // caso real (assessoria administrativa de Fies) que expos a falta do contexto do cliente e do papo
-  // social/pessoal ter lugar proprio.
-  const marcador = marcadorNota('m1', 'd1');
-  const EXTRACAO = {
-    perfil_qualificacao: 'Aluno de Medicina no ultimo periodo, aprovado em 1o lugar.',
-    historico_processual_anterior: 'Mandado de seguranca extinto no TRF3 por deficiencia tecnica do patrono anterior.',
-    situacao_atual_urgencia: 'Nova negativa expressa da IES; risco de perder a posse no cargo.',
-    diretrizes_internas_equipe: 'Subir a transcricao no NotebookLM antes de redigir a peca.',
-    objeto: 'Propositura de mandado de seguranca perante a Justica Federal.',
-    via_eleita_foro: 'Mandado de seguranca, mesmo juizo por prevencao.',
-    fundamentacao_legal: 'Principio da razoabilidade e teoria do fato consumado.',
-    superacao_obices: '',
-    contexto_pessoal_social: 'Pretende migrar de carreira apos concluir a formacao em Medicina.',
-    honorarios: [
-      { etapa: 'Entrada / Início da Ação', valor: 'R$ 5.000,00', condicao: 'protocolo em 1o e 2o graus' },
-      { etapa: 'Êxito Final', valor: 'R$ 10.000,00', condicao: '' },
-    ],
-  };
-  const meta = { dataBr: '14/08/2026', tituloEvento: 'Consulta — Lia (Berto)', metodo: 'evento_telefone', confianca: 'alta' };
-  const texto = montarTextoNota({ extracao: EXTRACAO, meta, avisos: [], marcador });
-
-  checar('titulo do briefing no topo', texto.startsWith('📄 BRIEFING DE ATENDIMENTO E ALINHAMENTO ESTRATÉGICO'), texto.slice(0, 70));
-  checar('a data e o titulo do evento no cabecalho', texto.includes('— 14/08/2026 (Consulta — Lia (Berto))'), texto.slice(0, 120));
-  checar('as cinco secoes na ordem', /1\. CONTEXTO[\s\S]*2\. DO OBJETO[\s\S]*3\. DA ESTRATÉGIA[\s\S]*4\. DA PROPOSTA[\s\S]*5\. CONTEXTO PESSOAL/.test(texto), texto);
-  checar('rotulo com valor vira bullet', texto.includes('• Perfil/Qualificação: Aluno de Medicina'), texto);
-  checar('rotulo VAZIO some do bullet', !texto.includes('Superação de Óbices'), texto);
-  checar('secao 2 e texto corrido, sem bullet', texto.includes('📌 2. DO OBJETO\nPropositura'), texto);
-  checar('honorario com condicao usa travessao', texto.includes('• Entrada / Início da Ação: R$ 5.000,00 — protocolo em 1o e 2o graus'), texto);
-  checar('honorario sem condicao nao deixa travessao solto', texto.includes('• Êxito Final: R$ 10.000,00\n'), texto);
-  checar('secao 5 (campo novo) e texto corrido', texto.includes('🗒️ 5. CONTEXTO PESSOAL/SOCIAL\nPretende migrar'), texto);
-  checar('nota termina com o marcador', texto.trim().endsWith(marcador), texto.slice(-60));
-  checar('disclaimer de IA presente', texto.includes('gerado por IA'));
-  checar('metodo de vinculo impresso para auditoria', texto.includes('Vínculo: evento_telefone'), texto);
-  // O `description` do Moskit e exibido cru: sintaxe nao renderizada viraria sujeira justamente no
-  // documento que o advogado abre antes de redigir.
-  checar('nota em texto puro, sem Markdown', !/\*\*|^#/m.test(texto), texto);
-
-  // Funcao pura: mesma entrada, mesmo texto — e o que permite comparar contra o que esta no CRM.
-  const denovo = montarTextoNota({ extracao: EXTRACAO, meta, avisos: [], marcador });
-  checar('montarTextoNota e deterministica', texto === denovo);
-}
-
-{
-  // Secao com TODOS os rotulos vazios some inteira. E o motivo de o prompt proibir "nao informado":
-  // um titulo seguido de tres rotulos vazios ocupa espaco afirmando que se sabe alguma coisa.
-  const texto = montarTextoNota({
-    extracao: { objeto: 'So o objeto foi dito.', honorarios: [] },
-    meta: {},
-    avisos: [],
-    marcador: marcadorNota('m4', 'd4'),
-  });
-
-  checar('secao 1 inteira vazia some', !texto.includes('CONTEXTO DO CLIENTE'), texto);
-  checar('secao 3 inteira vazia some', !texto.includes('ESTRATÉGIA JURÍDICA'), texto);
-  checar('honorarios vazio omite a secao 4', !texto.includes('PROPOSTA DE HONORÁRIOS'), texto);
-  checar('secao 5 (campo novo) vazia tambem some', !texto.includes('CONTEXTO PESSOAL'), texto);
-  checar('o que existe continua aparecendo', texto.includes('📌 2. DO OBJETO'), texto);
-}
-
-{
-  const texto = montarTextoNota({
-    extracao: { objeto: 'x' },
-    meta: { truncou: true, semTranscricao: true, metodo: 'atividade_moskit', confianca: 'media' },
-    avisos: ['honorarios (Êxito Final): valor "R$ 9.900,00" não aparece no texto da reunião'],
-    marcador: marcadorNota('m2', null),
-  });
-  checar('truncagem avisada na nota', texto.includes('TRECHO INICIAL foi omitido'));
-  checar('ausencia de transcricao avisada', texto.includes('Sem transcrição literal'));
-  checar('aviso de ancoragem chega ao rodape', texto.includes('R$ 9.900,00'), texto);
-}
-
-// ------------------------------------------------------------
-console.log('\n=== Nome do anexo (PDF na aba Arquivos) ===');
 
 {
   // O determinismo NAO e detalhe estetico: o POST /deals/{id}/attachments so aceita uma url, sem
@@ -597,20 +350,59 @@ console.log('\n=== Nome do anexo (PDF na aba Arquivos) ===');
   checar('nome nunca contem separador de caminho', !/[\\/]/.test(nomeAnexoNota('lixo', '../../etc')), nomeAnexoNota('lixo', '../../etc'));
 }
 
-{
-  const base = {
-    extracao: { perfil_qualificacao: 'x' },
-    avisos: [],
-    marcador: marcadorNota('m3', 'd3'),
-  };
-  const com = montarTextoNota({ ...base, meta: { anexado: true } });
-  const sem = montarTextoNota({ ...base, meta: { anexado: false } });
+// ------------------------------------------------------------
+console.log('\n=== Texto da nota (so link, sem extracao por IA) ===');
 
-  checar('rodape anuncia o anexo quando ele existe', com.includes('anexada na aba Arquivos'), com);
+{
+  // Decisao de 02/09/2026: nao ha mais secao nenhuma nem texto extraido por IA — so o link da
+  // transcricao (quando existe) e o metodo de vinculo, para auditoria.
+  const marcador = marcadorNota('m1', 'd1');
+  const meta = {
+    dataBr: '14/08/2026', tituloEvento: 'Consulta — Lia (Berto)',
+    anexado: true, linkDoc: 'https://docs.google.com/document/d/d1',
+    metodo: 'evento_telefone', confianca: 'alta', numeroReuniao: 2,
+  };
+  const texto = montarTextoNota({ meta, marcador });
+
+  checar('titulo simples, sem "BRIEFING DE ATENDIMENTO"', texto.startsWith('📄 Notas de reunião'), texto.slice(0, 40));
+  checar('titulo cita a reuniao, a data e o evento', texto.includes('REUNIÃO 2') && texto.includes('14/08/2026') && texto.includes('(Consulta — Lia (Berto))'), texto.slice(0, 100));
+  checar('rodape afirma o anexo quando anexado=true', texto.includes('anexada na aba Arquivos'), texto);
+  checar('rodape cita o link da transcricao', texto.includes('Fonte: https://docs.google.com/document/d/d1'), texto);
+  checar('metodo de vinculo impresso para auditoria', texto.includes('Vínculo: evento_telefone (confiança alta)'), texto);
+  checar('nota termina com o marcador', texto.trim().endsWith(marcador), texto.slice(-60));
+  // O `description` do Moskit e exibido cru: sintaxe nao renderizada viraria sujeira justamente no
+  // documento que o advogado abre antes de redigir.
+  checar('nota em texto puro, sem Markdown', !/\*\*|^#/m.test(texto), texto);
+  // Nenhum resto da extracao antiga: nem secao, nem disclaimer de IA, nem aviso de ancoragem.
+  checar('nada de secoes numeradas antigas', !/1\.\s*CONTEXTO|DA ESTRATÉGIA|PROPOSTA DE HONOR/.test(texto), texto);
+  checar('nada de disclaimer de IA (nao ha mais extracao)', !texto.includes('gerado por IA'), texto);
+
+  // Funcao pura: mesma entrada, mesmo texto — e o que permite comparar contra o que esta no CRM.
+  const denovo = montarTextoNota({ meta, marcador });
+  checar('montarTextoNota e deterministica', texto === denovo);
+}
+
+{
+  // Sem numero de reuniao identificado (deal com uma so reuniao) o titulo simplesmente nao cita
+  // numero — nenhuma mudanca de formato so por isso.
+  const texto = montarTextoNota({
+    meta: { dataBr: '14/08/2026', anexado: false, linkDoc: 'https://docs.google.com/document/d/d2', metodo: 'atividade_moskit', confianca: 'media' },
+    marcador: marcadorNota('m2', 'd2'),
+  });
+  checar('sem numeroReuniao, titulo nao cita "REUNIÃO"', !texto.includes('REUNIÃO'), texto.slice(0, 60));
+  checar('sem tituloEvento, titulo nao abre parenteses vazio', !texto.includes('()'), texto.slice(0, 60));
   // O silencio e o ponto: prometer um arquivo que nao subiu manda o advogado procurar o que nao esta
   // la — pior que nao mencionar nada.
-  checar('rodape NAO promete anexo quando ele falhou', !sem.includes('anexada na aba Arquivos'), sem);
-  checar('sem anexo, o resto da nota fica igual', sem.includes('Resumo gerado por IA'));
+  checar('rodape NAO promete anexo quando ele ainda nao foi confirmado', !texto.includes('anexada na aba Arquivos'), texto);
+  checar('mas o link da transcricao continua presente (util mesmo sem anexo confirmado)', texto.includes('Fonte:'), texto);
+}
+
+{
+  // Sem link nenhum (nao deveria acontecer em producao — o index.js so chama montarTextoNota depois
+  // de confirmar que ha docId — mas a funcao pura nao pode quebrar mesmo assim).
+  const texto = montarTextoNota({ meta: {}, marcador: marcadorNota('m3', null) });
+  checar('sem linkDoc, a linha "Fonte:" simplesmente nao aparece', !texto.includes('Fonte:'), texto);
+  checar('ainda assim termina com o marcador', texto.trim().endsWith(marcadorNota('m3', null)), texto);
 }
 
 // ------------------------------------------------------------

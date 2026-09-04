@@ -214,7 +214,7 @@ openai.respostas = [
     igual('   reuniao_num nao muda', l.reuniao_num, 1);
     checar('   avisa no Telegram', telegrams().some((t) => (t.corpo.text || '').includes('Reunião de retorno')), telegrams().map((t) => t.corpo.text));
     checar('   o aviso diz que nada foi alterado', telegrams().some((t) => (t.corpo.text || '').includes('[dry-run]')), telegrams().map((t) => t.corpo.text));
-    checar('   nota marcada como dry-run no negocio', notas().some((n) => (n.corpo.description || '').includes('[dry-run]')), notas().map((n) => n.corpo.description));
+    checar('   nenhuma nota de dry-run no negocio (aviso agora so no Telegram)', !notas().some((n) => (n.corpo.description || '').includes('[dry-run]')), notas().map((n) => n.corpo.description));
     checar('   grava o hash para nao repetir o aviso', !!l.reuniao_aviso_hash, l.reuniao_aviso_hash);
   } else {
     igual('aplicando: 1 evento NOVO criado', agenda.insert.length, 1);

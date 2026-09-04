@@ -185,7 +185,7 @@ openai.respostas = [
   } else {
     checar('dry-run: avisa no Telegram', telegrams().some((t) => (t.corpo.text || '').includes('Cliente de retorno')), telegrams().map((t) => t.corpo.text));
     checar('dry-run: o aviso diz que nada foi alterado', telegrams().some((t) => (t.corpo.text || '').includes('[dry-run]')), telegrams().map((t) => t.corpo.text));
-    checar('dry-run: nota marcada como dry-run no negocio', de('POST', '/notes').some((n) => (n.corpo.description || '').includes('[dry-run]')), de('POST', '/notes').map((n) => n.corpo.description));
+    checar('dry-run: nenhuma nota de dry-run no negocio (aviso agora so no Telegram)', !de('POST', '/notes').some((n) => (n.corpo.description || '').includes('[dry-run]')), de('POST', '/notes').map((n) => n.corpo.description));
     checar('dry-run: grava o hash para nao repetir o aviso', !!l.retorno_aviso_hash, l.retorno_aviso_hash);
   }
 

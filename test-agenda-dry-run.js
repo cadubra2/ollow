@@ -6,7 +6,7 @@
 // 'false' e cobre a agenda funcionando; aqui fixamos 'true' e cobrimos o desligamento.
 //
 // O que este teste protege: que desligar a agenda do CRM NAO derruba o resto do agendamento. O evento
-// no Google, a nota no negocio, o avanco de estagio e o contrato continuam acontecendo — a flag e
+// no Google, o Telegram de aviso, o avanco de estagio e o contrato continuam acontecendo — a flag e
 // cirurgica. Se ela virar um "desliga o agendamento inteiro", o escritorio perde consulta de cliente
 // real achando que so silenciou o CRM.
 //
@@ -90,11 +90,13 @@ function semear(chatId, extras = {}) {
   igual('   nada entra em atividades_sincronizadas', db.prepare('SELECT COUNT(*) t FROM atividades_sincronizadas').get().t, 0);
 
   const notas = de('POST', '/notes');
-  checar('uma nota [dry-run] avisa que a consulta nao foi pra agenda do CRM',
-    notas.some((n) => n.corpo.description.includes('[dry-run]') && n.corpo.description.includes('agenda do Moskit')),
-    notas.map((n) => n.corpo.description));
+  const telegrams = de('POST', 'api.telegram.org');
+  igual('nenhuma nota (aviso de dry-run agora so no Telegram)', notas.length, 0);
+  checar('um Telegram [dry-run] avisa que a consulta nao foi pra agenda do CRM',
+    telegrams.some((t) => t.corpo.text.includes('[dry-run]') && t.corpo.text.includes('agenda do Moskit')),
+    telegrams.map((t) => t.corpo.text));
   checar('   e diz qual variavel desligar',
-    notas.some((n) => n.corpo.description.includes('AGENDA_MOSKIT_DRY_RUN')));
+    telegrams.some((t) => t.corpo.text.includes('AGENDA_MOSKIT_DRY_RUN')));
 
   // O ponto mais importante: a flag e cirurgica. Se desligar a agenda do CRM tambem parasse o evento
   // no Google, o escritorio perderia a consulta achando que so silenciou o CRM.
@@ -103,10 +105,11 @@ function semear(chatId, extras = {}) {
   igual('   com o horario confirmado', agenda.insert[0].requestBody.start.dateTime, '2026-08-05T17:30:00');
   igual('   banco: evento_calendar_criado', linha.evento_calendar_criado, 1);
   igual('   banco: evento_calendar_id salvo', linha.evento_calendar_id, 'ev1');
-  checar('a nota normal de agendamento continua saindo',
-    notas.some((n) => n.corpo.description.includes('Reunião agendada no Google Calendar')));
-  checar('   e ela NAO afirma que entrou na agenda do Moskit',
-    !notas.some((n) => n.corpo.description.includes('Também marcada na agenda do Moskit')));
+  // Decisao de 02/09/2026: a confirmacao de sucesso ("Reunião agendada no Google Calendar") deixou
+  // de virar nota (confirmacao de rotina), e o proprio aviso de dry-run acima tambem deixou de virar
+  // nota — o que importa aqui e que nenhum alerta afirma que a consulta entrou na agenda do Moskit.
+  checar('nenhum alerta afirma que entrou na agenda do Moskit',
+    !telegrams.some((t) => t.corpo.text.includes('Também marcada na agenda do Moskit')));
 
   console.log(`\n${'='.repeat(50)}`);
   console.log(`${passou} passaram · ${falhou} falharam`);

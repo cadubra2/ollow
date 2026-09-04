@@ -13,7 +13,7 @@ const { detectarBlocoCondicoes, contarAnexosIlegiveisEquipe } = require('./src/b
 const { apurarDuplaConfirmacao, descreverPendencia } = require('./src/agendamento');
 const { enfileirar, TEMP_DIR } = require('./src/fila');
 const { jaExiste, normalizarMensagens } = require('./src/mensagens');
-const { chaveConversa, ehInterno, TEAM_SUFIXOS } = require('./src/telefone');
+const { chaveConversa, ehInterno, TEAM_SUFIXOS, mesmoTelefone, SUFIXO_COMPARACAO } = require('./src/telefone');
 const { transcreverAudio } = require('./src/transcricao');
 const { montarPayloadAtividade, horarioNaiveParaInstante } = require('./src/atividade-moskit');
 const MOSKIT_IDS = require('./src/moskit-ids');
@@ -107,10 +107,21 @@ const AGENDAMENTO_PENDENCIA_SILENCIOSA_DIAS = Number(process.env.AGENDAMENTO_PEN
 const BRIEFING_REFRESH_ATIVO = process.env.BRIEFING_REFRESH_ATIVO !== 'false'; // default true
 const BRIEFING_REFRESH_ANTECEDENCIA_HORAS = Number(process.env.BRIEFING_REFRESH_ANTECEDENCIA_HORAS) || 4;
 const BRIEFING_REFRESH_MAX_POR_CICLO = Number(process.env.BRIEFING_REFRESH_MAX_POR_CICLO) || 5;
+// Postar o briefing MESMO com campo obrigatorio pendente, com a lacuna anotada no cabecalho. Nasce
+// LIGADO, ao contrario da regra "recurso novo nasce desligado", porque nao e recurso: e conserto de
+// um portao que descartava resumo pago em silencio (ver o bloco no ramo atualizar_campos). A flag
+// existe como interruptor de emergencia — `BRIEFING_SEM_PENDENTES=false` volta ao comportamento
+// antigo sem redeploy.
+const BRIEFING_SEM_PENDENTES = process.env.BRIEFING_SEM_PENDENTES !== 'false'; // default true
 // Cria evento/Meet sem comprovante quando o deal esta marcado como "consulta gratis" no Moskit.
 // Default DESLIGADO de proposito: sobe o codigo, roda GET /auditoria-consulta-gratis pra ver o que
 // seria liberado, e so entao liga no .env.
 const LIBERAR_CONSULTA_GRATIS = process.env.LIBERAR_CONSULTA_GRATIS === 'true';
+// Bloquear a criacao do deal quando falta campo obrigatorio e um comportamento novo com impacto de
+// negocio direto (lead pode ficar sem deal nenhum criado). Nasce em DRY-RUN: so loga o que faria,
+// sem alterar `acao` de verdade — permite validar contra o corpus real antes de confiar. Setar
+// BLOQUEIO_CAMPOS_OBRIGATORIOS_DRY_RUN=false liga o bloqueio de verdade.
+const BLOQUEIO_CAMPOS_OBRIGATORIOS_DRY_RUN = process.env.BLOQUEIO_CAMPOS_OBRIGATORIOS_DRY_RUN !== 'false'; // default true
 // Os IDs de estagio vem de MOSKIT_IDS.STAGE (src/moskit-ids.js) — a fonte unica para todo ID do
 // Moskit. Aqui so vive o que E de fato logica de negocio do funil: o override por env var e a
 // `priority` que decide a ordem (moverEstagioSeAvancar nunca deixa o funil andar pra tras).
@@ -190,7 +201,6 @@ const NOTAS_REUNIAO_DRY_RUN = process.env.NOTAS_REUNIAO_DRY_RUN !== 'false';
 const NOTAS_REMETENTE = process.env.NOTAS_REMETENTE || 'gemini-notes@google.com';
 const NOTAS_JANELA_DIAS = Number(process.env.NOTAS_JANELA_DIAS) || 30;
 const NOTAS_MAX_POR_CICLO = Number(process.env.NOTAS_MAX_POR_CICLO) || 20;
-const NOTAS_MAX_CHARS = Number(process.env.NOTAS_MAX_CHARS) || 120000;
 const NOTAS_SYNC_INTERVAL_MS = Number(process.env.NOTAS_SYNC_INTERVAL_MS) || 10 * 60 * 1000;
 // Teto de paginacao ao procurar o marcador nas notas de um deal. Medido em 16/08/2026: /deals/{id}/notes
 // devolve 10 por pagina (`limit` e ignorado, como em /activities) e pagina por `?start=`. O deal da
@@ -289,6 +299,21 @@ axios.defaults.httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 10 })
 // vem de TIMEOUT_HTTP_MS, configuravel por .env.
 axios.defaults.timeout = TIMEOUT_HTTP_MS;
 
+// Consumo da IA, acumulado. Toda resposta da OpenAI carrega `usage` e este arquivo o DESCARTAVA —
+// entao nao havia como dizer quanto custa uma conversa, nem comparar dois modelos sobre o mesmo
+// corpus (e a comparacao e o criterio de decisao da troca de modelo). Aditivo de proposito: o
+// `resolve(content)` continua identico e nenhum call site muda. Quem quer custo POR conversa chama
+// zerarUsoIA() antes dela — e o que avaliar-extracao.js faz.
+const usoIA = { chamadas: 0, prompt_tokens: 0, completion_tokens: 0 };
+function lerUsoIA() { return { ...usoIA }; }
+function zerarUsoIA() { usoIA.chamadas = 0; usoIA.prompt_tokens = 0; usoIA.completion_tokens = 0; }
+// A chamada conta mesmo sem `usage` (resposta vazia tambem foi paga); os tokens somam o que vier.
+function registrarUsoIA(usage) {
+  usoIA.chamadas += 1;
+  usoIA.prompt_tokens += Number(usage?.prompt_tokens) || 0;
+  usoIA.completion_tokens += Number(usage?.completion_tokens) || 0;
+}
+
 // Chamada direta a API OpenAI via HTTPS (sem SDK, sem fetch, sem hangs)
 async function openaiChat(messages, responseFormat) {
   const body = JSON.stringify({
@@ -330,9 +355,17 @@ async function openaiChat(messages, responseFormat) {
         const data = Buffer.concat(chunks).toString('utf8');
         try {
           const parsed = JSON.parse(data);
+          registrarUsoIA(parsed.usage);
           const content = parsed.choices?.[0]?.message?.content;
-          if (!content) reject(new Error('OpenAI retornou resposta vazia'));
-          else resolve(content);
+          // A mensagem tem de CARREGAR o motivo. "resposta vazia" era o que saia para TODA falha da
+          // API — 429 de rate limit, contexto estourado, chave revogada — porque `parsed.choices`
+          // nao existe em nenhuma delas e o payload de erro era descartado aqui. MEDIDO em
+          // 02/09/2026: 163 de 277 conversas de um replay falharam com essa frase, e nao havia como
+          // descobrir que eram rate limit sem instrumentar a funcao a mao.
+          if (!content) {
+            const motivo = parsed.error?.message || parsed.error?.code || `sem choices (HTTP ${res.statusCode})`;
+            reject(new Error(`OpenAI nao devolveu conteudo: ${motivo}`));
+          } else resolve(content);
         } catch (e) {
           reject(new Error('Falha ao parsear resposta OpenAI: ' + e.message));
         }
@@ -526,6 +559,11 @@ const stmtMoskitUpsert = db.prepare(`
     updated_at = datetime('now')
 `);
 const stmtMoskitGet = db.prepare('SELECT * FROM moskit_contacts WHERE phone = ?');
+// Busca pelo SUFIXO do telefone (ultimos SUFIXO_COMPARACAO digitos). A chave da tabela e o telefone
+// com `slice(-13)`, entao o mesmo cliente salvo com e sem DDI ocupa duas chaves diferentes e o GET
+// exato erra — ver o comentario de buscarOuCriarContato. Varredura de tabela, mas so roda quando o
+// GET exato falha e a tabela e pequena (~4k contatos).
+const stmtMoskitPorSufixo = db.prepare("SELECT * FROM moskit_contacts WHERE phone LIKE '%' || ?");
 const stmtMoskitCount = db.prepare('SELECT COUNT(*) as t FROM moskit_contacts');
 
 const stmtUpsert = db.prepare(`
@@ -1115,19 +1153,96 @@ const CAMPOS_OBRIGATORIOS = ['assunto', 'origem', 'tipo_consulta', 'area_direito
 
 function camposPendentes(dados) {
   if (!dados) return CAMPOS_OBRIGATORIOS;
-  return CAMPOS_OBRIGATORIOS.filter((k) => !dados[k] || dados[k] === 'null');
+  return CAMPOS_OBRIGATORIOS.filter((k) => {
+    if (!dados[k] || dados[k] === 'null') return true;
+    // ASSUNTO = ASSUNTO_NEUTRO conta como PENDENTE, e nao como preenchido. Sem esta linha o
+    // comentario acima descrevia uma intencao que o codigo contradizia: "Consulta juridica" e o
+    // PLACEHOLDER honesto que o prompt manda usar quando ninguem descreveu o caso, nao um assunto.
+    // Contá-lo como preenchido fechava o ciclo para sempre — assunto nunca voltava a "pendentes", o
+    // prompt informava "nenhum campo pendente", o modelo escolhia a acao `nota`, `nota` nao faz PUT,
+    // e o nome do deal ficava CONGELADO no placeholder mesmo depois de o last_data ja ter o tema real.
+    //
+    // MEDIDO no corpus em 02/09/2026: deal 48407608 chamado so "Rayra Pureza" com
+    // last_data.assunto = "Abatimento do FIES"; mesmo padrao em 48287898 ("Adocao") e 48206720
+    // ("Rescisao de contrato"). O dado existia e nunca subia para o titulo.
+    //
+    // Consequencia deliberada: essas conversas passam de `nota` para `atualizar_campos`, ou seja
+    // voltam a fazer PUT. Isso e seguro porque atualizarNegocioMoskit respeita renomeacao humana por
+    // autoria (CHAVE_AUTORIA_NOME) — deal renomeado a mao NAO e reescrito. Ha regressao provando
+    // exatamente isso em test-pipeline.js; se ela cair, esta linha volta atras.
+    return k === 'assunto' && ehAssuntoNeutro(dados[k]);
+  });
 }
 
-// Reconhece "pagina/instagram do socio" e "site do escritorio" no texto da conversa e forca a origem
-// (e, no caso do socio, a captacao) — deterministico, sem depender do modelo lembrar disso a cada
-// rodada. Muta e devolve `dados` (mesmo contrato das outras sanitizacoes do pipeline).
+// Detecta a pergunta padrao da EQUIPE ("como voce conheceu o escritorio?", geralmente com lista
+// numerada de opcoes) seguida da resposta do CLIENTE — o sinal mais confiavel que existe, e o unico
+// GAP REAL medido no modelo (nao bug de merge): deal 48317782, a equipe perguntou "Voce pode nos
+// contar como conheceu o nosso escritorio? 1.Indicacao 2.Artigo 3.Instagram 4.Youtube" e o cliente
+// respondeu "verifiquei no instagram" — o modelo nao usou essa resposta. A regra 2 do prompt ja pede
+// isso em linguagem natural desde entao; esta funcao torna o mesmo sinal deterministico, sem
+// depender do modelo lembrar a cada rodada. So a PRIMEIRA resposta do cliente apos a pergunta conta
+// (a equipe pode perguntar de novo depois, numa conversa longa, mas a resposta imediata e o vinculo
+// causal real).
+function detectarRespostaPerguntaOrigem(mensagens) {
+  const lista = mensagens || [];
+  for (let i = 0; i < lista.length; i++) {
+    if (lista[i].role !== 'equipe') continue;
+    const pergunta = removerAcentos(lista[i].text || '').toLowerCase();
+    if (!/como\s+(voce\s+)?conheceu|como\s+(voce\s+)?chegou\s+(ate\s+)?(a\s+)?(gente|nos|escritorio)/.test(pergunta)) continue;
+    // Ate 5 mensagens de TEXTO do cliente (nunca placeholder de anexo — "📎 [cliente enviou...]" nao
+    // e resposta nenhuma) apos a pergunta: MEDIDO no deal 48317782 que a resposta de fato so vem
+    // depois de o cliente mandar 4 anexos e responder a OUTRA pergunta pendente ("Essa e a proposta
+    // de distrato da empresa" / "Um dos socios do escritorio foi meu professor" / "Berto Igor" ×2) —
+    // parar na primeira mensagem de texto (sem pular anexo) ou nao ter janela nenhuma perderia esse
+    // sinal real. Nao quebra mais na primeira que nao bate: continua ate achar ou esgotar a janela.
+    let vistas = 0;
+    for (let j = i + 1; j < lista.length && vistas < 5; j++) {
+      if (lista[j].role !== 'cliente') continue;
+      const textoOriginal = lista[j].text || '';
+      if (/^📎\s*\[cliente enviou/.test(textoOriginal)) continue;
+      vistas++;
+      const resposta = removerAcentos(textoOriginal).toLowerCase();
+      if (/instagram|\binsta\b/.test(resposta)) return { origem: 'Instagram', trecho: textoOriginal };
+      if (/jusbrasil/.test(resposta)) return { origem: 'JusBrasil', trecho: textoOriginal };
+      if (/you\s?tube/.test(resposta)) return { origem: 'Youtube', trecho: textoOriginal };
+      if (/\bartigo\b/.test(resposta)) return { origem: 'Artigo', trecho: textoOriginal };
+      if (/\bsite\b/.test(resposta)) return { origem: 'Site', trecho: textoOriginal };
+      if (/indica[cç][aã]o/.test(resposta)) return { origem: 'Indicacao de/ou amigos e parentes', trecho: textoOriginal };
+    }
+  }
+  return null;
+}
+
+// Reconhece cancais de entrada explicitos no texto da conversa e forca a origem (e, no caso do
+// socio, a captacao) — deterministico, sem depender do modelo lembrar disso a cada rodada. Muta e
+// devolve `dados` (mesmo contrato das outras sanitizacoes do pipeline).
 //
 // Texto SEM ACENTO (removerAcentos): MEDIDO em 21/08/2026 no deal 48206716 ("vi a página do Advogado
 // Bruno Rocha") — a regex "pagina" sem acento nunca batia contra "página" com acento no texto real,
 // entao esta regra nunca acionava pra essa grafia, que e a mais comum em portugues. "site do
 // escritorio" e outro sinal claro que o modelo tambem deixava passar (deals 48412103/48359253).
+//
+// Vocabulario ampliado em 02/09/2026 a partir do que recuperar-origem-perdida.js ja media so em
+// auditoria (SO-LEITURA, pra conferencia humana) — aqui o padrao PRECISA ser confiavel o bastante
+// pra forcar o campo sem revisao, entao alguns sinais daquele script foram deixados de fora ou
+// reescritos com mais contexto:
+// - "amigo"/"parente" SOZINHOS ficaram de fora: sao comuns em conversa juridica sem ser sobre
+//   ORIGEM ("meu parente teve um problema parecido"). So conta indicacao com verbo/substantivo de
+//   indicacao explicito.
+// - "artigo"/"materia"/"noticia" SOZINHOS tambem ficaram de fora: em conversa juridica "artigo" e
+//   most-likely "artigo da lei" ("artigo 927 do codigo civil"), nao "vi um artigo no blog". So conta
+//   com verbo de consumo de midia (vi/li) na frente.
+// - "Video (Youtube/Instagram/TikTok)" do script de auditoria era ambiguo de proposito (pra
+//   conferencia humana escolher) — aqui nao entra, porque um padrao deterministico tem que apontar
+//   pra UM valor canonico, nunca adivinhar entre tres.
+// - "google" isolado ficou de fora (armadilha ja medida: todo convite de Google Meet/Calendar
+//   injeta "google" no texto — deal 48219774). So conta com verbo de busca explicito.
 function aplicarPadroesDeterministicosDeOrigem(dados, mensagens) {
-  const textoCompleto = removerAcentos((mensagens || []).map((m) => m.text).join(' ')).toLowerCase();
+  // So o texto do CLIENTE: e ele quem informa como chegou ate o escritorio. Sem esta restricao, a
+  // PROPRIA pergunta da equipe ("...1.Indicacao 2.Artigo 3.Instagram 4.Youtube") bateria no padrao
+  // generico de Instagram/Artigo/Youtube antes mesmo do cliente responder qualquer coisa —
+  // detectarRespostaPerguntaOrigem ja cobre esse caso separadamente, olhando os roles.
+  const textoCompleto = removerAcentos((mensagens || []).filter((m) => m.role === 'cliente').map((m) => m.text).join(' ')).toLowerCase();
   const PADROES_SOCIO = [
     { regex: /pagina\s+do\s+(bruno|dr\.?\s*bruno|advogado\s+bruno)/i, socio: 'Bruno' },
     { regex: /pagina\s+do\s+(berto|dr\.?\s*berto|caballero)/i, socio: 'Berto' },
@@ -1144,9 +1259,36 @@ function aplicarPadroesDeterministicosDeOrigem(dados, mensagens) {
       return dados;
     }
   }
-  if (/\bsite\s+(do\s+escritorio|de\s+voces)\b/.test(textoCompleto)) {
-    if (dados.origem !== 'Site') console.log('  ℹ️ mencao a "site do escritorio" detectada — origem forçada para Site');
-    dados.origem = 'Site';
+
+  // Pergunta da equipe + resposta do cliente: sinal mais confiavel que existe, checado antes dos
+  // padroes genericos abaixo (mais especifico primeiro).
+  const porPergunta = detectarRespostaPerguntaOrigem(mensagens);
+  if (porPergunta) {
+    if (dados.origem !== porPergunta.origem) console.log(`  ℹ️ equipe perguntou a origem e cliente respondeu ("${porPergunta.trecho}") — origem forçada para ${porPergunta.origem}`);
+    dados.origem = porPergunta.origem;
+    return dados;
+  }
+
+  const PADROES_GENERICOS = [
+    { regex: /\bsite\s+(do\s+escritorio|de\s+voces)\b/, origem: 'Site' },
+    { regex: /\bjusbrasil\b/, origem: 'JusBrasil' },
+    { regex: /\byou\s?tube\b/, origem: 'Youtube' },
+    { regex: /\binstagram\b|\binsta\b|link\s+(da|na)\s+bio/, origem: 'Instagram' },
+    { regex: /\b(vi|li)\s+(um\s+)?artigo\b/, origem: 'Artigo' },
+    { regex: /\b(vi|li)\s+(uma\s+)?mat[eé]ria\b/, origem: 'Artigo' },
+    { regex: /\b(vi|li)\s+(uma\s+)?not[ií]cia\b/, origem: 'Artigo' },
+    { regex: /achei\s*(no|pelo)\s*google|pesquisei\s*(no|na)?\s*google/, origem: 'Site' },
+    { regex: /indica[cç][aã]o\s+de\s+(um\s+)?(amigo|parente)|(amigo|parente)\s+(me\s+)?indicou|indicad[oa]\s+por\s+(um\s+)?(amigo|parente)/, origem: 'Indicacao de/ou amigos e parentes' },
+    { regex: /j[aá]\s+(sou|fui|foi)\s+cliente|outro\s+caso\s+(com|no)\s+(escrit[oó]rio|voces)/, origem: 'Indicacao de clientes' },
+    { regex: /an[uú]ncio|trafego\s+pago|facebook\s+ads|impulsionad/, origem: 'VSL - Trafego pago' },
+    { regex: /landing\s+page/, origem: 'Landing Page' },
+  ];
+  for (const padrao of PADROES_GENERICOS) {
+    if (padrao.regex.test(textoCompleto)) {
+      if (dados.origem !== padrao.origem) console.log(`  ℹ️ padrao "${padrao.regex}" detectado — origem forçada para ${padrao.origem}`);
+      dados.origem = padrao.origem;
+      return dados;
+    }
   }
   return dados;
 }
@@ -1210,12 +1352,42 @@ function deveEsperarCasoDescrito(acao, casoDescrito, apuracao, blocoEnviado) {
   return acao === 'criar' && !casoDescrito && !apuracao?.confirmado && !blocoEnviado;
 }
 
+// MESMA excecao de deveEsperarCasoDescrito (dupla confirmacao de horario / bloco de condicoes
+// enviado), agora aplicada aos 5 CAMPOS_OBRIGATORIOS. criarNegocioMoskit nunca validou nada: campo
+// vazio so e omitido do payload (buscarIdOpcao retorna null), e o deal nasce incompleto sem erro
+// nenhum. Decisao do escritorio, 02/09/2026: bloquear a CRIACAO enquanto faltar qualquer um dos 5
+// evita esse deal fantasma.
+//
+// `dadosMesclados` tem que vir do objeto MESCLADO com o historico (mesclarParaCrm), nunca da
+// extracao crua desta rodada: um campo completo num ciclo anterior nao pode contar como pendente so
+// porque a rodada atual nao voltou a mencionar tudo (ex: cliente so confirmando horario).
+function deveEsperarCamposObrigatorios(dadosMesclados, apuracao, blocoEnviado) {
+  return camposPendentes(dadosMesclados).length > 0 && !apuracao?.confirmado && !blocoEnviado;
+}
+
+// ACHADO em 03/09/2026, investigando por que deals do bot com assunto real capturado (ex: "Pericia de
+// readaptacao") voltavam a mostrar o placeholder neutro dias depois, sem ninguem ter corrigido nada
+// manualmente. Reproduzido de forma deterministica: rodada 1 captura o assunto real com evidencia;
+// rodada 2 e so agendamento/confirmacao, sem caso novo — e o MODELO, seguindo a propria instrucao do
+// prompt de usar "Consulta juridica" quando o caso esta vago, devolve o campo `assunto` PREENCHIDO com
+// o placeholder em vez de omiti-lo. Como o placeholder e uma string nao-nula, o `if` abaixo o tratava
+// como dado novo de verdade e sobrescrevia o assunto real — silenciosamente, sem log de "descartado"
+// nenhum (esse log so existe em aplicarGateCasoDescrito, que roda DEPOIS do merge, sobre o objeto JA
+// corrompido, e nao tem como saber que o valor neutro vinha de cima de um valor bom).
+// `_casoDescritoValidado` protege area_direito/advogado_responsavel dessa mesma classe de regressao
+// (ver aplicarGateCasoDescrito), mas nunca protegia assunto, porque o gate so nula um assunto quando
+// ele NAO e o placeholder — o placeholder sempre "passava", inclusive por cima de um valor bom.
+// Fix: o placeholder do modelo so conta como novidade quando ainda NAO existe um assunto real
+// herdado. Testes: "mesclarParaCrm: placeholder nao apaga assunto real herdado" (test-pipeline.js).
 function mergeDados(anteriores, novos) {
   const merged = { ...(anteriores || {}) };
   for (const key of Object.keys(novos || {})) {
-    if (novos[key] !== null && novos[key] !== undefined && novos[key] !== 'null') {
-      merged[key] = novos[key];
+    let valor = novos[key];
+    if (valor === null || valor === undefined || valor === 'null') continue;
+    if (key === 'assunto' && ehAssuntoNeutro(valor) && merged.assunto && !ehAssuntoNeutro(merged.assunto)) {
+      continue;
     }
+    merged[key] = valor;
   }
   return merged;
 }
@@ -1314,9 +1486,36 @@ async function buscarOuCriarContato(phone, name) {
   //    /importar-moskit) e ate agora so alimentava o banner "Cliente NOVO/EXISTENTE". A busca na API
   //    abaixo le APENAS a primeira pagina de /contacts ordenada por id desc: contato antigo nunca
   //    aparecia ali, o codigo caia no POST e criava DUPLICATA — em toda rodada criar/nota/atualizar.
+  //
+  // MEDIDO em 03/09/2026, limpando a aba "Agendamento de Consulta": comparar o telefone INTEIRO
+  // (slice(-13) na chave, `.includes()` na API) faz o MESMO numero salvo com e sem DDI nao casar —
+  // `"8694751616".includes("558694751616")` e false, e as duas chaves de 13 digitos tambem diferem.
+  // Todo lead que ja existia no Moskit Boost com o telefone em formato local virava contato novo +
+  // deal duplicado. Achado no par da Jessica (558694751616 x 8694751616) e depois medido em toda a
+  // aba: 46 dos 87 negocios abertos tinham outro negocio no mesmo telefone pelos ultimos 8 digitos,
+  // contra 20 pela comparacao inteira. `mesmoTelefone` (src/telefone.js) ja era a comparacao correta
+  // do projeto — o comentario dela diz "sobrevivem a diferencas de DDI/nono digito" — e e a mesma
+  // regra que `ehInterno` usa pra decidir se um numero e da equipe. Duas respostas diferentes pra
+  // "esses dois telefones sao a mesma pessoa?" dependendo do caminho de codigo e exatamente o que
+  // src/moskit-ids.js existe pra evitar.
   if (phoneClean.length >= 8) {
     const espelho = stmtMoskitGet.get(phoneClean);
     if (espelho?.moskit_id) return espelho.moskit_id;
+
+    // Sufixo: pega o mesmo cliente gravado sob outra grafia. AMBIGUIDADE NAO DECIDE — se dois
+    // contatos DIFERENTES compartilham o sufixo, nao da pra saber qual e; cai pra busca na API em
+    // vez de chutar (mesmo "candidato unico ou nada" de decidirDeal, em src/notas-reuniao.js).
+    const sufixo = phoneClean.slice(-SUFIXO_COMPARACAO);
+    const candidatos = stmtMoskitPorSufixo.all(sufixo).filter((c) => c.moskit_id);
+    const ids = new Set(candidatos.map((c) => c.moskit_id));
+    if (ids.size === 1) {
+      const achado = candidatos[0];
+      console.log(`  📇 contato ${achado.moskit_id} achado pelo sufixo do telefone (espelho tem "${achado.phone}", chegou "${phoneClean}") — evitando duplicata`);
+      return achado.moskit_id;
+    }
+    if (ids.size > 1) {
+      console.log(`  ⚠️ sufixo ...${sufixo} bate com ${ids.size} contatos diferentes no espelho — seguindo para a busca na API em vez de escolher um`);
+    }
   }
 
   // 2) Fallback na API, agora paginando de verdade (mesmo mecanismo de importarContatosMoskit).
@@ -1356,8 +1555,12 @@ async function buscarOuCriarContato(phone, name) {
       }
 
       const contatos = Array.isArray(listRes.data) ? listRes.data : [];
+      // `mesmoTelefone` no lugar do `.includes(phoneDigits)` antigo: o includes so casava quando o
+      // numero SALVO era igual ou mais longo que o buscado, entao contato do Moskit Boost gravado
+      // sem DDI ("8694751616") nunca casava com o numero que chega do WhatsApp ("558694751616") —
+      // ver o comentario do espelho local acima, com a medicao de 03/09/2026.
       const found = contatos.find((c) => (c.phones || [])
-        .some((p) => String(p.number).replace(/\D/g, '').includes(phoneDigits)));
+        .some((p) => mesmoTelefone(p.number, phoneDigits)));
       if (found) {
         // Alimenta o espelho pra que a proxima rodada nem precise da rede.
         stmtMoskitUpsert.run(phoneClean, found.id, found.name || '', JSON.stringify(found));
@@ -1664,10 +1867,9 @@ async function atualizarNegocioMoskit(dealId, dados, contactId, opcoes = {}) {
   // no ciclo seguinte, que a divergencia foi correcao humana.
   registrarAutoriaCampos(opcoes.chatId, camposEsperados, travasNovas, baselineCampos, payload.name);
   for (const id of travasNovas) {
-    await criarNotaMoskit(
-      dealId,
-      `🔒 "${nomeCampo(id)}" foi corrigido manualmente no CRM — o bot não vai mais sobrescrever este campo nesta negociação.`
-    );
+    await enviarTelegram(
+      `🔒 *Campo travado por correção manual*\nDeal: https://app.ollow.com.br/?/deal/${dealId}\n"${nomeCampo(id)}" foi corrigido manualmente no CRM — o bot não vai mais sobrescrever este campo nesta negociação.`
+    ).catch(() => {});
   }
   return response.data;
 }
@@ -1716,7 +1918,6 @@ async function aplicarViradaCobranca(chatId, row, dados, opcoesPayload, phone) {
     sanitizarClassificacao(dadosVirada, []);
     await atualizarNegocioMoskit(dealId, dadosVirada, contactId, opcoesPayload);
     console.log(`  💳 Deal ${dealId} reclassificado para PAGA (price 35000) pelo checkpoint do bloco de condicoes`);
-    await criarNotaMoskit(dealId, '💳 A equipe enviou as condições de valor nesta conversa — consulta reclassificada de cortesia para PAGA (R$350,00). Valor do negócio atualizado. Aguardando comprovante.');
 
     // Se a consulta ja foi pro Google Agenda como cortesia, o evento NAO e cancelado — cancelar
     // reuniao de cliente real por inferencia e pior que o erro. Avisa pra alguem cobrar.
@@ -1752,7 +1953,7 @@ function detectarOpcoesInvalidas(dados) {
     .map(({ campo, nome }) => ({ campo, nome, valor: dados[campo] }));
 }
 
-// Nota + Telegram uma unica vez por conjunto de valores invalidos (hash), mesmo padrao de
+// Telegram uma unica vez por conjunto de valores invalidos (hash), mesmo padrao de
 // registrarPendenciaContrato. E assim que um apelido novo chega ao conhecimento de quem mantem
 // src/moskit-ids.js, em vez de o valor errado se repetir calado a cada ciclo.
 async function registrarOpcoesInvalidas(dealId, chatId, invalidas) {
@@ -1764,10 +1965,6 @@ async function registrarOpcoesInvalidas(dealId, chatId, invalidas) {
 
   const lista = invalidas.map((i) => `• ${i.nome}: "${i.valor}"`).join('\n');
   try {
-    await criarNotaMoskit(
-      dealId,
-      `⚠️ A IA sugeriu valor que não existe na lista do CRM — campo(s) deixado(s) em branco de propósito:\n${lista}\n\nPreencher manualmente se fizer sentido.`
-    );
     await enviarTelegram(`⚠️ *Valor fora da lista do CRM*\nDeal \`${dealId}\`\n${lista}`);
     if (chatId) db.prepare('UPDATE conversations SET opcao_invalida_hash = ? WHERE chat_id = ?').run(hash, chatId);
     return true;
@@ -1865,8 +2062,7 @@ async function criarNotaMoskit(dealId, texto) {
 //
 // NUNCA LANCA — de proposito. Quando esta funcao roda, o evento no Google Agenda ja existe e a dupla
 // confirmacao ja aconteceu; deixar uma excecao subir aqui derrubaria o avanco de estagio e a geracao
-// do contrato no ZapSign por causa da agenda do CRM. A falha vira nota no deal, que e onde o
-// escritorio ve.
+// do contrato no ZapSign por causa da agenda do CRM. A falha vira Telegram, que e onde o escritorio ve.
 async function criarAtividadeMoskit(dealId, payload) {
   if (!dealId || !payload) return null;
   try {
@@ -1880,11 +2076,10 @@ async function criarAtividadeMoskit(dealId, payload) {
     if (res.status >= 300 || !atividadeId) {
       const texto = `⚠️ A consulta NAO entrou na agenda do Moskit (falha ao criar a atividade, HTTP ${res.status}). O evento no Google Agenda foi criado normalmente — marque a atividade na mao para ela aparecer na agenda do CRM.`;
       console.error(`  ❌ Atividade nao criada no Moskit (HTTP ${res.status}): ${JSON.stringify(res.data)}`);
-      await criarNotaMoskit(dealId, texto).catch(() => {});
       // Achado em 14/08/2026: 21 de 27 consultas com evento no Google NUNCA tiveram a Atividade
       // criada, e a unica trilha que sobrou foi o console (o log da VPS nao guarda historico longo o
-      // bastante, e a nota acima tambem pode falhar em silencio via o .catch). Telegram nao depende de
-      // nenhum dos dois — mesmo padrao ja aplicado em registrarErroAgendamento/registrarErroContrato.
+      // bastante). Telegram nao depende disso — mesmo padrao ja aplicado em
+      // registrarErroAgendamento/registrarErroContrato.
       await enviarTelegram(`❌ *Atividade NAO criada no Moskit*\nDeal: \`${dealId}\`\n${texto}`).catch(() => {});
       return null;
     }
@@ -1892,7 +2087,6 @@ async function criarAtividadeMoskit(dealId, payload) {
   } catch (e) {
     const texto = `⚠️ A consulta NAO entrou na agenda do Moskit (${e.message}). O evento no Google Agenda foi criado normalmente — marque a atividade na mao para ela aparecer na agenda do CRM.`;
     console.error(`  ❌ Erro ao criar atividade no Moskit: ${e.message}`);
-    await criarNotaMoskit(dealId, texto).catch(() => {});
     await enviarTelegram(`❌ *Atividade NAO criada no Moskit*\nDeal: \`${dealId}\`\n${texto}`).catch(() => {});
     return null;
   }
@@ -1900,17 +2094,17 @@ async function criarAtividadeMoskit(dealId, payload) {
 
 // Move o horario da atividade quando a consulta e remarcada. Mesmo contrato de nao-lancar: o evento
 // no Google ja foi movido quando chegamos aqui, e o pior desfecho e a agenda do CRM ficar no horario
-// velho — o que precisa virar nota, nao excecao.
+// velho — o que precisa virar Telegram, nao excecao.
 async function atualizarAtividadeMoskit(atividadeId, dueDate, dealId) {
   if (!atividadeId) return false;
   // dueDate nulo aqui significa que horarioNaiveParaInstante recusou o horario DEPOIS de o evento no
   // Google ja ter sido movido: as duas agendas ficam divergentes, e a do CRM mostrando o horario
   // antigo e pior que nao mostrar nada, porque parece certo. Era um `return false` mudo, o unico ramo
-  // de falha do agendamento sem nota nenhuma no deal.
+  // de falha do agendamento sem alerta nenhum.
   if (!dueDate) {
     console.error(`  ❌ Atividade ${atividadeId}: horario invalido pra remarcar — agenda do CRM continua no horario antigo`);
     if (dealId) {
-      await criarNotaMoskit(dealId, `⚠️ A reunião foi remarcada no Google Agenda, mas a atividade ${atividadeId} na agenda do Moskit NÃO foi movida (horário inválido na conversão de fuso). A agenda do CRM está mostrando o horário ANTIGO — corrigir na mão.`).catch(() => {});
+      await enviarTelegram(`⚠️ *Atividade do Moskit NAO remarcada*\nDeal: \`${dealId}\`\nA reunião foi remarcada no Google Agenda, mas a atividade ${atividadeId} na agenda do Moskit NÃO foi movida (horário inválido na conversão de fuso). A agenda do CRM está mostrando o horário ANTIGO — corrigir na mão.`).catch(() => {});
     }
     return false;
   }
@@ -1925,7 +2119,7 @@ async function atualizarAtividadeMoskit(atividadeId, dueDate, dealId) {
     });
     if (atualRes.status >= 300) {
       console.error(`  ❌ Atividade ${atividadeId} nao pode ser lida para remarcar (HTTP ${atualRes.status})`);
-      if (dealId) await criarNotaMoskit(dealId, '⚠️ A atividade na agenda do Moskit NAO foi remarcada (nao consegui ler a atividade) e continua no horario antigo. O Google Agenda ja esta no horario novo — corrija a atividade na mao.').catch(() => {});
+      if (dealId) await enviarTelegram(`⚠️ *Atividade do Moskit NAO remarcada*\nDeal: \`${dealId}\`\nA atividade na agenda do Moskit NAO foi remarcada (nao consegui ler a atividade) e continua no horario antigo. O Google Agenda ja esta no horario novo — corrija a atividade na mao.`).catch(() => {});
       return false;
     }
 
@@ -1935,13 +2129,13 @@ async function atualizarAtividadeMoskit(atividadeId, dueDate, dealId) {
     });
     if (res.status >= 300) {
       console.error(`  ❌ Atividade ${atividadeId} nao remarcada no Moskit (HTTP ${res.status})`);
-      if (dealId) await criarNotaMoskit(dealId, '⚠️ A atividade na agenda do Moskit NAO foi remarcada e continua no horario antigo. O Google Agenda ja esta no horario novo — corrija a atividade na mao.').catch(() => {});
+      if (dealId) await enviarTelegram(`⚠️ *Atividade do Moskit NAO remarcada*\nDeal: \`${dealId}\`\nA atividade na agenda do Moskit NAO foi remarcada e continua no horario antigo. O Google Agenda ja esta no horario novo — corrija a atividade na mao.`).catch(() => {});
       return false;
     }
     return true;
   } catch (e) {
     console.error(`  ❌ Erro ao remarcar atividade ${atividadeId} no Moskit: ${e.message}`);
-    if (dealId) await criarNotaMoskit(dealId, `⚠️ A atividade na agenda do Moskit NAO foi remarcada (${e.message}) e continua no horario antigo. O Google Agenda ja esta no horario novo — corrija a atividade na mao.`).catch(() => {});
+    if (dealId) await enviarTelegram(`⚠️ *Atividade do Moskit NAO remarcada*\nDeal: \`${dealId}\`\nA atividade na agenda do Moskit NAO foi remarcada (${e.message}) e continua no horario antigo. O Google Agenda ja esta no horario novo — corrija a atividade na mao.`).catch(() => {});
     return false;
   }
 }
@@ -2084,7 +2278,10 @@ async function moverParaEstagio(dealId, stageId) {
 }
 
 // So move o deal se for AVANCO no funil (nunca deixa voltar).
-// Se FUNIL_DRY_RUN estiver ativo (padrao), so registra uma nota com a sugestao, sem mover de verdade.
+// Se FUNIL_DRY_RUN estiver ativo (padrao), so avisa no Telegram a sugestao, sem mover de verdade.
+// Sem dedup de proposito — mesmo comportamento de frequencia que a nota tinha (roda a cada ciclo
+// enquanto o deal nao avancar); so o canal mudou. FUNIL_DRY_RUN=false esta ligado em producao (ver
+// memoria funil-automacao-completa), entao isso fica inerte no dia a dia hoje.
 async function moverEstagioSeAvancar(dealId, estagioKey) {
   const alvo = MOSKIT_STAGE_MAP[estagioKey];
   if (!alvo) return;
@@ -2104,13 +2301,12 @@ async function moverEstagioSeAvancar(dealId, estagioKey) {
   const nomeEstagio = estagioKey.replace(/_/g, ' ');
   if (FUNIL_DRY_RUN) {
     console.log(`  🤖 [dry-run] moveria deal ${dealId} para "${nomeEstagio}" — nao movido de verdade`);
-    await criarNotaMoskit(dealId, `🤖 [dry-run] IA sugere mover para "${nomeEstagio}" (revisao manual necessaria — FUNIL_DRY_RUN ativo)`);
+    await enviarTelegram(`🤖 *[dry-run] Avanço de estágio sugerido*\nDeal: \`${dealId}\`\nIA sugere mover para "${nomeEstagio}" (revisão manual necessária — FUNIL_DRY_RUN ativo)`).catch(() => {});
     return;
   }
 
   await moverParaEstagio(dealId, alvo.id);
   console.log(`  ➡️ Deal ${dealId} movido automaticamente para "${nomeEstagio}"`);
-  await criarNotaMoskit(dealId, `➡️ Deal movido automaticamente para "${nomeEstagio}" com base na conversa`);
 }
 
 // Fecha o negocio como Ganho/Perdido — eixo DIFERENTE de moverEstagioSeAvancar: `status`, nao
@@ -2142,7 +2338,6 @@ async function fecharNegocioSeAplicavel(dealId, statusKey, motivoTexto, obsValid
   if (FUNIL_FECHAMENTO_DRY_RUN) {
     const quem = nomeCliente ? `"${nomeCliente}"${telefone ? ` (${telefone})` : ''}` : `deal ${dealId}`;
     console.log(`  🤖 [dry-run] fecharia ${quem} como "${statusKey}"${motivoTexto ? ` (motivo: ${motivoTexto})` : ''} — nao fechado de verdade`);
-    await criarNotaMoskit(dealId, `🤖 [dry-run] IA sugere fechar negocio ${quem} como "${statusKey}"${motivoTexto ? ` — motivo: ${motivoTexto}` : ''} (revisao manual necessaria — FUNIL_FECHAMENTO_DRY_RUN ativo)`);
     await enviarTelegram([
       `🤖 *[dry-run] Fechamento sugerido*`,
       `Cliente: ${nomeCliente || 'nao informado'}${telefone ? ` (\`${telefone}\`)` : ''}`,
@@ -2176,7 +2371,6 @@ async function fecharNegocioSeAplicavel(dealId, statusKey, motivoTexto, obsValid
       (deal) => deal?.status === STATUS_DEAL.WON
     );
     console.log(`  🏆 Deal ${dealId} fechado automaticamente como GANHO`);
-    await criarNotaMoskit(dealId, '🏆 Negocio fechado automaticamente como GANHO, com base na conversa');
     await enviarTelegram(`🏆 *Negocio ganho!*\nDeal \`${dealId}\` fechado automaticamente com base na conversa.`);
     return;
   }
@@ -2192,7 +2386,6 @@ async function fecharNegocioSeAplicavel(dealId, statusKey, motivoTexto, obsValid
     (deal) => deal?.status === STATUS_DEAL.LOST
   );
   console.log(`  💔 Deal ${dealId} fechado automaticamente como PERDIDO (motivo: ${motivoTexto || 'nao informado'})`);
-  await criarNotaMoskit(dealId, `💔 Negocio fechado automaticamente como PERDIDO — motivo: ${motivoTexto || 'nao informado'}`);
   await enviarTelegram(`💔 *Negocio perdido*\nDeal \`${dealId}\` fechado automaticamente.\nMotivo: ${motivoTexto || 'nao informado'}`);
 }
 
@@ -2209,7 +2402,7 @@ async function handlePagamentoConfirmado(dealId, dados, chatId) {
     console.log(`  💳 Pagamento confirmado (sem comprovante verificado), movendo deal ${dealId} para Consulta Agendada...`);
     await moverParaEstagio(dealId, MOSKIT_STAGE_CONSULTA_AGENDADA);
     console.log(`  ✅ Deal ${dealId} movido para Consulta Agendada`);
-    await criarNotaMoskit(dealId, `💳 Pagamento confirmado (sem comprovante verificado) — deal movido para Consulta Agendada`);
+    await enviarTelegram(`💳 *Pagamento confirmado sem comprovante*\nDeal: \`${dealId}\`\nDeal movido para Consulta Agendada — cliente disse que pagou, mas não enviou/nunca chegou imagem verificável.`).catch(() => {});
     return { verificadoPorComprovante: false };
   }
 
@@ -2220,12 +2413,11 @@ async function handlePagamentoConfirmado(dealId, dados, chatId) {
     console.log(`  💳 Comprovante confere (${valorFormatado}), movendo deal ${dealId} para Consulta Agendada...`);
     await moverParaEstagio(dealId, MOSKIT_STAGE_CONSULTA_AGENDADA);
     console.log(`  ✅ Deal ${dealId} movido para Consulta Agendada`);
-    await criarNotaMoskit(dealId, `💳 Pagamento confirmado (comprovante verificado: ${valorFormatado}) — deal movido para Consulta Agendada`);
     return { verificadoPorComprovante: true };
   }
 
   console.log(`  ⚠️ Comprovante NAO confere (${valorFormatado}) — deal ${dealId} NAO movido, revisao manual necessaria`);
-  await criarNotaMoskit(dealId, `⚠️ Comprovante recebido mas NÃO confere (valor lido: ${valorFormatado}) — revisão manual necessária, deal não movido`);
+  await enviarTelegram(`⚠️ *Comprovante NÃO confere*\nDeal: \`${dealId}\`\nValor lido: ${valorFormatado} — revisão manual necessária, deal não movido.`).catch(() => {});
   return { verificadoPorComprovante: false };
 }
 
@@ -2385,11 +2577,11 @@ async function registrarConsultaNaAgendaMoskit({ dealId, dados, chatId, horarioI
   if (row?.atividade_moskit_id) return false; // ja tem atividade — nao duplicar na agenda do CRM
 
   if (AGENDA_MOSKIT_DRY_RUN) {
-    // Uma nota so: esta funcao roda no ramo de CRIACAO do evento, guardado por
+    // Um Telegram so: esta funcao roda no ramo de CRIACAO do evento, guardado por
     // evento_calendar_criado — uma vez por conversa, nao a cada ciclo.
     const quando = formatarHorarioEscritorio(horarioIso);
     console.log(`  ⏭️ [dry-run] atividade do Moskit NAO criada para o deal ${dealId} (AGENDA_MOSKIT_DRY_RUN ativo)`);
-    await criarNotaMoskit(dealId, `🤖 [dry-run] A consulta de ${quando} NAO foi lançada na agenda do Moskit (AGENDA_MOSKIT_DRY_RUN ativo) — marque a atividade na mão. O evento no Google Agenda foi criado normalmente.`).catch(() => {});
+    await enviarTelegram(`🤖 *[dry-run] Atividade do Moskit NAO criada*\nDeal: \`${dealId}\`\nA consulta de ${quando} NAO foi lançada na agenda do Moskit (AGENDA_MOSKIT_DRY_RUN ativo) — marque a atividade na mão. O evento no Google Agenda foi criado normalmente.`).catch(() => {});
     return false;
   }
 
@@ -2422,7 +2614,6 @@ async function registrarConsultaNaAgendaMoskit({ dealId, dados, chatId, horarioI
   const vinculada = await garantirVinculoAtividadeDeal(atividadeId, dealId);
   if (!vinculada) {
     const texto = `⚠️ A atividade ${atividadeId} foi criada na agenda do Moskit mas NAO ficou vinculada ao negócio (o Moskit as vezes perde esse vínculo quando o negócio acabou de ser escrito) — vincule na mão para ela aparecer na tela do negócio.`;
-    await criarNotaMoskit(dealId, texto).catch(() => {});
     await enviarTelegram(`❌ *Atividade criada sem vínculo com o negócio*\nDeal: \`${dealId}\`\n${texto}`).catch(() => {});
   }
 
@@ -2542,8 +2733,8 @@ async function handleAgendamentoCalendar(dealId, dados, chatId, pagamentoVerific
   // que o modelo devolveu nesta rodada em favor de `apuracao.horarioIso` — se a apuracao fechar com
   // um par ANTIGO mas autoconsistente (ja igual ao que esta no banco), `atualizarEventoSeRemarcado`
   // faz um `return` silencioso (`row.evento_calendar_data === novoInicioNaive`) sem instrumentacao
-  // nenhuma. So registra (nota + hash proprio, sem Telegram — e defesa, nao incidente confirmado)
-  // quando ja existe reuniao marcada e os dois valores discordam.
+  // nenhuma. So avisa (Telegram + hash proprio) quando ja existe reuniao marcada e os dois valores
+  // discordam.
   if (row?.evento_calendar_criado && podeAgendar) {
     const brutoNaive = normalizarHorarioNaive(dados?.data_hora_consulta);
     const efetivoNaive = normalizarHorarioNaive(dadosEvento?.data_hora_consulta);
@@ -2552,7 +2743,7 @@ async function handleAgendamentoCalendar(dealId, dados, chatId, pagamentoVerific
       const atual = db.prepare('SELECT agendamento_divergencia_hash FROM conversations WHERE chat_id = ?').get(chatId);
       if (atual?.agendamento_divergencia_hash !== hash) {
         console.log(`  ⚠️ deal ${dealId}: apuracao fechou em ${efetivoNaive} mas o modelo devolveu ${brutoNaive} nesta rodada — divergencia registrada`);
-        await criarNotaMoskit(dealId, `⚠️ A dupla confirmação fechou em ${formatarHorarioEscritorio(efetivoNaive)}, mas a IA havia entendido ${formatarHorarioEscritorio(brutoNaive)} nesta rodada — vale conferir a conversa manualmente.`).catch(() => {});
+        await enviarTelegram(`⚠️ *Divergência apuração × IA*\nDeal: \`${dealId}\`\nA dupla confirmação fechou em ${formatarHorarioEscritorio(efetivoNaive)}, mas a IA havia entendido ${formatarHorarioEscritorio(brutoNaive)} nesta rodada — vale conferir a conversa manualmente.`).catch(() => {});
         db.prepare('UPDATE conversations SET agendamento_divergencia_hash = ? WHERE chat_id = ?').run(hash, chatId);
       }
     }
@@ -2587,7 +2778,6 @@ async function handleAgendamentoCalendar(dealId, dados, chatId, pagamentoVerific
       dealId, dados: dadosEvento, chatId, horarioIso: row.evento_calendar_data, meetLink: null, eventoId: row.evento_calendar_id, row,
     });
     if (naAgendaMoskit) {
-      await criarNotaMoskit(dealId, '🗓️ Consulta marcada na agenda do Moskit (a atividade estava faltando e foi criada agora).');
       // `row` e o snapshot lido ANTES deste ciclo — registrarConsultaNaAgendaMoskit acabou de gravar
       // atividade_moskit_id no banco, mas o objeto em memoria continua com o valor antigo (nulo).
       // Sem atualiza-lo aqui, atualizarEventoSeRemarcado (logo abaixo) nao acha a atividade que acabou
@@ -2636,7 +2826,6 @@ async function handleAgendamentoCalendar(dealId, dados, chatId, pagamentoVerific
           const hash = `dry|${apuracao.horarioIso}|${classificacao.motivo}`;
           if (row?.reuniao_aviso_hash !== hash) {
             console.log(`  🤖 [dry-run] deal ${dealId}: reuniao NOVA seria aberta para ${dataFormatadaRetorno} (${porque}) — evento anterior NAO sera movido`);
-            await criarNotaMoskit(dealId, `🤖 [dry-run] Reunião nova detectada para ${dataFormatadaRetorno} (${porque}). Uma reunião própria SERIA aberta em vez de mover o evento anterior — revisão manual necessária (REUNIAO_RETORNO_DRY_RUN ativo).`).catch(() => {});
             await enviarTelegram([
               '🔁 *Reunião de retorno detectada (dry-run)*',
               `Negócio: \`${dealId}\``,
@@ -2711,8 +2900,6 @@ async function handleAgendamentoCalendar(dealId, dados, chatId, pagamentoVerific
   }
   const dataFormatada = formatarHorarioEscritorio(apuracao.horarioIso);
   const meetLink = evento ? extrairMeetLink(evento) : null;
-  const notaComprovante = pagamentoVerificado ? ' (comprovante verificado)' : ' ⚠️ SEM comprovante verificado';
-  const evidencia = `\nCliente aceitou: "${apuracao.cliente.trecho}" · Equipe confirmou: "${apuracao.equipe.trecho}"`;
 
   // Tenta a Atividade do Moskit INDEPENDENTE do Google ter dado certo — o que garante que o deal
   // tenha a consulta marcada em pelo menos uma agenda mesmo com o Google fora do ar. Com eventoId
@@ -2723,7 +2910,6 @@ async function handleAgendamentoCalendar(dealId, dados, chatId, pagamentoVerific
   });
 
   if (evento) {
-    await criarNotaMoskit(dealId, `📅 Reunião agendada no Google Calendar: ${dataFormatada}${notaComprovante}${evidencia}${meetLink ? `\nLink do Meet: ${meetLink}` : ''}${naAgendaMoskit ? '\n🗓️ Também marcada na agenda do Moskit.' : ''}`);
     await notificarTelegramMeet({
       nome: dados.nome,
       telefone: chatId,
@@ -2733,13 +2919,10 @@ async function handleAgendamentoCalendar(dealId, dados, chatId, pagamentoVerific
       dealId,
     });
   } else if (erroGoogle) {
-    // A dupla confirmacao e a data sao boas — so a chamada ao Google falhou de verdade. Uma nota
-    // otimista aqui seria mentira se a Atividade TAMBEM tiver falhado (criarAtividadeMoskit ja posta
-    // a propria nota de falha nesse caso); por isso o texto se ajusta conforme `naAgendaMoskit`.
-    await criarNotaMoskit(dealId, naAgendaMoskit
-      ? `🗓️ Consulta marcada na agenda do Moskit: ${dataFormatada}${evidencia}\n⚠️ Mas o evento no Google Calendar/Meet NÃO foi criado (${erroGoogle.message}). Será tentado de novo automaticamente no próximo reprocessamento.`
-      : `⚠️ A consulta foi confirmada (${dataFormatada})${evidencia}, mas NEM o Google Calendar NEM a agenda do Moskit foram atualizados (Google: ${erroGoogle.message}). Verificar manualmente.`);
-    await registrarErroAgendamento(dealId, chatId, erroGoogle.message, false);
+    // A dupla confirmacao e a data sao boas — so a chamada ao Google falhou de verdade. O Telegram de
+    // registrarErroAgendamento carrega o aviso; `naAgendaMoskit` so ajusta o texto dele (a consulta
+    // pode ja ter entrado no Moskit mesmo com o Google falhando).
+    await registrarErroAgendamento(dealId, chatId, erroGoogle.message, false, naAgendaMoskit);
   }
   // evento nulo sem erroGoogle = Google nao configurado (getGoogleAuthClient() devolveu null, tipico
   // de ambiente sem as credenciais) — nao e falha de producao, so segue: a Atividade do Moskit ja foi
@@ -2779,7 +2962,6 @@ async function handleContratoZapSign(dealId, dados, chatId, row) {
     db.prepare(
       'UPDATE conversations SET contrato_zapsign_criado = 1, contrato_zapsign_doc_token = ?, contrato_zapsign_status = ?, contrato_zapsign_pendente_hash = NULL WHERE chat_id = ?'
     ).run(resultado.docToken, resultado.status || 'pending', chatId);
-    await criarNotaMoskit(dealId, `📄 Contrato de Prestação de Serviço enviado para assinatura via ZapSign (convite por e-mail para ${dados.email_cliente}).`);
     await moverEstagioSeAvancar(dealId, 'contrato_enviado');
   } catch (e) {
     console.error(`  ❌ Erro ao criar contrato no ZapSign (deal ${dealId}): ${e.message}`);
@@ -2790,10 +2972,10 @@ async function handleContratoZapSign(dealId, dados, chatId, row) {
   }
 }
 
-// Nota no deal quando falta algum dado pro contrato (CPF, profissao, endereco, e-mail, valor de
-// honorarios...) — mesmo padrao de registrarAgendamentoPendente: hash evita repetir a nota a cada
+// Telegram quando falta algum dado pro contrato (CPF, profissao, endereco, e-mail, valor de
+// honorarios...) — mesmo padrao de registrarAgendamentoPendente: hash evita repetir o aviso a cada
 // ciclo de 5 min enquanto a mesma lista de campos continuar faltando. Como o bot nunca manda
-// mensagem pro cliente (so le o que a Zernio ja trouxe), esta nota e o unico jeito de a equipe
+// mensagem pro cliente (so le o que a Zernio ja trouxe), este aviso e o unico jeito de a equipe
 // saber que precisa pedir esses dados pelo WhatsApp real dela.
 async function registrarPendenciaContrato(dealId, chatId, faltantes) {
   if (!dealId || !faltantes?.length) return;
@@ -2803,18 +2985,17 @@ async function registrarPendenciaContrato(dealId, chatId, faltantes) {
   if (atual?.contrato_zapsign_pendente_hash === hash) return;
 
   try {
-    await criarNotaMoskit(dealId, `⏳ Contrato de Prestação de Serviço NÃO gerado — faltam: ${faltantes.join(', ')}. Peça esses dados ao cliente pelo WhatsApp.`);
+    await enviarTelegram(`⏳ *Contrato NÃO gerado — dado faltando*\nDeal: \`${dealId}\`\nFaltam: ${faltantes.join(', ')}. Peça esses dados ao cliente pelo WhatsApp.`);
     db.prepare('UPDATE conversations SET contrato_zapsign_pendente_hash = ? WHERE chat_id = ?').run(hash, chatId);
   } catch (e) {
-    console.error(`  ❌ Erro ao anotar pendencia de contrato no deal ${dealId}: ${e.message}`);
+    console.error(`  ❌ Erro ao avisar pendencia de contrato no deal ${dealId}: ${e.message}`);
   }
 }
 
-// Nota no deal quando os dados estavam completos mas a CHAMADA a API do ZapSign falhou de verdade
+// Telegram quando os dados estavam completos mas a CHAMADA a API do ZapSign falhou de verdade
 // (token/template invalido, rede, etc) — eixo diferente de registrarPendenciaContrato (dado
-// faltante). Mesmo padrao de registrarErroAgendamento — inclusive o aviso no Telegram: uma falha de
-// API tende a afetar TODOS os contratos seguintes, nao so este deal, e sem Telegram ninguem percebe
-// ate abrir o deal na mao.
+// faltante). Mesmo padrao de registrarErroAgendamento: uma falha de API tende a afetar TODOS os
+// contratos seguintes, nao so este deal, e sem Telegram ninguem percebe ate abrir o deal na mao.
 async function registrarErroContrato(dealId, chatId, mensagemErro) {
   if (!dealId) return;
   const hash = String(mensagemErro || '').slice(0, 200);
@@ -2824,7 +3005,6 @@ async function registrarErroContrato(dealId, chatId, mensagemErro) {
 
   const texto = `❌ Falha ao gerar contrato no ZapSign: ${mensagemErro}. Verificar manualmente (ZAPSIGN_API_KEY/ZAPSIGN_TEMPLATE_TOKEN configurados corretamente?).`;
   try {
-    await criarNotaMoskit(dealId, texto);
     await enviarTelegram(`❌ *Falha ao gerar contrato*\nDeal: \`${dealId}\`\nTelefone: \`${chatId}\`\n${texto}`);
     db.prepare('UPDATE conversations SET contrato_zapsign_erro_hash = ? WHERE chat_id = ?').run(hash, chatId);
   } catch (e) {
@@ -2832,8 +3012,8 @@ async function registrarErroContrato(dealId, chatId, mensagemErro) {
   }
 }
 
-// Nota no deal quando ha horario em jogo mas o agendamento esta travado. O hash evita repetir a mesma
-// nota a cada ciclo de 5 min enquanto a situacao nao muda.
+// Telegram quando ha horario em jogo mas o agendamento esta travado. O hash evita repetir o mesmo
+// aviso a cada ciclo de 5 min enquanto a situacao nao muda.
 //
 // MEDIDO em 14/08/2026 (deals 48292471/48287898): a apuracao ja identificava a pendencia certa
 // (motivo falta_cliente) e o Telegram ja e incondicional quando remarcacao=true — mas em pelo menos
@@ -2874,59 +3054,53 @@ async function registrarAgendamentoPendente(dealId, chatId, apuracao, remarcacao
 
   const quando = formatarHorarioEscritorio(horarioRelatado) || 'horário ainda não definido';
   const acao = remarcacao ? 'Reunião NÃO remarcada' : 'Consulta NÃO lançada na agenda';
-  // Horario que o modelo devolveu e a rede deterministica recusou (eco da data-ancora, formato com
-  // fuso, madrugada). Vale na nota porque muda o diagnostico: nao e "o cliente ainda nao respondeu",
-  // e "o horario extraido nao servia" — sem isso a equipe procura a confirmacao que ja existe.
-  const detalheDescartado = descartados.length
-    ? `\nHorário extraído e recusado pela validação: ${descartados.map((d) => `"${d.valor}" (${d.motivo})`).join('; ')}`
-    : '';
-  // O que ESTA na agenda agora — faltava na nota antiga, que so falava do que a IA extraiu nesta
-  // rodada (que pode nao ter extraido nada de novo, como no caso da Lia).
-  const detalheBanco = bancoNaive
-    ? `\nAgenda atual mostra: ${formatarHorarioEscritorio(bancoNaive)}${divergeDoConteudo ? ' (diferente do que foi comunicado na conversa)' : ''}`
-    : '';
 
   try {
-    if (hashMudou) {
-      await criarNotaMoskit(dealId, `⏳ ${acao}: ${quando} — ${descreverPendencia({ motivo })}.${detalheDescartado}${detalheBanco}\nO evento é criado/movido quando as duas confirmações aparecerem na conversa.`);
-    }
-
-    // Telegram so no que e acionavel e surpreendente. Uma REMARCACAO travada e o caso grave: ja existe
-    // reuniao na agenda e ela agora esta no horario errado — foi o que fez o cliente do deal 47543238
-    // esperar sozinho ("Estou aguardando aqui para o horario agendado") com o evento parado no dia
-    // velho. Horario recusado pela validacao tambem avisa, porque indica extracao quebrada. O que NAO
-    // avisa por hash novo e a pendencia de rotina (falta a confirmacao de um dos lados num agendamento
-    // novo): isso e o fluxo normal do atendimento e viraria ruido diario no Telegram. Mas se a
-    // pendencia e de remarcacao E a reuniao esta perto (`urgente`), reenvia mesmo com hash igual — a
-    // proximidade sozinha ja justifica.
-    if (hashMudou ? (remarcacao || descartados.length) : urgente) {
+    // Telegram para toda mudanca de pendencia (hashMudou), inclusive a pendencia de ROTINA (falta a
+    // confirmacao de um dos lados num agendamento novo, sem remarcacao nem horario descartado) — que
+    // antes so virava nota, para nao gerar "ruido diario" no Telegram. Agora que a nota some, o
+    // Telegram e o unico jeito de a equipe saber; o titulo distingue os tres casos, mas todos avisam.
+    // Uma REMARCACAO travada continua o caso mais grave: ja existe reuniao na agenda e ela agora esta
+    // no horario errado — foi o que fez o cliente do deal 47543238 esperar sozinho ("Estou aguardando
+    // aqui para o horario agendado") com o evento parado no dia velho. Se a pendencia e de remarcacao
+    // E a reuniao esta perto (`urgente`), reenvia mesmo com hash igual — a proximidade sozinha ja
+    // justifica.
+    if (hashMudou || urgente) {
+      const titulo = remarcacao
+        ? '⚠️ *Reunião NÃO remarcada — agenda com horário velho*'
+        : (descartados.length ? '⚠️ *Horário da consulta recusado pela validação*' : `⏳ *${acao}*`);
       await enviarTelegram([
-        remarcacao ? `⚠️ *Reunião NÃO remarcada — agenda com horário velho*` : `⚠️ *Horário da consulta recusado pela validação*`,
+        titulo,
         `Chat: \`${chatId}\``,
         dealId ? `Negócio: https://app.ollow.com.br/?/deal/${dealId}` : '',
         `Horário relatado na conversa: ${quando}`,
-        bancoNaive ? `Agenda atual: ${formatarHorarioEscritorio(bancoNaive)}` : '',
+        bancoNaive ? `Agenda atual: ${formatarHorarioEscritorio(bancoNaive)}${divergeDoConteudo ? ' (diferente do que foi comunicado na conversa)' : ''}` : '',
         `Situação: ${descreverPendencia({ motivo })}`,
+        // Horario que o modelo devolveu e a rede deterministica recusou (eco da data-ancora, formato
+        // com fuso, madrugada). Muda o diagnostico: nao e "o cliente ainda nao respondeu", e "o
+        // horario extraido nao servia" — sem isso a equipe procura a confirmacao que ja existe.
         descartados.length ? `Recusado: ${descartados.map((d) => `"${d.valor}" — ${d.motivo}`).join('; ')}` : '',
         urgente && !hashMudou ? '⏰ Reenviando: a reunião está próxima e a pendência continua sem resolver.' : '',
         '',
         remarcacao
           ? 'A reunião que já está na agenda pode estar no horário ANTIGO. Conferir a conversa e remarcar na mão.'
-          : 'Conferir na conversa qual horário foi combinado e marcar na mão se já estiver fechado.',
+          : 'O evento é criado/movido quando as duas confirmações aparecerem na conversa. Conferir na conversa qual horário foi combinado e marcar na mão se já estiver fechado.',
       ].filter(Boolean).join('\n'));
     }
     if (hashMudou) db.prepare('UPDATE conversations SET agendamento_pendente_hash = ? WHERE chat_id = ?').run(hash, chatId);
   } catch (e) {
-    console.error(`  ❌ Erro ao anotar pendencia de agendamento no deal ${dealId}: ${e.message}`);
+    console.error(`  ❌ Erro ao avisar pendencia de agendamento no deal ${dealId}: ${e.message}`);
   }
 }
 
-// Nota no deal quando a dupla confirmacao ACONTECEU mas a criacao/remarcacao do evento FALHOU de
+// Telegram quando a dupla confirmacao ACONTECEU mas a criacao/remarcacao do evento FALHOU de
 // verdade (token do Google expirado, erro de rede, quota da API, etc). Ate esta funcao existir,
-// esse caminho so gerava um console.error — a equipe nao tinha nenhum jeito de saber, pelo CRM, que
-// uma consulta ja confirmada pelas duas partes nao foi pra agenda. O hash evita repetir a mesma nota
+// esse caminho so gerava um console.error — a equipe nao tinha nenhum jeito de saber que uma
+// consulta ja confirmada pelas duas partes nao foi pra agenda. O hash evita repetir o mesmo aviso
 // de erro a cada ciclo de 5 min enquanto a causa nao for corrigida (ex: token continuar expirado).
-async function registrarErroAgendamento(dealId, chatId, mensagemErro, remarcacao) {
+// `naAgendaMoskit` (opcional) so ajusta o texto: a consulta pode ja ter entrado no Moskit mesmo com
+// o Google tendo falhado (ver handleAgendamentoCalendar).
+async function registrarErroAgendamento(dealId, chatId, mensagemErro, remarcacao, naAgendaMoskit) {
   if (!dealId) return;
   const hash = `${mensagemErro}|${remarcacao ? 'R' : 'C'}`;
 
@@ -2935,19 +3109,17 @@ async function registrarErroAgendamento(dealId, chatId, mensagemErro, remarcacao
 
   const acao = remarcacao ? 'reunião NÃO remarcada' : 'evento NÃO criado';
   try {
-    await criarNotaMoskit(
-      dealId,
-      `❌ Falha ao agendar: ${acao} — cliente e equipe já confirmaram o horário, mas a integração com o Google Calendar falhou (${mensagemErro}). Verificar manualmente e, se for token expirado, renovar com autorizar-google.js.`
-    );
-    // Nota no deal nao e suficiente: ninguem abre o deal a tempo. As duas partes ja combinaram um
-    // horario e nao existe reuniao — isso tem que chegar em quem pode marcar na mao, hoje.
+    // As duas partes ja combinaram um horario e o evento no Google nao existe (ou nao foi movido) —
+    // isso tem que chegar em quem pode marcar na mao, hoje.
     await enviarTelegram([
       `❌ *Consulta confirmada mas NÃO agendada*`,
       `Chat: \`${chatId}\``,
       dealId ? `Negócio: https://app.ollow.com.br/?/deal/${dealId}` : '',
       `Motivo: ${mensagemErro}`,
       '',
-      `Cliente e equipe já confirmaram o horário, mas ${acao}. Marcar na mão e verificar a integração.`,
+      naAgendaMoskit
+        ? `A consulta JÁ ENTROU na agenda do Moskit, mas o evento no Google Calendar/Meet NÃO foi criado. Será tentado de novo automaticamente no próximo reprocessamento.`
+        : `Cliente e equipe já confirmaram o horário, mas ${acao} NEM no Google NEM no Moskit. Marcar na mão e verificar a integração.`,
     ].filter(Boolean).join('\n'));
     db.prepare('UPDATE conversations SET agendamento_erro_hash = ? WHERE chat_id = ?').run(hash, chatId);
   } catch (e) {
@@ -3002,11 +3174,10 @@ async function atualizarEventoSeRemarcado(dealId, dados, chatId, row) {
     // As duas agendas movem juntas. Sem isto, a agenda do CRM continuaria mostrando o horario velho
     // — pior que nao ter compromisso nenhum la, porque parece certo e esta errado. O guard de
     // "nao mudou de verdade" la em cima ja impede um PUT redundante a cada ciclo.
-    const naAgendaMoskit = row?.atividade_moskit_id
-      ? await atualizarAtividadeMoskit(row.atividade_moskit_id, horarioNaiveParaInstante(novoInicioNaive, TZ_ESCRITORIO), dealId)
-      : false;
+    if (row?.atividade_moskit_id) {
+      await atualizarAtividadeMoskit(row.atividade_moskit_id, horarioNaiveParaInstante(novoInicioNaive, TZ_ESCRITORIO), dealId);
+    }
 
-    await criarNotaMoskit(dealId, `🔁 Reunião remarcada para ${dataFormatada}${meetLink ? `\nLink do Meet (o mesmo de antes): ${meetLink}` : ''}${naAgendaMoskit ? '\n🗓️ Agenda do Moskit atualizada também.' : ''}`);
     await notificarTelegramMeet({
       nome: dados.nome,
       telefone: chatId,
@@ -3131,17 +3302,21 @@ REGRAS DE DECISAO:
 
 CAMPOS OBRIGATORIOS (nunca podem ser null em criar):
 1. assunto — tema curto do caso, 2 a 5 palavras (ex: "Inventario", "Usucapiao de imovel", "Abatimento do FIES", "Rescisao de contrato"). E o que aparece no titulo do negocio no CRM, entao seja especifico e direto, sem frase completa. NUNCA deixe null: se o cliente ainda NAO contou o caso, use exatamente "Consulta juridica" — NUNCA use o nome de uma area do direito como assunto (isso transforma um palpite de area no titulo do negocio).
-2. origem — SEMPRE preencher. Procure ATIVAMENTE por canal de entrada em QUALQUER ponto da conversa,
-   nao so na primeira mensagem: "vi/acessei/segui a pagina, o Instagram ou o link da bio do Dr. X" ->
-   Instagram; "vi seu video/reels" -> Youtube; "vi/acessei/entrei no site" -> Site; "indicacao de
-   [alguem]"/"minha amiga indicou"/"fulano me indicou" -> Indicacao de amigos e parentes; "ja fui
-   cliente"/"outro caso com voces" -> Indicacao de clientes. A EQUIPE por vezes pergunta diretamente
-   "como conheceu nosso escritorio?" com uma lista numerada de opcoes — a RESPOSTA do cliente a essa
-   pergunta e o sinal MAIS CONFIAVEL que existe e tem que ser usada (deal 48317782 ficou "Nao
-   identificado" porque a equipe perguntou "Voce pode nos contar como conheceu o nosso escritorio?
-   1.Indicacao 2.Artigo 3.Instagram 4.Youtube" e o cliente respondeu "verifiquei no instagram", e essa
-   resposta nao foi usada). So depois de procurar isso na conversa INTEIRA, se nao achar nada, use
-   "Nao identificado".
+2. origem — SEMPRE preencher, e tente ao MAXIMO identificar antes de desistir. Procure ATIVAMENTE por
+   canal de entrada em QUALQUER ponto da conversa, nao so na primeira mensagem: "vi/acessei/segui a
+   pagina, o Instagram ou o link da bio do Dr. X" -> Instagram; "vi seu video/reels" -> Youtube;
+   "vi/acessei/entrei no site" -> Site; "achei/pesquisei no Google" (busca ativa, nao so a palavra
+   "google" solta) -> Site; "li um artigo/uma materia/uma noticia sobre voces" -> Artigo; "vi no
+   JusBrasil" -> JusBrasil; "indicacao de [alguem]"/"minha amiga indicou"/"fulano me indicou" ->
+   Indicacao de amigos e parentes; "ja fui cliente"/"outro caso com voces" -> Indicacao de clientes;
+   "vi um anuncio"/"trafego pago"/"impulsionado" -> VSL - Trafego pago; "cliquei na landing page" ->
+   Landing Page. A EQUIPE por vezes pergunta diretamente "como conheceu nosso escritorio?" com uma
+   lista numerada de opcoes — a RESPOSTA do cliente a essa pergunta e o sinal MAIS CONFIAVEL que existe
+   e tem que ser usada (deal 48317782 ficou "Nao identificado" porque a equipe perguntou "Voce pode
+   nos contar como conheceu o nosso escritorio? 1.Indicacao 2.Artigo 3.Instagram 4.Youtube" e o
+   cliente respondeu "verifiquei no instagram", e essa resposta nao foi usada). So depois de procurar
+   isso na conversa INTEIRA, se nao achar nada, use "Nao identificado" — mas "Nao identificado" so e
+   aceitavel quando a conversa REALMENTE nao tem nenhum desses sinais, nunca por nao ter procurado.
 3. tipo_consulta — "consulta paga" por padrao. Use "consulta gratis" APENAS se a equipe disser explicitamente que a consulta e cortesia/gratuita/sem custo/isenta. Use "sem consulta" so se o lead disser EXPLICITAMENTE que nao quer contratar.
 4. area_direito — Use seu conhecimento juridico para inferir a area A PARTIR DO QUE O CLIENTE CONTOU SOBRE O CASO, e de nada mais. Se ele so cumprimentou, so pediu consulta, so disse por qual canal chegou ou so citou o nome de um advogado ("quero falar com o Dr. Berto"), voce NAO sabe a area: devolva null. E PROIBIDO derivar a area de captacao, de origem, do advogado que o lead mencionou ou dos PERFIS DOS ADVOGADOS abaixo — o caminho e sempre area -> advogado, nunca advogado -> area. Deixar null e o resultado correto e esperado nessa situacao; a area entra numa rodada seguinte, quando o cliente descrever o caso.
    CASO RECORRENTE NESTE ESCRITORIO — FIES: caso envolvendo financiamento estudantil (FIES) — negativa administrativa, transferencia de curso, renegociacao, aditamento, recurso — e SEMPRE "Direito Educacional", mesmo que o cliente nao diga isso com essas palavras (deals 48474073, 48466404, 48464876, 48320992 nasceram com area_direito null porque o modelo nao fez essa ligacao sozinho, apesar do caso estar descrito).
@@ -3212,13 +3387,13 @@ Regras de horario nas observacoes:
 
 INSTRUCOES PARA resumo_atendimento (briefing pre-consulta do advogado):
 Escreva um resumo ESPECIFICO e ACIONAVEL, nao generico. Use os fatos concretos que aparecem na conversa: nomes de pessoas ou empresas envolvidas, datas, valores, numero de processo, tipo de documento, prazos, providencias ja tomadas. Evite frases vagas tipo "cliente quer analise do caso" — prefira algo como "cliente foi notificado pela ANPD em 15/03 sobre vazamento de dados de clientes e quer saber se pode ser responsabilizado".
-Estruture em 6 linhas (uma por topico, com quebra de linha \n entre elas — NAO use "|"):
+Os seis topicos abaixo sao o VOCABULARIO do resumo, nao um limite de tamanho. Separe os topicos com quebra de linha \n (NAO use "|"). Um topico pode ocupar mais de uma linha quando o caso tem mais a dizer — caso complexo merece resumo longo, e o advogado prefere ler tres linhas sobre o caso a uma linha generica. Topico SEM informacao na conversa e OMITIDO por completo: nao escreva o rotulo, nao escreva "Nao mencionado", "Nada mencionado", "Nao informado" nem nada equivalente. Quem le a nota sabe que topico ausente e topico sem dado, e uma linha de duas palavras so ocupa espaco.
 📌 Caso: [o que aconteceu, com os detalhes concretos disponiveis — partes envolvidas, datas, valores, documentos]
 📌 Objetivo do cliente: [o que especificamente ele quer resolver, saber ou contratar]
-📌 Urgencia/prazo: [prazo, audiencia, notificacao ou data mencionada — se nao houver, escreva "Nao mencionado"]
-📌 Ja tentou: [acoes anteriores mencionadas pelo cliente — se nao houver, escreva "Nada mencionado"]
-📌 Pendencias: [o que ainda falta resolver ou o que o advogado deve preparar para a consulta — documentos a pedir, situacao a investigar; se nao houver, escreva "Nao mencionado"]
-📌 Documentos citados: [documentos, contratos, processos, comprovantes que o cliente citou na conversa — se nao houver, escreva "Nao mencionado"]
+📌 Urgencia/prazo: [prazo, audiencia, notificacao ou data mencionada]
+📌 Ja tentou: [acoes anteriores mencionadas pelo cliente]
+📌 Pendencias: [o que ainda falta resolver ou o que o advogado deve preparar para a consulta — documentos a pedir, situacao a investigar]
+📌 Documentos citados: [documentos, contratos, processos, comprovantes que o cliente citou na conversa]
 Regra de ouro: NUNCA invente detalhe que nao esteja na conversa. Leia o que escreveu pensando "com isso o advogado prepara a reuniao?" — cada topico tem que ser util antes da consulta, nao um resumo administrativo do atendimento.
 
 EXEMPLOS REAIS DE CAPTACAO (captacao = quem TROUXE o lead; adv_resp = quem CUIDA da area — podem ser pessoas diferentes):
@@ -3260,7 +3435,7 @@ Formato de resposta (use dados reais extraidos, nao descricoes):
     "modalidade_consulta": "online",
     "status_negocio_sugerido": null,
     "motivo_perda_sugerido": null,
-    "resumo_atendimento": "📌 Caso: pai do cliente faleceu ha 3 meses e deixou uma casa; os dois irmaos querem vender o imovel sem repassar a parte do cliente na heranca.\n📌 Objetivo do cliente: entender seus direitos no inventario e formalizar a partilha antes que os irmaos vendam a casa.\n📌 Urgencia/prazo: Nao mencionado.\n📌 Ja tentou: Nada mencionado.\n📌 Pendencias: pedir a certidao de obito e a matricula do imovel para a consulta.\n📌 Documentos citados: Nao mencionado.",
+    "resumo_atendimento": "📌 Caso: pai do cliente faleceu em marco e deixou uma casa no bairro Renascenca, sem testamento.\nOs dois irmaos moram no imovel e ja procuraram um comprador, e o cliente diz que eles se recusam a falar sobre a parte dele na heranca.\nO cliente e o filho mais novo e nao consta na escritura, que esta no nome so do pai.\n📌 Objetivo do cliente: entender seus direitos no inventario e formalizar a partilha antes que os irmaos vendam a casa.\n📌 Pendencias: pedir a certidao de obito e a matricula atualizada do imovel para a consulta; confirmar se ja existe inventario aberto.\n📌 Documentos citados: escritura da casa no nome do pai (o cliente disse que a irma tem a via original).",
     "cpf": null,
     "profissao": null,
     "estado_civil": null,
@@ -3314,8 +3489,22 @@ async function extrairDadosAtendimento(historico, temDeal, dadosAnteriores, info
   // anteriores — senao o modelo nunca fica sabendo que um campo obrigatorio continua vazio e a
   // regra "atualize APENAS o que identificou agora" faz ele ignorar o campo pra sempre.
   const pendentes = camposPendentes(dadosAnteriores);
-  const contextoAnteriores = dadosAnteriores
-    ? `${JSON.stringify(dadosAnteriores)}\n- Campos obrigatorios AINDA PENDENTES (preencha estes se a conversa permitir, mesmo que nao tenham sido mencionados agora): ${pendentes.length ? pendentes.join(', ') : 'nenhum'}`
+  // O RESUMO ANTERIOR NAO VAI NO PROMPT, e isto e um conserto medido, nao uma preferencia. A regra
+  // "atualize APENAS o que identificou agora" faz o modelo COPIAR o resumo antigo palavra por
+  // palavra quando ele esta ali — e com ele vem o formato antigo inteiro. MEDIDO em 02/09/2026 nas
+  // MESMAS 40 conversas, com o prompt novo em vigor nas duas rodadas:
+  //   com o resumo anterior no prompt : 1,62 literal "nao mencionado" por resumo, mediana 300 chars
+  //   sem o resumo anterior no prompt : 0    literais,                            mediana 466 chars
+  // Ou seja: enquanto o texto velho viajava junto, TODA melhoria de prompt era invisivel para
+  // conversa que ja tinha last_data — que e justamente o caso de refrescarBriefingsPertoDaConsulta,
+  // o briefing que o advogado le minutos antes da consulta. Os OUTROS campos continuam indo (sao
+  // dado, e o modelo precisa deles para nao reabrir o que ja foi decidido); so a narrativa e
+  // reescrita do zero a cada rodada. Se o modelo devolver resumo null, mergeDados preserva o antigo
+  // do banco como sempre — `dadosAnteriores` segue intacto fora daqui.
+  const anterioresParaPrompt = dadosAnteriores ? { ...dadosAnteriores } : null;
+  if (anterioresParaPrompt) delete anterioresParaPrompt.resumo_atendimento;
+  const contextoAnteriores = anterioresParaPrompt
+    ? `${JSON.stringify(anterioresParaPrompt)}\n- Campos obrigatorios AINDA PENDENTES (preencha estes se a conversa permitir, mesmo que nao tenham sido mencionados agora): ${pendentes.length ? pendentes.join(', ') : 'nenhum'}\n- O resumo_atendimento anterior NAO esta acima de proposito: reescreva-o do zero a partir da conversa, sem copiar texto de rodada passada.`
     : `{ "pendentes": "${pendentes.join(', ')}" }`;
   const prompt = PROMPT_EXTRAIR
     .replace('{historico}', historico)
@@ -3582,16 +3771,13 @@ function textoConsultaAnterior(retorno) {
 // Dedup por LINHA, nao por texto: o mesmo veredito volta a cada ciclo enquanto a conversa nao mudar, e
 // um aviso repetido a cada 5 min afoga justamente o caso que importa (a mesma licao de
 // agendamento_pendente_hash e vinculo_aviso_hash).
-async function avisarRetornoUmaVez({ chatId, row, retorno, nota, telegrama }) {
+async function avisarRetornoUmaVez({ chatId, row, retorno, telegrama }) {
   const hash = crypto.createHash('sha1')
     .update([retorno.decisao, retorno.motivo, retorno.consulta?.quando || '', retorno.assuntoNovo || '', String(row?.deal_id || '')].join('|'))
     .digest('hex');
   if (row?.retorno_aviso_hash === hash) {
     console.log('  ⏭️ aviso de retorno identico ao ultimo — nao repetido');
     return false;
-  }
-  if (nota && row?.deal_id) {
-    try { await criarNotaMoskit(row.deal_id, nota); } catch (e) { console.error(`  ⚠️ nota de retorno falhou: ${e.message}`); }
   }
   if (telegrama) await enviarTelegram(telegrama);
   try { stmtRetornoAvisoHash().run(hash, chatId); } catch (e) { console.error(`  ⚠️ nao gravei retorno_aviso_hash: ${e.message}`); }
@@ -3626,11 +3812,7 @@ async function abrirNovoAtendimento({ chatId, row, retorno, dados, dadosAnterior
 
   if (CLIENTE_RETORNO_DRY_RUN) {
     console.log(`  🤖 [dry-run] abriria o ${numero}o atendimento (corte na msg ${retorno.corteMsgIdx}, ${porque}) — nada gravado`);
-    await avisarRetornoUmaVez({
-      chatId, row, retorno,
-      nota: `🤖 [dry-run] Cliente de retorno: caso novo detectado depois da consulta de ${consultaTexto} (${porque}). Um negócio novo SERIA criado — revisão manual necessária (CLIENTE_RETORNO_DRY_RUN ativo).`,
-      telegrama,
-    });
+    await avisarRetornoUmaVez({ chatId, row, retorno, telegrama });
     return false;
   }
 
@@ -3646,16 +3828,8 @@ async function abrirNovoAtendimento({ chatId, row, retorno, dados, dadosAnterior
   stmtAbrirAtendimento().run(retorno.corteMsgIdx, numero, JSON.stringify(anteriores), chatId);
   console.log(`  🔁 ${numero}o atendimento aberto para ${chatId} — corte na msg ${retorno.corteMsgIdx} (${porque}); negocio ${row.deal_id} preservado`);
 
-  // Best-effort: a nota e o aviso nao podem desfazer o corte que ja esta no banco, entao falha aqui
-  // nunca lanca — o pior caso e a equipe descobrir o segundo negocio pelo funil.
-  try {
-    await criarNotaMoskit(
-      row.deal_id,
-      `🔁 Cliente voltou com um caso novo depois da consulta de ${consultaTexto} (${porque}). Este negócio foi encerrado para o bot: o caso novo ("${assuntoNovo}") vai para um negócio separado, e nada aqui será sobrescrito.`
-    );
-  } catch (e) {
-    console.error(`  ⚠️ nota de retorno no deal ${row.deal_id} falhou: ${e.message}`);
-  }
+  // O Telegram avisa a equipe; o corte em si nao vira nota no negocio (a acao ja foi concluida com
+  // sucesso — quem quiser o historico tem deals_anteriores e o Telegram).
   try { await enviarTelegram(telegrama); } catch (e) { console.error(`  ⚠️ Telegram de retorno falhou: ${e.message}`); }
 
   // Conversa muda NUNCA e reprocessada por conta propria (nada aqui reprocessa so porque o tempo
@@ -3980,7 +4154,6 @@ async function processarConversaDirect(chatId) {
           const consultaTexto = textoConsultaAnterior(retorno);
           await avisarRetornoUmaVez({
             chatId, row, retorno,
-            nota: `🔁 Caso descrito depois da consulta de ${consultaTexto}, mas ${clienteRetorno.descreverMotivo(retorno.motivo)} — o bot não sabe dizer se é um caso NOVO ou a continuação deste. Nada foi reclassificado; se for caso novo, abra o negócio na mão.`,
             telegrama: [
               '🔁 *Cliente antigo escreveu de novo — é caso novo?*',
               `Cliente: ${dados?.nome || dadosAnteriores?.nome || row?.contact_name || 'nao informado'} (\`${chatId}\`)`,
@@ -4013,6 +4186,22 @@ async function processarConversaDirect(chatId) {
     if (deveEsperarCasoDescrito(acao, casoDescrito, apuracao, bloco.enviado)) {
       console.log(`  ⏳ "criar" sem caso descrito (e sem horario confirmado nem bloco de condicoes) — tratando como aguardar, nada e criado no CRM`);
       acao = 'aguardar';
+    }
+
+    // CAMPOS OBRIGATORIOS na CRIACAO — ver deveEsperarCamposObrigatorios. Roda ANTES de
+    // buscarOuCriarContato (dentro do ramo "criar" abaixo): bloquear depois criaria um contato no
+    // Moskit a toa em todo ciclo que so vai virar "aguardar".
+    if (acao === 'criar') {
+      const dadosMescladosGate = mesclarParaCrm(dadosAnteriores, dados, obsValidas);
+      if (deveEsperarCamposObrigatorios(dadosMescladosGate, apuracao, bloco.enviado)) {
+        const pendentesGate = camposPendentes(dadosMescladosGate);
+        if (BLOQUEIO_CAMPOS_OBRIGATORIOS_DRY_RUN) {
+          console.log(`  🔍 [dry-run] bloquearia "criar" por campo(s) pendente(s) (${pendentesGate.join(', ')}) — criando mesmo assim (BLOQUEIO_CAMPOS_OBRIGATORIOS_DRY_RUN ativo)`);
+        } else {
+          console.log(`  ⏳ "criar" com campo(s) obrigatorio(s) pendente(s) (${pendentesGate.join(', ')}) e sem horario confirmado nem bloco de condicoes — tratando como aguardar, nada e criado no CRM`);
+          acao = 'aguardar';
+        }
+      }
     }
 
     if (acao === 'ignorar') {
@@ -4065,19 +4254,6 @@ async function processarConversaDirect(chatId) {
         const deal = await criarNegocioMoskit(dadosMesclados, contactId, opcoesPayload);
         dealId = deal.id;
         console.log(`  ✅ Novo Deal ${dealId} criado`);
-        // Segundo atendimento do mesmo cliente: o negocio novo nasce citando o anterior, sem nenhuma
-        // chamada ao CRM (deals_anteriores e local). E o que permite a quem abre este negocio saber que
-        // existe historico — o CRM nao liga os dois sozinho.
-        const anteriores = lerDealsAnteriores(row);
-        if (anteriores.length) {
-          const anterior = anteriores[anteriores.length - 1];
-          const quando = anterior.consulta_em ? formatarHorarioEscritorio(instanteParaNaiveLocal(anterior.consulta_em)) : null;
-          await criarNotaMoskit(dealId, [
-            `🔁 Cliente de retorno — ${anteriores.length + 1}º atendimento.`,
-            `Negócio anterior: ${anterior.deal_id}${anterior.assunto ? ` ("${anterior.assunto}")` : ''}${quando ? `, consulta em ${quando}` : ''}.`,
-            'Este negócio é do caso novo; o anterior fica como está.',
-          ].join('\n'));
-        }
       }
 
       // Se o deal foi recriado com outro id, o banco precisa saber agora — o briefing e o
@@ -4190,25 +4366,6 @@ async function processarConversaDirect(chatId) {
         console.log(`  ✅ Deal ${dealId} atualizado no Moskit`);
       }
 
-      const camposAlterados = Object.keys(dados).filter(
-        (k) => dados[k] !== null && dados[k] !== undefined && dados[k] !== 'null'
-      );
-      if (camposAlterados.length > 0) {
-        const descricao = camposAlterados.map((k) => `${k}: ${dados[k]}`).join(', ');
-        // Hash: a IA devolve os mesmos campos a cada ciclo enquanto a conversa nao muda, e essa nota
-        // era postada de novo toda vez — o deal 48423360 acumulou SEIS notas identicas, ruido que
-        // ainda por cima escondia o problema real (o campo que nao estava pegando no CRM).
-        const hashNota = crypto.createHash('sha1').update(descricao).digest('hex');
-        const notaAtual = db.prepare('SELECT campos_nota_hash FROM conversations WHERE chat_id = ?').get(chatId);
-        if (notaAtual?.campos_nota_hash === hashNota) {
-          console.log(`  ⏭️ nota de campos identica a ultima — nao repostada`);
-        } else {
-          await criarNotaMoskit(dealId, `🔄 Campos preenchidos: ${descricao}`);
-          db.prepare('UPDATE conversations SET campos_nota_hash = ? WHERE chat_id = ?').run(hashNota, chatId);
-          console.log(`  ✅ Nota de atualizacao adicionada`);
-        }
-      }
-
       if (pendentes.length === 0) {
         console.log('  🎯 Todos os campos obrigatorios preenchidos!');
       }
@@ -4216,7 +4373,17 @@ async function processarConversaDirect(chatId) {
       await finalizarCiclo({ dealId, dados, dadosMesclados, chatId, row, apuracao, acao, obsValidas, mensagens,
         resumo: `Deal ${dealId} atualizado com campos pendentes` });
 
-      if (pendentes.length === 0) {
+      // BRIEFING COM A LACUNA ANOTADA, e nao briefing nenhum. Este bloco vivia dentro de
+      // `if (pendentes.length === 0)`, e o portao era um beco sem saida: aplicarGateCasoDescrito
+      // anula `area_direito` e `advogado_responsavel` de proposito quando ninguem descreveu o caso
+      // (decisao de 12/08 — melhor vazio que adivinhado), os dois estao em CAMPOS_OBRIGATORIOS, e
+      // entao conversa sem caso descrito NUNCA podia receber briefing. O resumo era pedido a OpenAI,
+      // pago, escrito e descartado sem uma linha de log. MEDIDO em 02/09/2026 (avaliar-extracao.js,
+      // 277 conversas): 19 barradas aqui, 14 delas com resumo pronto, e em todas as 14 quem segurou
+      // foram exatamente esses dois campos. O ramo "criar" nunca teve essa condicao — a assimetria
+      // entre os dois ramos era o defeito, e o gate do caso descrito continua intacto porque e ele
+      // que protege o CRM de palpite.
+      if (BRIEFING_SEM_PENDENTES || pendentes.length === 0) {
         // Ver comentario equivalente no ramo "criar" — briefing so depois de finalizarCiclo, com o
         // horario RECEM-CONFIRMADO no banco, nunca com apuracao.horarioIso otimista.
         const rowPosAgendamento = db.prepare('SELECT evento_calendar_data FROM conversations WHERE chat_id = ?').get(chatId);
@@ -4225,6 +4392,9 @@ async function processarConversaDirect(chatId) {
           contato: row.contact_name,
           telefone: chatId,
           horarioConsulta: formatarHorarioEscritorio(rowPosAgendamento?.evento_calendar_data),
+          // Viaja no contexto e chega ao cabecalho por `montarTextoBriefing` (spread em
+          // registrarBriefing). Lista vazia nao produz linha nenhuma.
+          pendentes,
         });
       }
       return;
@@ -4951,12 +5121,10 @@ async function processarWebhookZapSign(payload) {
   // Fechamento do negocio (WON/LOST) continua exclusivo de equipe_declarou_ganho/perdido na
   // conversa (ver fecharNegocioSeAplicavel) — assinatura do contrato NAO fecha o deal
   // automaticamente, e uma decisao de produto que nao foi pedida e fica de fora de proposito.
-  if (info.assinado) {
-    await criarNotaMoskit(row.deal_id, '✅ Contrato de Prestação de Serviço assinado pelo cliente via ZapSign.');
-  } else if (info.recusado) {
-    await criarNotaMoskit(row.deal_id, '❌ Cliente recusou assinar o contrato de Prestação de Serviço (ZapSign).');
+  if (info.recusado) {
+    await enviarTelegram(`❌ *Cliente recusou assinar o contrato*\nDeal: \`${row.deal_id}\`\nContrato de Prestação de Serviço (ZapSign).`).catch(() => {});
   } else if (info.emailFalhou) {
-    await criarNotaMoskit(row.deal_id, '⚠️ Falha ao entregar o e-mail de assinatura do contrato (ZapSign) — verificar o endereço ou reenviar manualmente.');
+    await enviarTelegram(`⚠️ *Falha ao entregar e-mail de assinatura*\nDeal: \`${row.deal_id}\`\nContrato (ZapSign) — verificar o endereço ou reenviar manualmente.`).catch(() => {});
   }
 }
 
@@ -5151,9 +5319,6 @@ async function sincronizarAtividadesMoskit() {
           const dataFormatadaNativo = new Date(atv.dueDate).toLocaleString('pt-BR', { timeZone: TZ_ESCRITORIO });
           console.log(`  ✅ Link do Meet adicionado ao evento nativo "${atv.title}" (${ollEventId}): ${meetLinkNativo}`);
 
-          if (dealId) {
-            await criarNotaMoskit(dealId, `🔗 Link do Meet adicionado à reunião "${atv.title}": ${meetLinkNativo}${seloConsultaGratis(authNativa.motivo)}`);
-          }
           await notificarTelegramMeet({ nome: atv.title, telefone: null, advogado: null, dataHoraTexto: dataFormatadaNativo, meetLink: meetLinkNativo, dealId });
           continue;
         }
@@ -5215,16 +5380,13 @@ async function sincronizarAtividadesMoskit() {
         stmtAtividadeMarcarSincronizada.run(atv.id, evento.data.id, dealId);
         relatorio.eventos_criados++;
         // Com timeZone explicito: sem ele este log sai na hora do SISTEMA (a VPS roda em UTC, 3h
-        // adiantado) enquanto a nota do mesmo deal, tres linhas abaixo, sai na hora do escritorio —
+        // adiantado) enquanto o aviso do Telegram, tres linhas abaixo, sai na hora do escritorio —
         // o mesmo compromisso aparecia em dois horarios diferentes dependendo de onde se olhava.
         console.log(`  ✅ Evento criado pra atividade "${atv.title}" (${inicio.toLocaleString('pt-BR', { timeZone: TZ_ESCRITORIO })})`);
 
         const meetLink = extrairMeetLink(evento.data);
         const dataFormatada = inicio.toLocaleString('pt-BR', { timeZone: TZ_ESCRITORIO });
 
-        if (dealId) {
-          await criarNotaMoskit(dealId, `📅 Reunião "${atv.title}" sincronizada com o Google Calendar (${dataFormatada})${meetLink ? `\nLink do Meet: ${meetLink}` : ''}${seloConsultaGratis(auth.motivo)}`);
-        }
         await notificarTelegramMeet({
           nome: atv.title,
           telefone: null,
@@ -5340,11 +5502,6 @@ async function backfillMeetLinks(dryRun) {
 
           const dataHoraTexto = new Date(ev.start?.dateTime || ev.start?.date).toLocaleString('pt-BR', { timeZone: TZ_ESCRITORIO });
 
-          if (dealId) {
-            await criarNotaMoskit(dealId, `🔗 Link do Meet adicionado à reunião já agendada: ${meetLink}${seloConsultaGratis(motivoLiberacao)}`).catch((e) => {
-              console.error(`  ❌ Erro ao anotar link no deal ${dealId}: ${e.message}`);
-            });
-          }
           await notificarTelegramMeet({ nome: ev.summary, telefone: null, advogado: null, dataHoraTexto, meetLink, dealId });
         } catch (e) {
           relatorio.erros++;
@@ -5756,11 +5913,6 @@ async function reconciliarClassificacao({ aplicar = false, incluirLegado = false
         condicoesValorEnviadas: condicoesParaPayload,
         forcarAutoria: incluirLegado,
       });
-      await criarNotaMoskit(
-        linha.deal_id,
-        '🔁 Classificação reconciliada automaticamente (o CRM estava diferente do que o bot apurou na conversa): ' +
-        divergentes.map((c) => nomeCampo(c.id)).join(', ') + '.'
-      );
       console.log(`  🔁 Deal ${linha.deal_id} reconciliado (${divergentes.length} campo(s))`);
     } catch (e) {
       relatorio.erros.push({ chat_id: linha.chat_id, deal_id: linha.deal_id, erro: e.message });
@@ -5882,7 +6034,6 @@ async function reconciliarVinculoAtividades({ aplicar = false } = {}) {
       }
       if (aplicar) stmtResetVinculo.run(linha.chat_id);
       relatorio.religadas.push({ chat_id: linha.chat_id, deal_id: linha.deal_id, atividade_moskit_id: linha.atividade_moskit_id });
-      await criarNotaMoskit(linha.deal_id, '🔁 Atividade da agenda religada automaticamente ao negócio (o Moskit tinha criado sem esse vínculo).').catch(() => {});
       console.log(`  🔁 Deal ${linha.deal_id}: atividade ${linha.atividade_moskit_id} religada ao negocio`);
     } catch (e) {
       console.error(`  ❌ Reconciliacao de vinculo da atividade ${linha.atividade_moskit_id} (deal ${linha.deal_id}): ${e.message}`);
@@ -6575,25 +6726,10 @@ async function buscarDealsPorAtividade(inicioIso) {
   return { ids: [...new Set(ids.map(Number))], truncou };
 }
 
-async function exportarTextoDoDoc(drive, docId) {
-  if (!drive || !docId) return null;
-  try {
-    const res = await drive.files.export({ fileId: docId, mimeType: 'text/plain' }, { responseType: 'text' });
-    return typeof res.data === 'string' ? res.data : String(res.data || '');
-  } catch (e) {
-    // A transcricao e BONUS: so existe se alguem a ligou na reuniao, e o proprio Google avisa que
-    // pode nao estar la. O resumo do corpo do e-mail ja basta para a nota — falhar aqui nao pode
-    // impedir o registro no CRM.
-    console.log(`  ⏭️ Doc ${docId} nao exportado (${e.message}) — seguindo so com o resumo do e-mail`);
-    return null;
-  }
-}
-
-// O MESMO Doc, agora em PDF, para virar anexo na aba "Arquivos" do negocio.
+// O Doc do Gemini, em PDF, para virar anexo na aba "Arquivos" do negocio.
 //
-// Mesmo contrato de exportarTextoDoDoc — nunca lanca, devolve null — e pelo mesmo motivo, so que
-// mais forte: aqui o produto e um BONUS do bonus. A nota no CRM ja registra a consulta; se o PDF nao
-// sair, o pior desfecho aceitavel e "sem anexo". Falhar aqui nao pode custar a nota.
+// Nunca lanca, devolve null — o produto principal e a nota no CRM; se o PDF nao sair, o pior
+// desfecho aceitavel e "sem anexo". Falhar aqui nao pode custar a nota.
 //
 // Nao exige consentimento OAuth novo: `drive.readonly` (autorizar-google-notas.js) ja cobre exportar
 // em qualquer formato. Refazer o consentimento invalidaria o refresh token em uso e derrubaria o
@@ -6957,6 +7093,7 @@ function montarQueryNotas() {
 // Processa UM e-mail, do zero ou retomando de onde parou. A ordem existe para que todo artefato caro
 // seja gravado antes do proximo passo arriscado, e para que a unica operacao NAO idempotente (o POST
 // da nota) fique entre dois commits.
+
 async function processarNotaReuniao({ gmail, calendar, drive, mensagem, stmts, dryRun, dealIdForcado = null }) {
   const id = mensagem.id;
   const linha = stmts.get.get(id) || {};
@@ -6978,7 +7115,7 @@ async function processarNotaReuniao({ gmail, calendar, drive, mensagem, stmts, d
   // `dealIdForcado` (religamento manual) atravessa de proposito — e o unico jeito de ressuscitar um
   // orfao. Menos quando ja foi postada: ai religar so criaria a segunda nota, e quem pediu precisa
   // saber disso em vez de descobrir no prontuario do cliente.
-  const ESTADOS_TERMINAIS = new Set(['CONCLUIDO', 'ORFAO', 'ERRO_PERMANENTE', 'REVISAR_MANUAL']);
+  const ESTADOS_TERMINAIS = new Set(['CONCLUIDO', 'SEM_TRANSCRICAO', 'ORFAO', 'ERRO_PERMANENTE', 'REVISAR_MANUAL']);
   if (ESTADOS_TERMINAIS.has(linha.estado)) {
     if (!dealIdForcado) {
       console.log(`  ⏭️ ${id}: ja resolvido nesta caixa (${linha.estado}) — o rotulo ainda nao apareceu na busca`);
@@ -7064,9 +7201,6 @@ async function processarNotaReuniao({ gmail, calendar, drive, mensagem, stmts, d
     return { estado: concluida ? 'CONCLUIDO' : 'ERRO_PERMANENTE', dealId: jaPeloDoc.deal_id };
   }
 
-  const textoDoc = await exportarTextoDoDoc(drive, docId);
-  const { texto: textoFonte, truncou } = notasReuniao.prepararTextoFonte({ corpo, textoDoc, maxChars: NOTAS_MAX_CHARS });
-
   // --- 2. Qual negocio ------------------------------------------------------
   const porTelefone = buscarDealsPorTelefone(sinais.telefone);
   const porEmail = porTelefone.length ? [] : buscarDealsPorEmail(sinais.emails);
@@ -7117,47 +7251,15 @@ async function processarNotaReuniao({ gmail, calendar, drive, mensagem, stmts, d
     return { estado: 'ORFAO', resolucao };
   }
 
-  // --- 3. Extracao ----------------------------------------------------------
-  let extracao;
-  let avisos;
-  // Ja pago em ciclo anterior: nao chama a OpenAI de novo — mas so quando a extracao guardada segue
-  // o contrato de HOJE. Uma linha extraida sob um contrato antigo tem outras chaves, e montarTextoNota
-  // renderiza campo ausente como secao ausente: o negocio do cliente receberia um briefing sem uma
-  // unica secao, so cabecalho e rodape. Uma chamada de IA a mais custa menos que isso.
-  const guardada = linha.estado === 'EXTRAIDO' && linha.extracao ? parseJsonSeguro(linha.extracao, null) : null;
-  if (guardada && notasReuniao.ehExtracaoAtual(guardada.extracao)) {
-    ({ extracao, avisos } = guardada);
-  } else {
-    const mensagens = notasReuniao.montarMensagensExtracao(textoFonte, {
-      tituloEvento: sinais.tituloEvento || doAssunto?.tituloEvento,
-      dataIso,
-      truncou,
-    });
-    const bruto = await openaiChat(mensagens, 'json');
-
-    let parseado;
-    try {
-      parseado = JSON.parse(bruto);
-    } catch (e) {
-      throw new Error(`OpenAI devolveu JSON invalido: ${e.message}`);
-    }
-
-    const validado = notasReuniao.validarExtracao(parseado, textoFonte);
-    if (validado.vazia) {
-      // Resumo vazio nao e "reuniao sem assunto": e falha de extracao. Uma nota vazia no negocio do
-      // cliente e pior que nenhuma — parece que a reuniao nao rendeu nada.
-      stmts.avancar.run({ ...camposVazios(), gmail_message_id: id, estado: 'ERRO_PERMANENTE', ultimo_erro: 'extracao vazia (nenhum campo de sustentacao preenchido)' });
-      if (!dryRun) await rotularNota(gmail, id, NOTAS_ROTULOS.erro);
-      console.log(`  ⚠️ ${id}: extracao vazia — nada postado no deal ${resolucao.dealId}`);
-      return { estado: 'ERRO_PERMANENTE' };
-    }
-
-    extracao = validado.extracao;
-    avisos = validado.avisos;
-    stmts.avancar.run({
-      ...camposVazios(), gmail_message_id: id, estado: 'EXTRAIDO',
-      extracao: JSON.stringify({ extracao, avisos }), ultimo_erro: null,
-    });
+  // --- 3. Ha transcricao? ----------------------------------------------------
+  // Decisao de 02/09/2026: a nota deixou de extrair conteudo por IA — vira so o link da
+  // transcricao. Sem Doc nenhum referenciado (nem no evento, nem no e-mail), nao ha nada util para
+  // postar: a reuniao nao gerou nota nenhuma no negocio (silencioso, nao e erro).
+  if (!docId) {
+    stmts.avancar.run({ ...camposVazios(), gmail_message_id: id, estado: 'SEM_TRANSCRICAO', ultimo_erro: null });
+    if (!dryRun) await rotularNota(gmail, id, NOTAS_ROTULOS.processado);
+    console.log(`  ℹ️ ${id}: sem transcricao (reuniao sem Doc/gravacao) — nenhuma nota no deal ${resolucao.dealId}`);
+    return { estado: 'SEM_TRANSCRICAO', dealId: resolucao.dealId };
   }
 
   // --- 4. A nota ------------------------------------------------------------
@@ -7165,22 +7267,30 @@ async function processarNotaReuniao({ gmail, calendar, drive, mensagem, stmts, d
 
   // O anexo vem ANTES da nota de proposito: so assim o rodape pode afirmar "transcricao anexada" e
   // ser verdade. `anexarDocNoDeal` nunca lanca — se falhar, `anexado` volta false, a linha some do
-  // rodape e a nota entra igual.
-  const { anexado } = await anexarDocNoDeal({
+  // rodape e a nota entra igual (com o link cru do Doc — retentativas transitorias continuam
+  // tentando religar o PDF depois, via retomarAnexosPendentes).
+  const { anexado, motivo: motivoAnexo } = await anexarDocNoDeal({
     dealId: resolucao.dealId, docId, gmailMessageId: id, dataIso, marcador, drive, stmts, dryRun,
   });
 
+  // 'export_falhou' e veredito do Drive (404/403 — permanente, nao transitorio): o Doc referenciado
+  // no evento/e-mail nao existe de verdade ou esta fora do alcance da credencial. Sem PDF nenhum
+  // para anexar e sem certeza de que o link abre para alguem, trata igual a "sem transcricao" —
+  // postar um link morto nao e "util".
+  if (motivoAnexo === 'export_falhou') {
+    stmts.avancar.run({ ...camposVazios(), gmail_message_id: id, estado: 'SEM_TRANSCRICAO', ultimo_erro: null });
+    if (!dryRun) await rotularNota(gmail, id, NOTAS_ROTULOS.processado);
+    console.log(`  ℹ️ ${id}: Doc referenciado mas inacessivel (${motivoAnexo}) — nenhuma nota no deal ${resolucao.dealId}`);
+    return { estado: 'SEM_TRANSCRICAO', dealId: resolucao.dealId };
+  }
+
   const texto = notasReuniao.montarTextoNota({
-    extracao,
-    avisos,
     marcador,
     meta: {
       dataBr: dataIso.split('-').reverse().join('/'),
       tituloEvento: sinais.tituloEvento || doAssunto?.tituloEvento,
-      truncou,
-      semTranscricao: !textoDoc,
       anexado,
-      linkDoc: docId ? `https://docs.google.com/document/d/${docId}` : '',
+      linkDoc: `https://docs.google.com/document/d/${docId}`,
       metodo: resolucao.metodo,
       confianca: resolucao.confianca,
       numeroReuniao: reuniaoRetorno.numeroDaReuniao(reunioesConhecidasDoDeal(resolucao.dealId), dataIso),
@@ -7887,9 +7997,36 @@ module.exports = {
   // test-pipeline.js, porque processarConversaDirect depende da OpenAI e nao roda nos testes.
   aplicarGateCasoDescrito,
   aplicarPadroesDeterministicosDeOrigem,
+  detectarRespostaPerguntaOrigem,
   deveEsperarCasoDescrito,
+  deveEsperarCamposObrigatorios,
   sanitizarClassificacao,
   mesclarParaCrm,
+  // Exportada para avaliar-extracao.js: e ela que define o portao do briefing (`pendentes.length === 0`
+  // no ramo atualizar_campos), entao medir quantos resumos sao produzidos e descartados exige a MESMA
+  // funcao. Espelhar a lista de campos obrigatorios no script faria as duas divergirem em silencio.
+  camposPendentes,
+  // Exportados para auditar-crm-relatar.js pelo MESMO motivo de camposPendentes: o relatorio precisa
+  // dizer "este deal esta sem campo obrigatorio" e "este titulo e generico" usando a definicao da
+  // PRODUCAO, nao uma copia. Uma lista espelhada no script divergiria em silencio no dia em que
+  // alguem acrescentasse um campo obrigatorio aqui — e o relatorio continuaria dando tudo certo.
+  CAMPOS_OBRIGATORIOS,
+  ASSUNTO_NEUTRO,
+  ehAssuntoNeutro,
+  // Exportada em 03/09/2026 pro script de correção de nome genérico (PLANO-CORRECAO-QUALIDADE-DEALS.md,
+  // Fase 3): antes de renomear um deal com o assunto salvo em last_data, precisa confirmar que esse
+  // assunto NÃO é ele mesmo o nome de uma área — a auditoria não checa isso (só vê "existe algo em
+  // last_data.assunto"), e usar uma cópia da regra aqui divergiria da produção no dia em que a lista de
+  // áreas mudasse.
+  rejeitarAssuntoQueEhArea,
+  removerAcentos,
+  // Paginador generico de subcolecao do deal (/notes, /attachments): ?start=, pagina de 10, `limit`
+  // ignorado, e LANCA ao bater no teto de paginas em vez de devolver "nao achei" — a distincao entre
+  // "nao existe" e "nao terminei de procurar" leva a acoes opostas.
+  acharEmColecaoDoDeal,
+  // Consumo de tokens acumulado, para medir custo por conversa sem estimar por caractere.
+  lerUsoIA,
+  zerarUsoIA,
   derivarAdvogadoDaArea,
   detectarOpcoesInvalidas,
   registrarOpcoesInvalidas,

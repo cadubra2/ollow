@@ -34,6 +34,7 @@ const fs = require('fs');
 const Database = require('better-sqlite3');
 const axios = require('axios');
 const MOSKIT_IDS = require('./src/moskit-ids');
+const { escreverCsv } = require('./src/csv');
 const bot = require('./index.js');
 
 const MOSKIT_BASE = process.env.MOSKIT_BASE || 'https://api.moskitcrm.com/v2';
@@ -206,13 +207,21 @@ function classificarCausa(linhaLocal) {
     console.log('');
   }
 
+  // Escape do CSV via src/csv.js desde 02/09/2026. A montagem anterior misturava JSON.stringify
+  // (que escapa aspas como \", nao como "") com valores CRUS nao citados — `causa` contem virgula, e
+  // toda virgula ali quebrava a coluna em duas sem erro nenhum na abertura da planilha.
   const csvPath = path.join(process.cwd(), `deals-bot-sem-origem-${Date.now()}.csv`);
-  const linhasCsv = ['deal_id,nome,status,criado_em,chat_id,so_vinculado,origem_local,motivo,causa']
-    .concat(semOrigem.map((d) => [
-      d.deal_id, JSON.stringify(d.nome || ''), d.status, d.criado_em || '', d.chat_id || '',
-      d.so_vinculado, JSON.stringify(d.origem_local || ''), d.motivo, JSON.stringify(d.causa),
-    ].join(',')));
-  fs.writeFileSync(csvPath, linhasCsv.join('\n'), 'utf8');
+  escreverCsv(csvPath, semOrigem.map((d) => ({
+    deal_id: d.deal_id,
+    nome: d.nome || '',
+    status: d.status,
+    criado_em: d.criado_em || '',
+    chat_id: d.chat_id || '',
+    so_vinculado: d.so_vinculado,
+    origem_local: d.origem_local || '',
+    motivo: d.motivo,
+    causa: d.causa,
+  })));
   console.log(`📄 CSV salvo em: ${csvPath}`);
 
   console.log('='.repeat(70));

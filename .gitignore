@@ -14,6 +14,10 @@ conversations.db
 conversations.db-wal
 conversations.db-shm
 conversations.backup-*.db
+# O -wal/-shm do BACKUP tinha ficado de fora, e a regra do `conversations.db` acima nao os alcanca:
+# eram 8 arquivos de conversa de cliente esperando um `git add -A`. Mesmo conteudo, mesma regra.
+conversations.backup-*.db-wal
+conversations.backup-*.db-shm
 database.db
 *.sqlite
 *.sqlite-wal
@@ -30,11 +34,25 @@ ngrok.log
 # Comprovantes de pagamento baixados dos clientes.
 comprovantes/
 
+# Snapshot da auditoria do CRM (auditar-crm-coletar.js) e os CSVs que auditar-crm-relatar.js deriva
+# dele. E o artefato MAIS SENSIVEL que este repositorio produz: nome, telefone, caso e resumo de
+# ~4.265 pessoas, o CRM inteiro em texto puro no disco. As regras de `deals-*.csv` abaixo nao o
+# alcancam — o snapshot mora numa pasta propria e os relatorios nascem com outro prefixo.
+auditoria-crm/
+
 # CSVs gerados pelos scripts estudar-*.js/diagnosticar-*.js (nome, telefone e dados do caso de
 # clientes reais). Ficam no disco de quem rodou, nunca no repositorio.
 deals-*.csv
 notas-*.csv
 retorno-*.csv
+
+# Saida de avaliar-extracao.js. Mesma razao das linhas acima: o arquivo bruto tem chat_id (telefone),
+# nome do contato e o resumo do caso, e a rubrica e uma planilha de conversa de cliente para alguem
+# preencher a mao. O `agregado-*.json` fica de FORA desta lista de proposito: ele tem so contagens, e
+# e o que a Fase 2 precisa comparar contra a linha de base. Se um dia o agregado passar a carregar
+# exemplo de texto, ele entra aqui tambem.
+avaliacoes/linha-de-base-*.json
+avaliacoes/rubrica-*.csv
 
 # PDFs das notas de reuniao, servidos temporariamente para o Moskit baixar. Sao transcricoes de
 # consulta juridica: nunca podem ir para o repositorio. A rotina os apaga assim que o Moskit
