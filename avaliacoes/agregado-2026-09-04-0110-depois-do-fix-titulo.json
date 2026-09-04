@@ -1,0 +1,205 @@
+{
+  "gerado_em": "2026-09-04T04:10:47.008Z",
+  "opcoes": {
+    "soGratis": false,
+    "rubrica": false,
+    "semEstado": false,
+    "soComDesfecho": true,
+    "limite": 60,
+    "concorrencia": 2,
+    "seed": 42
+  },
+  "modelo": "gpt-4o-mini",
+  "camada0": {
+    "conversas": 401,
+    "mensagens": 14331,
+    "por_acao": {
+      "inviavel": 289,
+      "interno": 10,
+      "aguardar": 45,
+      "criar": 11,
+      "nota": 5,
+      "atualizar_campos": 40,
+      "ignorar": 1
+    },
+    "acima_de_100_mensagens": 47,
+    "mensagens_mediana": 14,
+    "placeholders_de_anexo": 867,
+    "placeholders_de_audio_transcrito": 143,
+    "conteudo_perdido": 724,
+    "conteudo_perdido_do_cliente": 493,
+    "conversas_com_placeholder": 159,
+    "placeholders_por_tipo": {
+      "equipe - image": 84,
+      "equipe - audio": 51,
+      "equipe - file": 75,
+      "equipe - arquivo nomeado": 70,
+      "cliente - arquivo nomeado": 153,
+      "cliente - image": 111,
+      "cliente - imagem": 138,
+      "cliente - audio": 92,
+      "cliente - figurinha": 1,
+      "cliente - file": 85,
+      "outro": 2,
+      "cliente - Me confirma as suas atuações, por gentileza?": 1,
+      "cliente - video": 4
+    },
+    "com_last_data": 131,
+    "sem_resumo": 3,
+    "resumo_chars": {
+      "min": 71,
+      "mediana": 322,
+      "max": 693
+    },
+    "literais_nao_mencionado": 341,
+    "literais_por_resumo": 2.66,
+    "preenchimento_por_campo": {
+      "nome": 122,
+      "assunto": 115,
+      "origem": 130,
+      "advogado_responsavel": 55,
+      "captacao": 89,
+      "tipo_consulta": 126,
+      "area_direito": 60,
+      "pagamento_confirmado": 130,
+      "data_hora_consulta": 44,
+      "email_cliente": 19,
+      "estagio_funil_sugerido": 1,
+      "modalidade_consulta": 112,
+      "status_negocio_sugerido": 0,
+      "motivo_perda_sugerido": 0,
+      "resumo_atendimento": 128,
+      "cpf": 14,
+      "profissao": 15,
+      "estado_civil": 17,
+      "endereco": 16,
+      "valor_honorarios_inicial": 5,
+      "valor_honorarios_liminar": 0,
+      "valor_mensalidade": 3
+    },
+    "base_do_preenchimento": 131
+  },
+  "camada1": {
+    "por_portao": {
+      "modelo_aguardar": 11,
+      "ok_atualizar_campos": 23,
+      "ok_atualizar_campos_com_lacuna": 5,
+      "B1_inviavel": 16,
+      "ok_criar": 4,
+      "ok_nota": 1
+    },
+    "b4_descartados": 0,
+    "campos_que_seguraram": {
+      "assunto": 5,
+      "area_direito": 5,
+      "advogado_responsavel": 5
+    },
+    "perfil_do_resumo": {
+      "resumos": 41,
+      "resumo_chars": {
+        "min": 88,
+        "mediana": 418,
+        "max": 736
+      },
+      "literais_nao_mencionado": 6,
+      "literais_por_resumo": 0.15,
+      "linhas_uteis": {
+        "min": 1,
+        "mediana": 4,
+        "max": 6
+      },
+      "titulo": {
+        "base": 44,
+        "por_classe": {
+          "titulo_so_nome": 6,
+          "assunto_especifico": 30,
+          "titulo_generico": 8
+        },
+        "assunto_especifico": 30,
+        "titulo_nao_diz_nada": 14,
+        "assunto_igual_a_area": 0,
+        "assunto_bruto_era_area": 1,
+        "ancoragem_media": 0.9,
+        "ancorado_100pc": 24,
+        "ancorado_50pc": 29,
+        "base_da_ancoragem": 30,
+        "base_da_ancoragem_e": "so os titulos assunto_especifico"
+      },
+      "obs_emitidas_por_tipo": {
+        "cliente_descreveu_caso": 49,
+        "equipe_anunciou_valor": 23,
+        "cliente_aceitou_horario": 12,
+        "equipe_propos_horario": 22,
+        "equipe_confirmou_horario": 9,
+        "cliente_alegou_pagamento": 4,
+        "equipe_descreveu_caso": 1,
+        "cliente_propos_horario": 1
+      },
+      "obs_validas_por_tipo": {
+        "cliente_descreveu_caso": 45,
+        "equipe_anunciou_valor": 17,
+        "cliente_aceitou_horario": 12,
+        "equipe_propos_horario": 18,
+        "equipe_confirmou_horario": 9,
+        "cliente_propos_horario": 3,
+        "equipe_descreveu_caso": 3
+      },
+      "preenchimento_da_rodada": {
+        "nome": 37,
+        "assunto": 38,
+        "origem": 42,
+        "advogado_responsavel": 31,
+        "captacao": 36,
+        "tipo_consulta": 44,
+        "area_direito": 32,
+        "pagamento_confirmado": 44,
+        "data_hora_consulta": 14,
+        "email_cliente": 6,
+        "estagio_funil_sugerido": 0,
+        "modalidade_consulta": 44,
+        "status_negocio_sugerido": 0,
+        "motivo_perda_sugerido": 0,
+        "resumo_atendimento": 41,
+        "cpf": 2,
+        "profissao": 2,
+        "estado_civil": 2,
+        "endereco": 2,
+        "valor_honorarios_inicial": 0,
+        "valor_honorarios_liminar": 0,
+        "valor_mensalidade": 1
+      },
+      "preenchimento_acumulado": {
+        "nome": 41,
+        "assunto": 38,
+        "origem": 44,
+        "advogado_responsavel": 30,
+        "captacao": 37,
+        "tipo_consulta": 44,
+        "area_direito": 31,
+        "pagamento_confirmado": 44,
+        "data_hora_consulta": 19,
+        "email_cliente": 6,
+        "estagio_funil_sugerido": 1,
+        "modalidade_consulta": 44,
+        "status_negocio_sugerido": 0,
+        "motivo_perda_sugerido": 0,
+        "resumo_atendimento": 44,
+        "cpf": 5,
+        "profissao": 5,
+        "estado_civil": 5,
+        "endereco": 5,
+        "valor_honorarios_inicial": 0,
+        "valor_honorarios_liminar": 0,
+        "valor_mensalidade": 2
+      },
+      "base_do_preenchimento": 44
+    },
+    "uso": {
+      "chamadas": 104,
+      "entrada": 565255,
+      "saida": 23525
+    },
+    "custo_usd": 0.09890325,
+    "modelo": "gpt-4o-mini"
+  }
+}
