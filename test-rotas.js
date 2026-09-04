@@ -111,6 +111,12 @@ const AUTORIZADO = { 'X-Admin-Token': 'token-de-teste' };
   checar('GET /auditoria-consulta-gratis sem token', await pedir(PORTA, 'GET', '/auditoria-consulta-gratis'), 401);
   checar('POST /backfill-meet-links sem token', await pedir(PORTA, 'POST', '/backfill-meet-links'), 401);
   checar('POST /importar-moskit sem token', await pedir(PORTA, 'POST', '/importar-moskit'), 401);
+  checar('POST /chatwoot/sincronizar-contatos sem token', await pedir(PORTA, 'POST', '/chatwoot/sincronizar-contatos'), 401);
+  // Com token e com CHATWOOT_ATIVO ausente (o padrao de producao) a rota responde 200 dizendo que
+  // esta desligada, sem tocar a rede — e por isso este teste nao precisa de dublê do Chatwoot.
+  checar('POST /chatwoot/sincronizar-contatos com token (desligada)',
+    await pedir(PORTA, 'POST', '/chatwoot/sincronizar-contatos', AUTORIZADO), 200);
+
   checar('GET /cliente-existente com token', await pedir(PORTA, 'GET', '/cliente-existente/5586999999999', AUTORIZADO), 200);
   checar('GET /cliente-existente com token errado', await pedir(PORTA, 'GET', '/cliente-existente/5586999999999', { 'X-Admin-Token': 'errado' }), 401);
   checar('token tambem aceito por querystring', await pedir(PORTA, 'GET', '/cliente-existente/5586999999999?token=token-de-teste'), 200);
@@ -337,6 +343,49 @@ console.log('\n=== Webhook em periodo de tolerancia (sem WEBHOOK_SECRET) ===');
     checar('   a rota de anexo degrada para 404, nao derruba nada', r && r.anexo, 404);
   }
 
+
+  console.log('\n=== Migracao impossivel de chatwoot_contacts: o bot continua no ar ===');
+  {
+    // Mesmo defeito, mesma defesa, tabela nova: os prepares de chatwoot_contacts sao PREGUICOSOS
+    // (stmtsChatwoot) porque um db.prepare no topo do modulo transformaria o try/catch da criacao
+    // numa armadilha — o require morreria com "no such column", exit 1, e o pm2 entraria em loop de
+    // restart, derrubando WhatsApp, agenda e CRM por causa de uma funcionalidade que nasce
+    // DESLIGADA. A simulacao e a mesma de notas_reuniao: uma VIEW ocupando o nome faz o
+    // CREATE TABLE IF NOT EXISTS pular em silencio e qualquer prepare falhar de verdade.
+    const dbCw = path.join(DIR, 'migracao-impossivel-chatwoot.db');
+    const d2 = new Database(dbCw);
+    d2.exec('CREATE TABLE base_cw (id INTEGER PRIMARY KEY, x TEXT)');
+    d2.exec('CREATE VIEW chatwoot_contacts AS SELECT * FROM base_cw');
+    d2.close();
+
+    let subiu = true;
+    let r2 = null;
+    try {
+      r2 = emSubprocesso(
+        {
+          WORKER_MODE: '1', ADMIN_TOKEN: 't', WEBHOOK_SECRET: '', DB_PATH: dbCw,
+          // Ligada e configurada de proposito: e o unico jeito de a requisicao chegar ao prepare que
+          // nao pode ser feito. Host inexistente para nao haver a menor chance de sair pacote.
+          CHATWOOT_ATIVO: 'true', CHATWOOT_DRY_RUN: 'true',
+          CHATWOOT_BASE: 'https://chatwoot.invalid', CHATWOOT_ACCOUNT_ID: '1', CHATWOOT_API_TOKEN: 't',
+        },
+        `${CLIENTE_HTTP(3994)}
+         const { app }=require('./index.js');
+         const s=app.listen(3994,'127.0.0.1',async()=>{
+           console.log(JSON.stringify({
+             saude: await p('/','GET'),
+             chatwoot: await p('/chatwoot/sincronizar-contatos?token=t','POST'),
+           }));
+           s.close(); process.exit(0);
+         });`
+      );
+    } catch { subiu = false; }
+
+    checar('o processo SOBE com a migracao impossivel', subiu, true);
+    checar('   e o resto do bot continua servindo', r2 && r2.saude, 200);
+    // O pior caso e a rota do Chatwoot falhar — nao o bot inteiro sair do ar.
+    checar('   a rota do Chatwoot degrada para 500, nao derruba nada', r2 && r2.chatwoot, 500);
+  }
   console.log(`\n${falhou === 0 ? '✅' : '❌'} ${passou} passaram, ${falhou} falharam\n`);
   process.exit(falhou === 0 ? 0 : 1);
 })();

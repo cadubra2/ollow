@@ -18,6 +18,8 @@ const path = require('path');
 
 const TESTES = [
   'test-telefone.js',
+  'test-chatwoot.js',
+  'test-evolution.js',
   'test-auditoria-crm.js',
   'test-moskit-ids.js',
   'test-atividade-moskit.js',
@@ -38,6 +40,8 @@ const TESTES = [
   'test-cliente-retorno-flags.js',
   'test-reuniao-retorno.js',
   'test-reuniao-retorno-flags.js',
+  'test-chatwoot-flags.js',
+  'test-evolution-flags.js',
 ];
 
 const TZ_TESTES = process.env.TZ_TESTES || 'UTC';

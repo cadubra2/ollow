@@ -1,4 +1,10 @@
 .env
+# Qualquer variante tambem: .env.local, .env.bak, .env.old, copia feita antes de mexer... O padrao
+# `.env` sozinho casa APENAS o nome exato, e um backup de .env com os segredos dentro fica visivel
+# ao git — bastava um `git add -A` para as credenciais do escritorio entrarem no historico.
+.env.*
+# menos o exemplo, que e versionado de proposito (documenta as variaveis, sem valor nenhum)
+!.env.example
 google-service-account.json
 google-oauth-client.json
 google-oauth-token.json
@@ -39,6 +45,12 @@ comprovantes/
 # ~4.265 pessoas, o CRM inteiro em texto puro no disco. As regras de `deals-*.csv` abaixo nao o
 # alcancam — o snapshot mora numa pasta propria e os relatorios nascem com outro prefixo.
 auditoria-crm/
+
+# Saida do backfill-chatwoot-nomes.js: uma linha por contato com telefone, o nome que estava na ficha
+# e o nome que o bot escreveu, mais o link do negocio. Mesmo motivo de auditoria-crm/ — e o segundo
+# artefato mais sensivel que este repositorio produz, e nasce ignorado no MESMO commit que cria o
+# script (depois e tarde: basta um `git add -A` antes de alguem se lembrar).
+chatwoot-backfill/
 
 # CSVs gerados pelos scripts estudar-*.js/diagnosticar-*.js (nome, telefone e dados do caso de
 # clientes reais). Ficam no disco de quem rodou, nunca no repositorio.

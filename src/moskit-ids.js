@@ -284,7 +284,27 @@ const LOST_REASON = {
   'nao quis marcar consulta gratis': 244375,
 };
 
+// ------------------------------------------------------------
+// URL do app do Moskit (o link que o escritorio clica)
+// ------------------------------------------------------------
+// O link do negocio esta escrito a mao em 12 pontos (index.js, src/atividade-moskit.js e 4 scripts).
+// Ele vai para o Telegram e para a agenda, entao e provado em producao todo dia — o problema e ser
+// COPIA: o dia em que o Moskit trocar o dominio (ja trocou de marca uma vez, dai o "ollow"), os 12
+// pontos precisam mudar juntos ou divergem em silencio. E a mesma razao pela qual este arquivo existe
+// para os IDs.
+//
+// Os 12 pontos antigos continuam como estao de proposito: e codigo que funciona, e reescrever por
+// reescrever e risco sem retorno. Codigo NOVO le daqui.
+const MOSKIT_APP_BASE = String(process.env.MOSKIT_APP_BASE || 'https://app.ollow.com.br').replace(/\/+$/, '');
+
+function linkDeal(dealId) {
+  if (!dealId) return null;
+  return `${MOSKIT_APP_BASE}/?/deal/${dealId}`;
+}
+
 module.exports = {
+  MOSKIT_APP_BASE,
+  linkDeal,
   LAYLA_USER_ID,
   PRODUTO_CONSULTA_PAGA_ID,
   CF,

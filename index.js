@@ -22,6 +22,9 @@ const notasReuniao = require('./src/notas-reuniao');
 const clienteRetorno = require('./src/cliente-retorno');
 const reuniaoRetorno = require('./src/reuniao-retorno');
 const briefing = require('./src/briefing');
+const chatwoot = require('./src/chatwoot');
+const evolutionSaude = require('./src/evolution');
+const { nomeUtilizavel } = require('./src/chatwoot');
 
 // ------------------------------------------------------------
 // Config
@@ -263,6 +266,48 @@ const REUNIAO_RETORNO_DRY_RUN = process.env.REUNIAO_RETORNO_DRY_RUN !== 'false';
 // Ate quantas horas DEPOIS do fim da reuniao anterior uma confirmacao nova ainda conta como
 // remarcacao (no-show + reagendamento rapido) em vez de reuniao nova de acompanhamento.
 const REUNIAO_TOLERANCIA_REMARCACAO_HORAS = Number(process.env.REUNIAO_TOLERANCIA_REMARCACAO_HORAS) || reuniaoRetorno.TOLERANCIA_HORAS_PADRAO;
+
+// ---- Chatwoot: preencher o nome do contato a partir do Moskit --------------------------------
+// O escritorio atende pelo Chatwoot. Quando o numero do cliente NAO esta salvo na agenda do WhatsApp,
+// a ficha aparece so com o telefone e PESQUISAR PELO NOME nao encontra o cliente. O nome ja existe do
+// outro lado — o bot o extrai da conversa e grava no Moskit (e no espelho local `moskit_contacts`) —,
+// e esta rotina so leva um para o outro. A decisao pura fica em src/chatwoot.js; aqui e rede e banco.
+const CHATWOOT_BASE = (process.env.CHATWOOT_BASE || '').replace(/\/+$/, '');
+const CHATWOOT_ACCOUNT_ID = process.env.CHATWOOT_ACCOUNT_ID || '';
+const CHATWOOT_API_TOKEN = process.env.CHATWOOT_API_TOKEN || '';
+// Nasce DESLIGADO e, quando ligado, nasce em DRY-RUN — a convencao de toda funcionalidade nova aqui.
+const CHATWOOT_ATIVO = process.env.CHATWOOT_ATIVO === 'true';
+const CHATWOOT_DRY_RUN = process.env.CHATWOOT_DRY_RUN !== 'false';
+const CHATWOOT_PAUSA_MS = Number(process.env.CHATWOOT_PAUSA_MS) || 300;
+// Teto de paginas da varredura de contatos. O rate limit do Chatwoot nao foi medido nesta instancia
+// (sondar-chatwoot.js mede antes de qualquer lote), entao o teto nasce alto o suficiente para uma
+// base de ~4 mil contatos e explicito o suficiente para nao virar varredura infinita.
+const CHATWOOT_MAX_PAGINAS = Number(process.env.CHATWOOT_MAX_PAGINAS) || 400;
+const CHATWOOT_MAX_TENTATIVAS = Number(process.env.CHATWOOT_MAX_TENTATIVAS) || 3;
+// Contato que a cascata nao achou no Chatwoot nao pode custar 2 requisicoes por ciclo para sempre.
+const CHATWOOT_RETENTAR_HORAS = Number(process.env.CHATWOOT_RETENTAR_HORAS) || 24;
+// Teto por ciclo da rotina periodica (o backfill de uma vez e o script, nao a rotina).
+const CHATWOOT_MAX_POR_CICLO = Number(process.env.CHATWOOT_MAX_POR_CICLO) || 40;
+
+// ---- Monitor Evolution API -> Chatwoot (nunca mais ficar mudo) --------------------------------
+// Em 04/09/2026 um Access Token do Chatwoot foi regenerado por seguranca e a Evolution API — o
+// servico que conecta o WhatsApp real ao Chatwoot, na MESMA VPS do bot — continuou configurada com o
+// token antigo. 58 minutos sem NENHUMA mensagem de WhatsApp virar conversa no Chatwoot, e nenhum
+// alarme disparou; so foi descoberto porque o dono notou na mao. Isto existe para nunca mais ficar
+// mudo. Ver src/evolution.js para a decisao pura (o que conta como "quebrado" e o texto do aviso).
+const EVOLUTION_BASE = (process.env.EVOLUTION_BASE || 'http://127.0.0.1:8080').replace(/\/+$/, '');
+const EVOLUTION_API_KEY = process.env.EVOLUTION_API_KEY || '';
+const EVOLUTION_INSTANCE = process.env.EVOLUTION_INSTANCE || 'escritorio';
+// Nasce LIGADO — ao contrario de toda outra funcionalidade nova deste repo. A convencao de nascer
+// desligada existe para conter o dano de uma ESCRITA errada; este monitor e estritamente leitura
+// (nunca escreve na Evolution nem no Chatwoot, so manda Telegram), entao o pior caso de estar ligado
+// por engano e um aviso a mais — e existe especificamente para prevenir a repeticao de um incidente
+// que ja aconteceu. Sem EVOLUTION_API_KEY configurada vira no-op silencioso (evolutionConfigurado()).
+const EVOLUTION_MONITOR_ATIVO = process.env.EVOLUTION_MONITOR_ATIVO !== 'false';
+// Cadencia PROPRIA, bem menor que RECONCILIACAO_INTERVAL_MS (30 min): a Evolution roda em
+// 127.0.0.1, sem rate limit de terceiro a proteger (diferente do Moskit), entao o unico custo de
+// checar mais vezes e irrelevante — e o incidente durou 58 min mudo por checar zero vezes.
+const EVOLUTION_MONITOR_INTERVAL_MS = Number(process.env.EVOLUTION_MONITOR_INTERVAL_MS) || 5 * 60 * 1000;
 
 // ---- Anexo do Doc do Gemini na aba "Arquivos" do negocio -------------------------------------
 // O POST /deals/{id}/attachments NAO aceita upload: o corpo e {"url": "..."} e quem baixa o arquivo
@@ -576,6 +621,105 @@ const stmtMoskitGet = db.prepare('SELECT * FROM moskit_contacts WHERE phone = ?'
 // GET exato falha e a tabela e pequena (~4k contatos).
 const stmtMoskitPorSufixo = db.prepare("SELECT * FROM moskit_contacts WHERE phone LIKE '%' || ?");
 const stmtMoskitCount = db.prepare('SELECT COUNT(*) as t FROM moskit_contacts');
+// ------------------------------------------------------------
+// Espelho dos contatos do Chatwoot (ver src/chatwoot.js)
+// ------------------------------------------------------------
+// O Chatwoot NAO tem webhook de contato — so conversation_*/message_* —, entao este estado local e a
+// UNICA memoria de tres coisas diferentes: "onde esta este contato", "eu ja escrevi isto" e "alguem
+// mexeu depois de mim".
+//
+// `nome_escrito` e a coluna que sustenta a precedencia ao longo do tempo, o mesmo desenho de
+// custom_fields_bot/campos_travados no Moskit: no 1o ciclo o nome estava vazio e o bot escreveu; se a
+// equipe corrigir depois para o nome de casada, sem memoria de autoria "o Chatwoot tem um nome
+// humano" e "o Chatwoot tem o nome que eu mesmo pus" ficam indistinguiveis — e o bot desfaz a
+// correcao da equipe.
+//
+// O CREATE vai em try/catch e os prepares sao PREGUICOSOS pelo motivo escrito em
+// stmtNotaPorAnexoToken(): prepare no topo do arquivo transforma esse catch numa armadilha. Se a
+// criacao falhar por qualquer motivo — disco cheio, banco travado, o nome ja ocupado por uma view —,
+// o `require` morre com "no such table", o processo sai com exit 1 e o pm2 entra em loop de restart:
+// o bot inteiro (WhatsApp, agenda, CRM) fora do ar por causa de uma funcionalidade DESLIGADA por
+// padrao. Preguicoso, o pior caso e "a sincronizacao do Chatwoot nao roda".
+try {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS chatwoot_contacts (
+      chave TEXT PRIMARY KEY,
+      chatwoot_id INTEGER,
+      phone_number TEXT,
+      nome_chatwoot TEXT,
+      nome_escrito TEXT,
+      identifier TEXT,
+      escrita_hash TEXT,
+      escrito_em TEXT,
+      visto_em TEXT,
+      travado_humano INTEGER DEFAULT 0,
+      falhas INTEGER DEFAULT 0,
+      backoff_ate INTEGER,
+      desistiu INTEGER DEFAULT 0,
+      ultimo_erro TEXT,
+      nao_encontrado_em TEXT,
+      updated_at TEXT DEFAULT (datetime('now'))
+    )
+  `);
+} catch (e) {
+  console.error(`  ⚠️ chatwoot_contacts nao pudo ser criada (${e.message}) — a sincronizacao do Chatwoot fica indisponivel`);
+}
+try { db.exec('CREATE INDEX IF NOT EXISTS idx_chatwoot_id ON chatwoot_contacts(chatwoot_id)'); } catch {}
+
+let _stmtsChatwoot = null;
+function stmtsChatwoot() {
+  if (!_stmtsChatwoot) {
+    _stmtsChatwoot = {
+      get: db.prepare('SELECT * FROM chatwoot_contacts WHERE chave = ?'),
+      // Mesmo filtro barato + peneira em JS de buscarOuCriarContato: o LIKE traz candidato, quem
+      // decide se e a mesma pessoa e mesmoClienteTelefone (que tambem exige o DDD).
+      porSufixo: db.prepare("SELECT * FROM chatwoot_contacts WHERE chave LIKE '%' || ?"),
+      contar: db.prepare('SELECT COUNT(*) as t FROM chatwoot_contacts'),
+      // Toda ficha do Chatwoot que o espelho conhece. Serve para o segundo conjunto de candidatos
+      // (ver montarCandidatosChatwoot): cliente que existe no Chatwoot e no Moskit mas NUNCA falou
+      // com o bot nao tem linha em `conversations`, e por isso era invisivel para a rotina.
+      todasComId: db.prepare('SELECT * FROM chatwoot_contacts WHERE chatwoot_id IS NOT NULL'),
+      // Upsert de LEITURA: atualiza o que foi visto na ficha sem tocar em nada de autoria/estado.
+      upsertVisto: db.prepare(`
+        INSERT INTO chatwoot_contacts (chave, chatwoot_id, phone_number, nome_chatwoot, identifier, visto_em)
+        VALUES (?, ?, ?, ?, ?, datetime('now'))
+        ON CONFLICT(chave) DO UPDATE SET
+          chatwoot_id = excluded.chatwoot_id,
+          phone_number = excluded.phone_number,
+          nome_chatwoot = excluded.nome_chatwoot,
+          identifier = excluded.identifier,
+          visto_em = datetime('now'),
+          nao_encontrado_em = NULL,
+          updated_at = datetime('now')
+      `),
+      marcarEscrito: db.prepare(`
+        UPDATE chatwoot_contacts
+           SET nome_escrito = ?, escrita_hash = ?, nome_chatwoot = ?, identifier = ?,
+               escrito_em = datetime('now'), falhas = 0, backoff_ate = NULL, ultimo_erro = NULL,
+               updated_at = datetime('now')
+         WHERE chave = ?
+      `),
+      travarHumano: db.prepare(
+        "UPDATE chatwoot_contacts SET travado_humano = 1, nome_chatwoot = ?, updated_at = datetime('now') WHERE chave = ?"
+      ),
+      registrarFalha: db.prepare(`
+        UPDATE chatwoot_contacts
+           SET falhas = COALESCE(falhas, 0) + 1, backoff_ate = ?, ultimo_erro = ?,
+               desistiu = CASE WHEN COALESCE(falhas, 0) + 1 >= ? THEN 1 ELSE COALESCE(desistiu, 0) END,
+               updated_at = datetime('now')
+         WHERE chave = ?
+      `),
+      marcarNaoEncontrado: db.prepare(`
+        INSERT INTO chatwoot_contacts (chave, nao_encontrado_em, visto_em)
+        VALUES (?, datetime('now'), datetime('now'))
+        ON CONFLICT(chave) DO UPDATE SET nao_encontrado_em = datetime('now'), updated_at = datetime('now')
+      `),
+      apagar: db.prepare('DELETE FROM chatwoot_contacts WHERE chave = ?'),
+    };
+  }
+  return _stmtsChatwoot;
+}
+
 
 const stmtUpsert = db.prepare(`
   INSERT INTO conversations (chat_id, phone, contact_name, messages, last_activity)
@@ -725,6 +869,27 @@ const stmtNotasViuEmail = db.prepare(
 const stmtNotasAvisouSilencio = db.prepare(
   "UPDATE notas_reuniao_saude SET ultimo_aviso_em = datetime('now') WHERE id = 1"
 );
+
+// Estado do monitor Evolution API -> Chatwoot (ver src/evolution.js). Tabela nova, uma linha so, sem
+// ALTER TABLE (nao ha tabela pre-existente pra alterar) — mesmo molde de notas_reuniao_saude acima.
+// Precisa sobreviver a restart do pm2: se a falha ainda estiver ativa quando o processo reiniciar,
+// uma variavel em memoria esqueceria o estado e, na volta, nao saberia avisar "voltou ao normal".
+db.exec(`
+  CREATE TABLE IF NOT EXISTS evolution_saude (
+    id            INTEGER PRIMARY KEY CHECK (id = 1),
+    ultimo_hash   TEXT,
+    avisado_hash  TEXT,
+    mudou_em      TEXT,
+    atualizado_em TEXT
+  )
+`);
+db.exec('INSERT OR IGNORE INTO evolution_saude (id) VALUES (1)');
+const stmtEvolutionSaude = db.prepare('SELECT * FROM evolution_saude WHERE id = 1');
+const stmtEvolutionEstado = db.prepare(
+  "UPDATE evolution_saude SET ultimo_hash = ?, mudou_em = datetime('now'), atualizado_em = datetime('now') WHERE id = 1"
+);
+const stmtEvolutionSoAtualizou = db.prepare("UPDATE evolution_saude SET atualizado_em = datetime('now') WHERE id = 1");
+const stmtEvolutionAvisou = db.prepare('UPDATE evolution_saude SET avisado_hash = ? WHERE id = 1');
 
 // Os statements sao montados por tabela para que o dry-run use exatamente o mesmo codigo do modo
 // real — um caminho de execucao separado para o dry-run so provaria que o caminho separado funciona.
@@ -4175,20 +4340,27 @@ async function processarConversaDirect(chatId) {
     } catch (e) {
       console.error(`  ❌ Erro ao gravar apuracao de agendamento: ${e.message}`);
     }
-    // Sanitizar nome: rejeitar placeholders genericos que a IA inventa
+    // Sanitizar nome: rejeitar placeholders genericos que a IA inventa.
+    //
+    // A regra vive em `nomeUtilizavel` (src/chatwoot.js) porque a MESMA pergunta — "isto e nome de
+    // pessoa ou placeholder?" — passou a ser feita nos dois lados do sistema. Aqui eram DUAS regexes
+    // quase iguais, uma por bloco, e ja tinham divergido: so a do fallback rejeitava "teste" e numero
+    // puro, e NENHUMA das duas pegava "Nao informado" com acento — a grafia natural em portugues, e
+    // portanto a que o modelo devolve. Agora e uma regra, e ela tambem tira o "*" do nome vindo do
+    // Moskit e devolve o nome com trim (o codigo antigo calculava o trim e nao o usava).
     if (dados.nome) {
-      const nome = dados.nome.trim();
-      const genericos = /^(cliente|do cliente|nome do cliente|lead|cliente sem nome|sem nome|n\/a|nao informado|nao identificado|null|undefined)$/i;
-      if (genericos.test(nome) || nome.length < 3) {
+      const limpo = nomeUtilizavel(dados.nome);
+      if (!limpo) {
         console.log(`  ⚠️ nome generico/invalido rejeitado: "${dados.nome}"`);
         dados.nome = null;
+      } else {
+        dados.nome = limpo;
       }
     }
     // Fallback: usar nome do contato do WhatsApp se a IA nao extraiu
     if (!dados.nome && row.contact_name) {
-      const nomeWhatsApp = row.contact_name.trim();
-      const genericos = /^(cliente|do cliente|nome do cliente|lead|cliente sem nome|sem nome|n\/a|nao informado|nao identificado|null|undefined|teste)$/i;
-      if (!genericos.test(nomeWhatsApp) && nomeWhatsApp.length >= 3 && !/^\d+$/.test(nomeWhatsApp)) {
+      const nomeWhatsApp = nomeUtilizavel(row.contact_name);
+      if (nomeWhatsApp) {
         console.log(`  ℹ️ usando nome do WhatsApp: "${nomeWhatsApp}"`);
         dados.nome = nomeWhatsApp;
       }
@@ -5767,6 +5939,810 @@ async function importarContatosMoskit() {
 
   console.log(`  ✅ ${importados} telefones importados de ${total} contatos do Moskit`);
   return { total_contatos: total, telefones_importados: importados };
+}
+// ------------------------------------------------------------
+// Chatwoot: cliente HTTP e a sincronizacao do nome do contato
+// ------------------------------------------------------------
+function chatwootConfigurado() {
+  return !!(CHATWOOT_BASE && CHATWOOT_ACCOUNT_ID && CHATWOOT_API_TOKEN);
+}
+
+// A credencial so vai para o host configurado. Comparacao por hostname exato ou sufixo COM PONTO —
+// `endsWith('chatwoot.com')` ingenuo entregaria o token para "malchatwoot.com", e este repositorio ja
+// vazou credencial exatamente assim (baixarParaArquivo mandando a chave do Zernio para CDN da Meta).
+function ehHostChatwoot(hostname) {
+  const host = String(hostname || '').toLowerCase();
+  if (!host || !CHATWOOT_BASE) return false;
+  let base;
+  try { base = new URL(CHATWOOT_BASE).hostname.toLowerCase(); } catch { return false; }
+  return host === base || host.endsWith(`.${base}`);
+}
+
+// Um unico ponto de saida, e ele NAO SABE criar contato. Nao existe funcao de POST /contacts para
+// alguem chamar por engano: criar contato no Chatwoot esta fora do escopo, e a garantia e estrutural
+// em vez de "revisar o codigo depois". O unico POST autorizado e /contacts/filter, que e LEITURA
+// apesar do verbo — por isso a guarda e sobre o CAMINHO, nao sobre o metodo.
+const CHATWOOT_POSTS_PERMITIDOS = new Set(['/contacts/filter']);
+
+// Decisao de 04/09/2026, do dono do escritorio: "eu nao quero, nunca mande mensagem pros meus
+// clientes." Nasceu de um incidente real — uma tentativa de RECUPERAR mensagem perdida (com o dono
+// tendo pedido a recuperacao) escreveu em conversas de cliente de verdade sem avisar que apareceria
+// com o timestamp de agora e a autoria do proprio usuario logado, e pareceu um bot descontrolado
+// mandando mensagem sozinho. A resposta e a mesma logica do bloqueio de POST /contacts acima: a
+// garantia fica no CODIGO, nao na memoria de quem escreve o proximo commit. QUALQUER metodo que nao
+// seja leitura (GET), contra QUALQUER caminho que toque mensagem — criar, editar ou apagar — e
+// recusado aqui, incondicionalmente. Ler mensagem continua permitido (GET .../messages e como o
+// monitor e as investigacoes conferem o que esta acontecendo); so a ESCRITA e proibida.
+const RE_CAMINHO_MENSAGEM = /\/messages(\/|$|\?)/;
+
+async function chatwootRequisicao(metodo, caminho, { corpo = null, params = null } = {}) {
+  if (!chatwootConfigurado()) {
+    throw new Error('Chatwoot nao configurado (CHATWOOT_BASE, CHATWOOT_ACCOUNT_ID, CHATWOOT_API_TOKEN)');
+  }
+  if (metodo !== 'get' && RE_CAMINHO_MENSAGEM.test(caminho)) {
+    throw new Error(`${metodo.toUpperCase()} ${caminho} nao e permitido — este sistema NUNCA escreve mensagem no Chatwoot (decisao do dono, 04/09/2026)`);
+  }
+  if (metodo === 'post' && !CHATWOOT_POSTS_PERMITIDOS.has(caminho)) {
+    throw new Error(`POST ${caminho} nao e permitido no cliente do Chatwoot (esta rotina nunca cria contato)`);
+  }
+  if (metodo !== 'get' && metodo !== 'put' && metodo !== 'post') {
+    throw new Error(`metodo nao permitido no cliente do Chatwoot: ${metodo}`);
+  }
+
+  const url = `${CHATWOOT_BASE}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}${caminho}`;
+  let alvo;
+  try { alvo = new URL(url); } catch { throw new Error(`CHATWOOT_BASE invalida: "${CHATWOOT_BASE}"`); }
+  if (!ehHostChatwoot(alvo.hostname)) {
+    throw new Error(`recusando mandar o token do Chatwoot para "${alvo.hostname}"`);
+  }
+
+  const cfg = {
+    headers: { api_access_token: CHATWOOT_API_TOKEN, 'Content-Type': 'application/json' },
+    timeout: TIMEOUT_HTTP_MS,
+    validateStatus: (s) => s < 500,
+  };
+  if (params) cfg.params = params;
+  if (metodo === 'get') return axios.get(url, cfg);
+  if (metodo === 'put') return axios.put(url, corpo || {}, cfg);
+  return axios.post(url, corpo || {}, cfg);
+}
+
+const chatwootGet = (caminho, params) => chatwootRequisicao('get', caminho, { params });
+const chatwootPut = (caminho, corpo) => chatwootRequisicao('put', caminho, { corpo });
+
+function chatwootOk(res) {
+  return res && res.status >= 200 && res.status < 300;
+}
+
+// Varre /contacts e alimenta o espelho local. Usada pelo backfill; a rotina periodica NAO varre (seria
+// centenas de paginas para achar 3 contatos novos) e usa a cascata de busca abaixo.
+async function varrerContatosChatwoot({ maxPaginas = CHATWOOT_MAX_PAGINAS, aoProgresso = null } = {}) {
+  const s = stmtsChatwoot();
+  const idsVistos = new Set();
+  let pagina = 1;
+  let gravados = 0;
+  let semTelefone = 0;
+  let totalRelatado = null;
+
+  for (; pagina <= maxPaginas; pagina++) {
+    const res = await chatwootGet('/contacts', { page: pagina });
+    if (!chatwootOk(res)) throw new Error(`GET /contacts pagina ${pagina} -> HTTP ${res.status}`);
+    const lista = res.data?.payload || [];
+    if (res.data?.meta?.count != null) totalRelatado = res.data.meta.count;
+    if (!lista.length) break;
+
+    let novos = 0;
+    for (const c of lista) {
+      if (!c?.id) continue;
+      if (!idsVistos.has(c.id)) { idsVistos.add(c.id); novos++; }
+      const chave = chaveConversa(c.phone_number);
+      if (!chave) { semTelefone++; continue; }
+      s.upsertVisto.run(chave, c.id, c.phone_number || '', c.name || '', c.identifier || '');
+      gravados++;
+    }
+
+    // PAGINACAO IGNORADA EM SILENCIO. Aconteceu tres vezes com o Moskit neste repositorio (/deals,
+    // /activities e /contacts ignoram `limit`/`page` respondendo 200 com a primeira pagina de novo):
+    // o loop rele os mesmos registros, escreve 15 contatos e PARECE ter varrido 4 mil. Uma pagina
+    // inteira sem nenhum id novo e a assinatura disso, e aqui isso e erro alto, nao log.
+    if (novos === 0) {
+      throw new Error(`paginacao do Chatwoot nao avanca: pagina ${pagina} nao trouxe nenhum id novo (o parametro \`page\` esta sendo ignorado?)`);
+    }
+    if (aoProgresso) aoProgresso({ pagina, vistos: idsVistos.size, gravados });
+    if (CHATWOOT_PAUSA_MS > 0) await new Promise((r) => setTimeout(r, CHATWOOT_PAUSA_MS));
+  }
+
+  const r = { paginas: pagina - 1, contatos: idsVistos.size, gravados, sem_telefone: semTelefone, total_relatado: totalRelatado };
+  if (totalRelatado != null && idsVistos.size < totalRelatado && pagina > maxPaginas) {
+    r.aviso = `teto de ${maxPaginas} paginas atingido com ${idsVistos.size} de ${totalRelatado} contatos — aumente CHATWOOT_MAX_PAGINAS`;
+  }
+  return r;
+}
+
+// A cascata que acha o contato do Chatwoot a partir de um telefone. Nunca cria nada.
+//
+// Um `filter equal_to` vazio NAO prova que o contato nao existe: `equal_to` e casamento de STRING, e o
+// Chatwoot pode ter o numero como "+5586...", "5586...", "86..." ou mascarado. Tratar "nao achei" como
+// "nao existe" foi exatamente o que custou 14 contatos duplicados no Moskit em 24/08. Por isso quem
+// DECIDE e sempre o casamento local por digitos (casarContatoPorTelefone), e o passo seguinte da
+// cascata continua tentando.
+async function acharContatoChatwoot(chave) {
+  const s = stmtsChatwoot();
+
+  const exato = s.get.get(chave);
+  if (exato?.chatwoot_id) return { contato: linhaParaContato(exato), via: 'espelho_exato', linha: exato };
+
+  const candidatosLocais = s.porSufixo.all(chave.slice(-SUFIXO_COMPARACAO))
+    .filter((l) => l.chatwoot_id)
+    .map(linhaParaContato);
+  const local = chatwoot.casarContatoPorTelefone(chave, candidatosLocais);
+  if (local?.ambiguo) return { ambiguo: true, ids: local.ids, via: 'espelho_sufixo' };
+  if (local) return { contato: local, via: 'espelho_sufixo' };
+
+  const e164 = chatwoot.normalizarE164(chave);
+  if (e164) {
+    const res = await chatwootRequisicao('post', '/contacts/filter', {
+      // `query_operator: null` e nao 'AND'. MEDIDO em 04/09/2026 contra a instancia real: o Chatwoot
+      // valida esse campo contra a string TRADUZIDA do idioma da instancia — a nossa esta em
+      // portugues e devolveu 422 {"error":"Operador de consulta deve ser \"E\" ou \"OU\"."} para
+      // 'AND'. `null` significa "este e o ultimo filtro, nao encadeia com outro" e e aceito em
+      // qualquer idioma. O sintoma era mudo: a cascata caia para /contacts/search, que funciona,
+      // entao a busca ACHAVA o contato — so gastava uma requisicao recusada em todo ciclo.
+      corpo: { payload: [{ attribute_key: 'phone_number', filter_operator: 'equal_to', values: [e164], query_operator: null }] },
+    });
+    if (chatwootOk(res)) {
+      const achado = chatwoot.casarContatoPorTelefone(chave, res.data?.payload || []);
+      if (achado?.ambiguo) return { ambiguo: true, ids: achado.ids, via: 'filter' };
+      if (achado) return { contato: achado, via: 'filter' };
+    }
+  }
+
+  // A busca casa telefone, entao buscar pelo SUFIXO pega o numero gravado em qualquer formato.
+  // NUNCA buscar por nome: o cliente nao tem nome no Chatwoot (e o problema que estamos consertando),
+  // e casar por nome poria a ficha de um cliente na de outro.
+  const res = await chatwootGet('/contacts/search', { q: chave.slice(-8) });
+  if (chatwootOk(res)) {
+    const achado = chatwoot.casarContatoPorTelefone(chave, res.data?.payload || []);
+    if (achado?.ambiguo) return { ambiguo: true, ids: achado.ids, via: 'search' };
+    if (achado) return { contato: achado, via: 'search' };
+  }
+
+  return null;
+}
+
+function linhaParaContato(linha) {
+  return {
+    id: linha.chatwoot_id,
+    name: linha.nome_chatwoot || '',
+    phone_number: linha.phone_number || linha.chave,
+    identifier: linha.identifier || '',
+    custom_attributes: null, // o espelho nao guarda atributos: sao relidos antes de escrever
+  };
+}
+
+
+let _stmtCandidatosChatwoot = null;
+function stmtCandidatosChatwoot() {
+  if (!_stmtCandidatosChatwoot) {
+    _stmtCandidatosChatwoot = db.prepare(`
+      SELECT chat_id, phone, contact_name, deal_id, last_data
+        FROM conversations
+       ORDER BY updated_at DESC
+       LIMIT ?
+    `);
+  }
+  return _stmtCandidatosChatwoot;
+}
+
+// 'YYYY-MM-DD HH:MM:SS' do SQLite (que grava em UTC) -> epoch ms. Sem o 'Z' explicito o Date leria
+// como hora LOCAL, e a suite roda em TZ=UTC enquanto a VPS tambem e UTC e o dev e -03:00: a janela de
+// retentativa mudaria de tamanho conforme a maquina.
+function instanteDeSqlite(texto) {
+  if (!texto) return null;
+  const ms = Date.parse(`${String(texto).replace(' ', 'T')}Z`);
+  return Number.isNaN(ms) ? null : ms;
+}
+
+function contarMotivo(mapa, motivo) {
+  mapa[motivo] = (mapa[motivo] || 0) + 1;
+}
+
+// Cooldown exponencial, o mesmo desenho de vinculo_falhas/vinculo_backoff_ate: falha transitoria
+// (429, timeout) nao e "conferir na mao", e o servidor pedindo calma. Ao estourar o teto a linha
+// desiste — estado terminal, nunca mais retenta sozinha.
+function registrarFalhaChatwoot(chave, erro) {
+  const s = stmtsChatwoot();
+  const linha = s.get.get(chave);
+  const falhas = (linha?.falhas || 0) + 1;
+  const espera = Math.min(Math.pow(2, falhas), 32) * RECONCILIACAO_INTERVAL_MS;
+  s.marcarNaoEncontrado.run(chave); // garante que a linha existe antes do UPDATE
+  s.registrarFalha.run(Date.now() + espera, String(erro).slice(0, 300), CHATWOOT_MAX_TENTATIVAS, chave);
+}
+
+// De onde vem o nome, e qual o id do contato no Moskit. A ordem da cascata esta justificada em
+// src/chatwoot.js (escolherNomeDoCliente): o espelho do Moskit primeiro porque, medido em producao,
+// ele tem 0 nomes vazios e 0 nomes que sao telefone, enquanto 33% dos contact_name do WhatsApp sao o
+// proprio numero — que e exatamente o problema que estamos consertando.
+function dadosLocaisDoCliente(row) {
+  const chave = chaveConversa(row.chat_id || row.phone);
+  if (!chave) return null;
+
+  let espelho = stmtMoskitGet.get(chave);
+  if (!espelho?.moskit_id) {
+    // Mesma peneira de buscarOuCriarContato, e com a mesma regra: ambiguidade NAO decide.
+    const candidatos = stmtMoskitPorSufixo.all(chave.slice(-SUFIXO_COMPARACAO))
+      .filter((c) => c.moskit_id && mesmoClienteTelefone(c.phone, chave));
+    const ids = new Set(candidatos.map((c) => c.moskit_id));
+    espelho = ids.size === 1 ? candidatos[0] : null;
+  }
+
+  let nomeIa = null;
+  try { nomeIa = JSON.parse(row.last_data || '{}')?.nome || null; } catch {}
+
+  const escolhido = chatwoot.escolherNomeDoCliente({
+    nomeEspelho: espelho?.name,
+    nomeIa,
+    nomeWhatsApp: row.contact_name,
+  });
+
+  return {
+    chave,
+    nome: escolhido?.nome || null,
+    fonte: escolhido?.fonte || null,
+    moskitContatoId: espelho?.moskit_id || null,
+    dealId: row.deal_id || null,
+  };
+}
+
+// Le a ficha ATUAL do Chatwoot antes de decidir. E este GET que traz `custom_attributes` (o espelho
+// local nao os guarda de proposito) e que detecta renomeacao humana feita depois do bot — as duas
+// coisas que nenhuma outra fonte responde. Um GET por candidato, com o teto de CHATWOOT_MAX_POR_CICLO.
+async function lerFichaChatwoot(id, fallbackTelefone) {
+  const res = await chatwootGet(`/contacts/${id}`);
+  if (res.status === 404) return { ausente: true };
+  if (!chatwootOk(res)) throw new Error(`GET /contacts/${id} -> HTTP ${res.status}`);
+  const f = res.data?.payload || res.data || {};
+  return {
+    ficha: {
+      id: f.id ?? id,
+      name: f.name || '',
+      phone_number: f.phone_number || fallbackTelefone || '',
+      identifier: f.identifier || '',
+      custom_attributes: f.custom_attributes || {},
+    },
+  };
+}
+
+// Quem entra na fila desta rodada. DOIS conjuntos, e o segundo foi acrescentado em 04/09/2026 depois
+// de medir a lacuna contra a instancia real:
+//
+//   1) as conversas do bot (`conversations`) — o caminho original;
+//   2) as fichas do Chatwoot que ainda nao tem nome de pessoa.
+//
+// O (2) existe porque o conjunto que o escritorio quer consertar e definido pelo CHATWOOT, nao pelo
+// nosso log de conversas. MEDIDO: das 33 fichas que ainda mostravam o telefone, 4 tinham nome
+// disponivel no Moskit e nunca seriam preenchidas — o cliente existe no CRM e no Chatwoot, mas nunca
+// escreveu para o bot, entao nao ha linha em `conversations` para ser candidata. Sem o (2), "todo
+// numero sem nome ganha nome" simplesmente nao e verdade.
+//
+// Deduplicado por chave, com a conversa tendo precedencia (ela traz `deal_id` e `last_data`, ou seja
+// o link do negocio e o nome extraido pela IA; a ficha sozinha so alcanca o espelho do Moskit).
+function montarCandidatosChatwoot(limite) {
+  const candidatos = [];
+  const vistos = new Set();
+
+  for (const row of stmtCandidatosChatwoot().all(limite)) {
+    const chave = chaveConversa(row.chat_id || row.phone);
+    if (!chave || vistos.has(chave)) continue;
+    vistos.add(chave);
+    candidatos.push(row);
+  }
+
+  for (const linha of stmtsChatwoot().todasComId.all()) {
+    if (!linha.chave || vistos.has(linha.chave)) continue;
+    // So quem PRECISA de nome. Ficha com nome de pessoa nao vira candidata: seria gastar um GET por
+    // ciclo para concluir "nao mexer" — e a decisao de nao mexer nao depende de rede.
+    const classe = chatwoot.classificarNomeChatwoot(linha.nome_chatwoot, linha.chave).classe;
+    if (!chatwoot.CLASSES_SOBRESCREVIVEIS.has(classe)) continue;
+    vistos.add(linha.chave);
+    // Linha sintetica: sem conversa nao ha `deal_id` (logo, sem link do negocio no payload) nem nome
+    // extraido pela IA. O nome vem do espelho do Moskit, que e a melhor fonte de todo jeito.
+    candidatos.push({ chat_id: linha.chave, phone: linha.chave, contact_name: null, deal_id: null, last_data: null });
+    if (candidatos.length >= limite) break;
+  }
+
+  return candidatos;
+}
+
+async function sincronizarContatosChatwoot({ aplicar = false, limite = CHATWOOT_MAX_POR_CICLO, detalhar = false, soChave = null } = {}) {
+  const r = {
+    aplicar: aplicar && !CHATWOOT_DRY_RUN,
+    dry_run: CHATWOOT_DRY_RUN,
+    analisados: 0, escritos: 0, escreveria: 0, nao_encontrados: 0,
+    pulados: {}, ambiguos: [], colisoes: [], erros: [], amostra: [],
+    // Uma linha por candidato, so quando pedido (o backfill monta o CSV com isto). Fora do backfill
+    // seria carregar milhares de objetos na memoria da rotina periodica para nada.
+    detalhe: detalhar ? [] : null,
+  };
+  if (!chatwootConfigurado()) {
+    r.erro = 'Chatwoot nao configurado (CHATWOOT_BASE, CHATWOOT_ACCOUNT_ID, CHATWOOT_API_TOKEN)';
+    return r;
+  }
+
+  const s = stmtsChatwoot();
+  const agora = Date.now();
+  let primeira = true;
+
+  // Registra o desfecho de UM candidato. `contarMotivo` continua sendo a contagem agregada; isto
+  // acrescenta a linha detalhada quando o chamador pediu.
+  let candidatoAtual = null;
+  const desfecho = (resultado, extra = {}) => {
+    contarMotivo(r.pulados, resultado);
+    if (r.detalhe) r.detalhe.push({ chave: candidatoAtual?.chave ?? null, resultado, ...extra });
+  };
+
+  for (const row of montarCandidatosChatwoot(limite)) {
+    candidatoAtual = null;
+    // TEAM_PHONES nunca vira lead, deal nem contato no CRM — e agora nem nome no Chatwoot. Primeira
+    // coisa avaliada, antes de casar, montar payload ou tocar a rede.
+    candidatoAtual = { chave: chaveConversa(row.chat_id || row.phone) || String(row.chat_id || '') };
+    if (ehInterno(row.chat_id || row.phone)) { desfecho('interno'); continue; }
+
+    const local = dadosLocaisDoCliente(row);
+    if (!local) { desfecho('telefone_invalido'); continue; }
+    candidatoAtual = local;
+
+    // Restricao a UM telefone (usada pelo teste de um contato so). Fica aqui, antes de tocar a rede:
+    // filtrar depois, no relatorio, deixaria a escrita acontecer em todos os candidatos — que era
+    // exatamente o defeito do `--so=` do backfill quando ele foi escrito.
+    if (soChave && !mesmoClienteTelefone(local.chave, soChave)) { contarMotivo(r.pulados, 'fora_do_filtro'); continue; }
+
+    const linha = s.get.get(local.chave);
+    if (linha?.desistiu) { desfecho('desistiu'); continue; }
+    if (linha?.travado_humano) { desfecho('travado_humano'); continue; }
+    if (linha?.backoff_ate && Number(linha.backoff_ate) > agora) { desfecho('backoff'); continue; }
+    // Contato que a cascata nao achou nao pode custar 2 requisicoes por ciclo para sempre.
+    if (!linha?.chatwoot_id && linha?.nao_encontrado_em) {
+      const desde = instanteDeSqlite(linha.nao_encontrado_em);
+      if (desde && agora - desde < CHATWOOT_RETENTAR_HORAS * 3600 * 1000) {
+        desfecho('nao_encontrado_recente');
+        continue;
+      }
+    }
+    // Sem nome para escrever, nao vale gastar requisicao nenhuma descobrindo onde esta a ficha.
+    if (!local.nome) { desfecho('sem_nome_utilizavel'); continue; }
+
+    if (!primeira && CHATWOOT_PAUSA_MS > 0) await new Promise((res2) => setTimeout(res2, CHATWOOT_PAUSA_MS));
+    primeira = false;
+    r.analisados++;
+
+    let achado;
+    try {
+      achado = await acharContatoChatwoot(local.chave);
+    } catch (e) {
+      // Rede instavel NAO e "o contato nao existe" — registra falha e tenta depois, nunca conclui.
+      registrarFalhaChatwoot(local.chave, e.message);
+      r.erros.push({ chave: local.chave, erro: e.message });
+      continue;
+    }
+
+    if (achado?.ambiguo) {
+      // Duas fichas no Chatwoot com telefone equivalente. Nao elege vencedor: escolher errado poria o
+      // nome de um cliente na ficha de conversa de outro. Vira item acionavel (merge manual).
+      r.ambiguos.push({ chave: local.chave, ids: achado.ids, via: achado.via });
+      desfecho('ambiguo', { ids: achado.ids.join(' '), via: achado.via });
+      continue;
+    }
+    if (!achado) {
+      s.marcarNaoEncontrado.run(local.chave);
+      r.nao_encontrados++;
+      if (r.detalhe) r.detalhe.push({ chave: local.chave, resultado: 'nao_encontrado', nome_novo: local.nome, fonte: local.fonte });
+      continue;
+    }
+
+    let leitura;
+    try {
+      leitura = await lerFichaChatwoot(achado.contato.id, achado.contato.phone_number);
+    } catch (e) {
+      registrarFalhaChatwoot(local.chave, e.message);
+      r.erros.push({ chave: local.chave, erro: e.message });
+      continue;
+    }
+    if (leitura.ausente) { s.apagar.run(local.chave); desfecho('contato_sumiu'); continue; }
+
+    const ficha = leitura.ficha;
+    s.upsertVisto.run(local.chave, ficha.id, ficha.phone_number, ficha.name, ficha.identifier);
+    const atual = s.get.get(local.chave);
+
+    const decisao = chatwoot.decidirAtualizacao({
+      chatwoot: ficha,
+      local: {
+        ...local,
+        nomeEscrito: atual?.nome_escrito || null,
+        travadoHumano: !!atual?.travado_humano,
+        escritaHash: atual?.escrita_hash || null,
+      },
+    });
+
+    if (decisao.acao === 'pular') {
+      // Divergiu do que o bot escreveu => foi pessoa. Trava permanente, gravada aqui.
+      if (decisao.travarHumano) s.travarHumano.run(ficha.name, local.chave);
+      desfecho(decisao.motivo, {
+        chatwoot_id: ficha.id, nome_atual: ficha.name, nome_novo: local.nome, fonte: local.fonte, via: achado.via,
+      });
+      continue;
+    }
+
+    if (!r.aplicar) {
+      r.escreveria++;
+      if (r.detalhe) {
+        r.detalhe.push({
+          chave: local.chave, resultado: 'escreveria', chatwoot_id: ficha.id, via: achado.via,
+          nome_atual: ficha.name, nome_novo: decisao.payload.name, fonte: local.fonte,
+          classe_anterior: decisao.classeAnterior, identifier: decisao.payload.identifier || '',
+          deal_id: local.dealId || '',
+        });
+      }
+      if (r.amostra.length < 25) {
+        r.amostra.push({
+          chave: local.chave, chatwoot_id: ficha.id, via: achado.via,
+          de: ficha.name, para: decisao.payload.name, fonte: local.fonte, motivo: decisao.motivo,
+        });
+      }
+      continue;
+    }
+
+    let res;
+    try {
+      res = await chatwootPut(`/contacts/${ficha.id}`, decisao.payload);
+    } catch (e) {
+      registrarFalhaChatwoot(local.chave, e.message);
+      r.erros.push({ chave: local.chave, erro: e.message });
+      continue;
+    }
+
+    let veredito = chatwoot.interpretarRespostaPut(res.status, res.data);
+
+    if (veredito.classe === 'colisao_identifier') {
+      // `identifier` e unico por conta: ha outra ficha do mesmo cliente ja marcada. NAO liberamos o
+      // identifier da outra (mutilar um cadastro para consertar outro) e NAO retentamos igual —
+      // degradamos para o que o dono realmente pediu, que e o nome.
+      const semId = chatwoot.payloadSemIdentifier(decisao.payload);
+      try {
+        const res2 = await chatwootPut(`/contacts/${ficha.id}`, semId);
+        veredito = chatwoot.interpretarRespostaPut(res2.status, res2.data);
+        if (veredito.ok) {
+          s.marcarEscrito.run(semId.name, chatwoot.hashEscrita(semId), semId.name, ficha.identifier, local.chave);
+          r.escritos++;
+          r.colisoes.push({ chave: local.chave, chatwoot_id: ficha.id, identifier: decisao.payload.identifier });
+          if (r.detalhe) {
+            r.detalhe.push({
+              chave: local.chave, resultado: 'escrito_sem_identifier', chatwoot_id: ficha.id,
+              nome_atual: ficha.name, nome_novo: semId.name, fonte: local.fonte, via: achado.via,
+            });
+          }
+          continue;
+        }
+      } catch (e) {
+        registrarFalhaChatwoot(local.chave, e.message);
+        r.erros.push({ chave: local.chave, erro: e.message });
+        continue;
+      }
+    }
+
+    if (veredito.ok) {
+      s.marcarEscrito.run(
+        decisao.payload.name, decisao.hash, decisao.payload.name,
+        decisao.payload.identifier || ficha.identifier, local.chave
+      );
+      r.escritos++;
+      if (r.detalhe) {
+        r.detalhe.push({
+          chave: local.chave, resultado: 'escrito', chatwoot_id: ficha.id, via: achado.via,
+          nome_atual: ficha.name, nome_novo: decisao.payload.name, fonte: local.fonte,
+          classe_anterior: decisao.classeAnterior, identifier: decisao.payload.identifier || '',
+          deal_id: local.dealId || '',
+        });
+      }
+      continue;
+    }
+
+    if (veredito.classe === 'ausente') { s.apagar.run(local.chave); desfecho('contato_sumiu'); continue; }
+
+    if (veredito.classe === 'proibido') {
+      // Global, nao por contato: token errado ou sem permissao. Insistir nos 4 mil candidatos seriam
+      // 4 mil 403 — encerra o ciclo e avisa uma vez.
+      r.erros.push({ chave: local.chave, erro: `HTTP ${res.status} — token do Chatwoot recusado; ciclo encerrado` });
+      r.encerrado_por = 'proibido';
+      break;
+    }
+
+    registrarFalhaChatwoot(local.chave, `HTTP ${res.status} (${veredito.classe})`);
+    r.erros.push({ chave: local.chave, erro: `HTTP ${res.status} (${veredito.classe})` });
+  }
+
+  return r;
+}
+
+// Telegram so no ACIONAVEL, e um resumo por ciclo. Decisao de 03/09/2026: problema vai so para o
+// Telegram (zero nota no Moskit), e erro transitorio nao avisa. "N nomes preenchidos" e sucesso de
+// rotina — nao vira aviso, viraria ruido diario.
+let ultimoResumoChatwoot = null;
+
+async function rodarSincronizacaoChatwoot() {
+  if (!CHATWOOT_ATIVO) return null;
+  const r = await sincronizarContatosChatwoot({ aplicar: true });
+
+  const linhas = [];
+  if (r.erro) linhas.push(`⚠️ ${r.erro}`);
+  if (r.encerrado_por === 'proibido') linhas.push('🚫 token do Chatwoot recusado (401/403) — ciclo encerrado');
+  if (r.ambiguos.length) {
+    linhas.push(`👥 ${r.ambiguos.length} cliente(s) com DUAS fichas no Chatwoot — precisam de merge manual:`);
+    for (const a of r.ambiguos.slice(0, 5)) linhas.push(`   ...${a.chave.slice(-8)} -> contatos ${a.ids.join(', ')}`);
+  }
+  if (r.colisoes.length) {
+    linhas.push(`🔗 ${r.colisoes.length} colisao(oes) de identifier — nome escrito, atalho do Moskit nao:`);
+    for (const c of r.colisoes.slice(0, 5)) linhas.push(`   contato ${c.chatwoot_id} (${c.identifier})`);
+  }
+  const desistiram = r.pulados?.desistiu || 0;
+  if (desistiram) linhas.push(`⛔ ${desistiram} contato(s) em estado terminal apos ${CHATWOOT_MAX_TENTATIVAS} tentativas`);
+
+  if (linhas.length) {
+    const resumo = linhas.join('\n');
+    if (resumo !== ultimoResumoChatwoot) {
+      ultimoResumoChatwoot = resumo;
+      await enviarTelegram(`*Chatwoot — sincronizacao de contatos*\n${resumo}`);
+    }
+  }
+
+  const modo = r.aplicar ? 'aplicando' : 'dry-run';
+  console.log(`  💬 Chatwoot (${modo}): ${r.analisados} analisados, ${r.escritos} escritos, ${r.escreveria} escreveria, ${r.nao_encontrados} nao encontrados`);
+  return r;
+}
+
+// ------------------------------------------------------------
+// Monitor Evolution API -> Chatwoot (ver src/evolution.js e a config no topo do arquivo)
+// ------------------------------------------------------------
+function evolutionConfigurado() {
+  return !!(EVOLUTION_BASE && EVOLUTION_API_KEY);
+}
+
+// A Evolution nunca e acessada de fora da VPS: a guarda e sobre ISSO, nao so sobre bater com
+// EVOLUTION_BASE (que e so config) — nem um EVOLUTION_BASE mal configurado escapa do loopback.
+function ehHostEvolutionLocal(hostname) {
+  const host = String(hostname || '').toLowerCase();
+  if (!host || !EVOLUTION_BASE) return false;
+  const LOOPBACK = new Set(['127.0.0.1', 'localhost', '::1']);
+  if (!LOOPBACK.has(host)) return false;
+  let base;
+  try { base = new URL(EVOLUTION_BASE).hostname.toLowerCase(); } catch { return false; }
+  return host === base;
+}
+
+// So sabe fazer GET, e um UNICO POST liberado: /chat/findMessages/{instancia}. Mesma excecao de
+// CHATWOOT_POSTS_PERMITIDOS e pelo mesmo motivo — e busca (leitura) apesar do verbo, porque a
+// Evolution exige um corpo (filtro/paginacao) que GET nao carrega. Nenhum outro POST, PUT ou DELETE
+// passa por aqui: o monitor nunca escreve na Evolution, so LE mensagem para montar o relatorio de
+// recuperacao (ver montarRelatorioRecuperacaoEvolution).
+const EVOLUTION_POSTS_PERMITIDOS = /^\/chat\/findMessages\/[^/]+$/;
+
+async function evolutionRequisicao(caminho, { metodo = 'get', corpo = null, params = null } = {}) {
+  if (!evolutionConfigurado()) throw new Error('Evolution nao configurada (EVOLUTION_BASE, EVOLUTION_API_KEY)');
+  if (metodo === 'post' && !EVOLUTION_POSTS_PERMITIDOS.test(caminho)) {
+    throw new Error(`POST ${caminho} nao e permitido no cliente da Evolution (so leitura)`);
+  }
+  if (metodo !== 'get' && metodo !== 'post') {
+    throw new Error(`metodo nao permitido no cliente da Evolution: ${metodo}`);
+  }
+  const url = `${EVOLUTION_BASE}${caminho}`;
+  let alvo;
+  try { alvo = new URL(url); } catch { throw new Error(`EVOLUTION_BASE invalida: "${EVOLUTION_BASE}"`); }
+  if (!ehHostEvolutionLocal(alvo.hostname)) {
+    throw new Error(`recusando mandar a apikey da Evolution para "${alvo.hostname}"`);
+  }
+  const cfg = { headers: { apikey: EVOLUTION_API_KEY }, timeout: TIMEOUT_HTTP_MS, validateStatus: (s) => s < 500 };
+  if (params) cfg.params = params;
+  if (metodo === 'post') return axios.post(url, corpo || {}, cfg);
+  return axios.get(url, cfg);
+}
+
+// Testa um token do Chatwoot (o que a Evolution DIZ ter configurado, nunca CHATWOOT_API_TOKEN do bot
+// — sao credenciais possivelmente diferentes, e testar a errada validaria a coisa errada) contra o
+// MESMO CHATWOOT_BASE que o bot ja usa. O token so vive no parametro desta chamada — nunca e
+// persistido, nunca vai a log, nunca chega ao texto do Telegram. E o mesmo tipo de credencial que ja
+// vazou uma vez (o causador do incidente de 04/09/2026).
+async function chatwootTokenValido(token) {
+  // Sem CHATWOOT_BASE nao existe onde testar, e "nao consegui medir" NUNCA pode virar "o token e
+  // invalido": um .env sem a secao do Chatwoot faria o monitor disparar alarme falso de token
+  // invalido a cada 5 min — o oposto do que ele existe pra fazer (aviso de incidente real). Lanca,
+  // para o chamador tratar como nao-mensuravel; medirSaudeEvolution nem chega aqui nesse caso.
+  if (!CHATWOOT_BASE) throw new Error('CHATWOOT_BASE nao configurado — nao ha onde testar o token');
+  if (!token) return false;
+  const url = `${CHATWOOT_BASE}/api/v1/profile`;
+  let alvo;
+  try { alvo = new URL(url); } catch { return false; }
+  if (!ehHostChatwoot(alvo.hostname)) throw new Error(`recusando testar token contra "${alvo.hostname}"`);
+  const res = await axios.get(url, { headers: { api_access_token: token }, timeout: TIMEOUT_HTTP_MS, validateStatus: (s) => s < 500 });
+  return res.status === 200;
+}
+
+// Mede o ciclo completo: os 5 sinais em ordem, com early-exit (se a Evolution esta inacessivel nao
+// faz sentido medir o resto). Devolve tambem os dados crus (sem o token) para o sondar-evolution.js
+// poder mostrar o que mediu.
+async function medirSaudeEvolution() {
+  let instancias;
+  try {
+    const r = await evolutionRequisicao('/instance/fetchInstances');
+    if (r.status < 200 || r.status >= 300) throw new Error(`HTTP ${r.status}`);
+    instancias = r.data || [];
+  } catch (e) {
+    return evolutionSaude.avaliarSaudeEvolution({ erroRede: e.message });
+  }
+
+  const instancia = instancias.find((i) => i.name === EVOLUTION_INSTANCE);
+  if (!instancia) return evolutionSaude.avaliarSaudeEvolution({ instanciaEncontrada: false });
+
+  let chatwootFind;
+  try {
+    const r = await evolutionRequisicao(`/chatwoot/find/${EVOLUTION_INSTANCE}`);
+    if (r.status < 200 || r.status >= 300) throw new Error(`HTTP ${r.status}`);
+    chatwootFind = r.data || {};
+  } catch (e) {
+    return evolutionSaude.avaliarSaudeEvolution({ instanciaEncontrada: true, connectionStatus: instancia.connectionStatus, erroRede: e.message });
+  }
+
+  // O 5o sinal so e MENSURAVEL se o bot souber onde fica o Chatwoot. Sem CHATWOOT_BASE, `tokenValido`
+  // fica `null` (= "nao medido") e avaliarSaudeEvolution ignora esse sinal, em vez de reportar
+  // `token_invalido`. Isto NAO e detalhe de implementacao: e a diferenca entre o monitor avisar de um
+  // incidente real e martelar um alarme falso a cada 5 min num .env que so tem a secao da Evolution.
+  let tokenValido = null;
+  if (!CHATWOOT_BASE) {
+    return evolutionSaude.avaliarSaudeEvolution({
+      instanciaEncontrada: true,
+      connectionStatus: instancia.connectionStatus,
+      chatwootEnabled: chatwootFind.enabled,
+      tokenValido: null,
+    });
+  }
+  try {
+    tokenValido = await chatwootTokenValido(chatwootFind.token);
+  } catch (e) {
+    return evolutionSaude.avaliarSaudeEvolution({ instanciaEncontrada: true, connectionStatus: instancia.connectionStatus, chatwootEnabled: chatwootFind.enabled, erroRede: e.message });
+  }
+
+  return evolutionSaude.avaliarSaudeEvolution({
+    instanciaEncontrada: true,
+    connectionStatus: instancia.connectionStatus,
+    chatwootEnabled: chatwootFind.enabled,
+    tokenValido,
+  });
+}
+
+// Teto de quanto tempo pra tras o relatorio de recuperacao varre — se `mudou_em` for muito antigo por
+// algum motivo estranho (monitor ficou desligado dias, relogio bagunçado), nao faz sentido paginar o
+// historico inteiro da Evolution. 48h cobre qualquer falha real com folga; capado, nao ilimitado.
+const EVOLUTION_RELATORIO_MAX_JANELA_MS = 48 * 60 * 60 * 1000;
+
+// Pagina /chat/findMessages/{instancia} (POST, o unico liberado — ver EVOLUTION_POSTS_PERMITIDOS),
+// mais recente primeiro, e para assim que uma pagina inteira ja for mais antiga que `desde`. So
+// mensagens do CLIENTE (fromMe:false — "recebidas", que foi o pedido) e nunca de grupo (@g.us, que
+// tem varios participantes e nao cabe num relatorio "por numero"). Agrupa por remoteJid (o
+// identificador estavel da Evolution — muitas vezes um @lid, nao um telefone, ver o comentario de
+// resolverTelefoneChatwoot) com o pushName mais recente visto e a lista de horarios.
+async function buscarMensagensEvolutionNaJanela(desde, ate) {
+  const porContato = new Map();
+  for (let pagina = 1; pagina <= 40; pagina++) {
+    const r = await evolutionRequisicao(`/chat/findMessages/${EVOLUTION_INSTANCE}`, { metodo: 'post', corpo: { page: pagina, offset: 100 } });
+    if (r.status < 200 || r.status >= 300) throw new Error(`HTTP ${r.status}`);
+    const registros = r.data?.messages?.records || [];
+    if (!registros.length) break;
+
+    for (const m of registros) {
+      const ts = (m.messageTimestamp || 0) * 1000; // a Evolution grava em SEGUNDOS
+      if (ts < desde || ts > ate) continue;
+      const jid = m.key?.remoteJid || '';
+      if (!jid || jid.endsWith('@g.us')) continue; // grupo fica de fora — nao cabe em "por numero"
+      if (m.key?.fromMe) continue; // so "recebidas" — o pedido foi mensagem do cliente, nao da equipe
+
+      const atual = porContato.get(jid) || { remoteJid: jid, pushName: null, horarios: [] };
+      if (m.pushName) atual.pushName = m.pushName;
+      atual.horarios.push(ts);
+      porContato.set(jid, atual);
+    }
+
+    const maisAntigaDaPagina = Math.min(...registros.map((m) => (m.messageTimestamp || 0) * 1000));
+    if (maisAntigaDaPagina < desde) break; // ja passou da janela, paginas seguintes so ficam mais velhas
+    await new Promise((s) => setTimeout(s, 150));
+  }
+  return [...porContato.values()];
+}
+
+// O identificador que a Evolution usa por mensagem (`remoteJid`) e frequentemente um @lid — um ID de
+// privacidade do WhatsApp, NAO o telefone — e a propria Evolution nao expoe o telefone por tras dele
+// em nenhum endpoint medido (nem /chat/findContacts). MEDIDO em 04/09/2026: so mensagem de GRUPO traz
+// o telefone real (`participantAlt`); em conversa 1:1 o dado simplesmente nao esta disponivel aqui.
+//
+// O caminho que funciona: o Chatwoot JA resolveu esse telefone quando criou o contato (por um canal
+// que a Evolution nao expoe pra fora), entao buscamos pelo NOME (`pushName`, o perfil do WhatsApp) na
+// API do Chatwoot. So aceitamos candidato UNICO — o mesmo "ambiguidade nao decide" do resto do
+// projeto (buscarOuCriarContato, decidirDeal): nome comum ou dois contatos com nome parecido nao
+// podem eleger um telefone por palpite. Sem resolver, o relatorio mostra so o nome (ver
+// montarRelatorioMensagensPerdidas) — melhor um cliente sem numero confirmado que um numero errado.
+async function resolverTelefoneChatwoot(pushName) {
+  if (!pushName || !chatwootConfigurado()) return null;
+  try {
+    const r = await chatwootGet('/contacts/search', { q: pushName });
+    if (r.status < 200 || r.status >= 300) return null;
+    const candidatos = (r.data?.payload || []).filter((c) => c.phone_number);
+    if (candidatos.length !== 1) return null;
+    return candidatos[0].phone_number;
+  } catch {
+    return null;
+  }
+}
+
+// Orquestra: busca as mensagens da janela, tenta resolver telefone de cada contato (pulando numero
+// interno quando resolvido — TEAM_PHONES nunca aparece num relatorio de "cliente"), e monta o texto.
+// Nunca lanca — um relatorio que falha nao pode derrubar o aviso de recuperacao, que e o que importa.
+async function montarRelatorioRecuperacaoEvolution(desde, ate) {
+  try {
+    const inicio = Math.max(desde, ate - EVOLUTION_RELATORIO_MAX_JANELA_MS);
+    const brutos = await buscarMensagensEvolutionNaJanela(inicio, ate);
+
+    const contatos = [];
+    for (const c of brutos) {
+      const telefone = await resolverTelefoneChatwoot(c.pushName);
+      if (telefone && ehInterno(telefone)) continue; // numero da equipe, nunca vira "cliente" aqui
+      contatos.push({ ...c, telefone });
+      if (telefone) await new Promise((s) => setTimeout(s, 150)); // so pausa quando bateu na API do Chatwoot
+    }
+
+    return evolutionSaude.montarRelatorioMensagensPerdidas({ contatos, desde: inicio, ate, timeZone: TZ_ESCRITORIO });
+  } catch (e) {
+    console.error(`  ❌ Erro ao montar relatorio de recuperacao da Evolution: ${e.message}`);
+    return null;
+  }
+}
+
+async function monitorarEvolution() {
+  if (!EVOLUTION_MONITOR_ATIVO || !evolutionConfigurado()) return null;
+
+  const veredito = await medirSaudeEvolution();
+  const hash = evolutionSaude.hashSaude(veredito);
+  const linha = stmtEvolutionSaude.get();
+
+  if (hash !== linha.ultimo_hash) stmtEvolutionEstado.run(hash);
+  else stmtEvolutionSoAtualizou.run();
+
+  // So avisa se o hash mudou desde o ULTIMO aviso — cobre as duas pontas (quebrou / voltou) com uma
+  // unica comparacao, e sobrevive a restart do pm2 porque avisado_hash vem do disco. Nunca manda
+  // "voltou" na primeira execucao (avisado_hash NULL + hash 'ok' e estado normal, nao evento).
+  const primeiraExecucao = linha.avisado_hash == null;
+  if (hash !== linha.avisado_hash && !(primeiraExecucao && hash === 'ok')) {
+    // A duracao (e a janela do relatorio) usa o mudou_em de ANTES desta atualizacao — o instante em
+    // que a falha comecou, nao o de agora.
+    const mudouEm = hash === 'ok' && linha.mudou_em ? Date.parse(`${linha.mudou_em}Z`) : null;
+    const texto = evolutionSaude.montarTextoAlertaEvolution({
+      hash,
+      motivo: veredito.motivo,
+      detalhe: veredito.detalhe,
+      instancia: EVOLUTION_INSTANCE,
+      mudouEm,
+    });
+    await enviarTelegram(texto).catch(() => {});
+    stmtEvolutionAvisou.run(hash);
+
+    // So numa recuperacao de verdade (nao no "ficou ok e ja estava ok"): manda, como mensagem
+    // SEPARADA, o relatorio de quem escreveu enquanto a integracao estava quebrada — pedido do dono
+    // em 04/09/2026, apos o incidente. So metadado (numero/nome/horario), nunca o conteudo da
+    // mensagem. Nunca escreve nada no Chatwoot — so leitura + Telegram, a mesma regra de sempre.
+    if (hash === 'ok' && mudouEm) {
+      const relatorio = await montarRelatorioRecuperacaoEvolution(mudouEm, Date.now());
+      if (relatorio) await enviarTelegram(relatorio).catch(() => {});
+    }
+  }
+
+  return { veredito, hash };
 }
 
 // ------------------------------------------------------------
@@ -7700,6 +8676,15 @@ app.get('/clientes-retorno/amostrar', exigeAdmin, rota(async (req, res) => {
   });
 }));
 
+// Sincronizacao do nome do contato no Chatwoot (ver src/chatwoot.js). Dry-run por padrao; ?aplicar=1
+// escreve de verdade, e mesmo assim so se CHATWOOT_DRY_RUN estiver desligado — a flag e a chave mestra.
+app.post('/chatwoot/sincronizar-contatos', exigeAdmin, rota(async (req, res) => {
+  if (!CHATWOOT_ATIVO) return res.json({ ok: false, motivo: 'CHATWOOT_ATIVO=false' });
+  const limite = Number(req.query.limite) || CHATWOOT_MAX_POR_CICLO;
+  const r = await sincronizarContatosChatwoot({ aplicar: req.query.aplicar === '1', limite });
+  res.json(r);
+}));
+
 app.post('/notas-reuniao/sincronizar', exigeAdmin, rota(async (req, res) => {
   const r = await sincronizarNotasReuniao({ dryRun: req.query.aplicar === '1' ? false : NOTAS_REUNIAO_DRY_RUN });
   res.json(r);
@@ -7996,6 +8981,35 @@ app.listen(PORT, () => {
   } else {
     console.log('   Refresh de briefing pre-consulta: DESLIGADO (BRIEFING_REFRESH_ATIVO=false)');
   }
+  // Chatwoot: preencher o nome do contato a partir do Moskit (ver src/chatwoot.js). Fase 20 porque
+  // 0/5/10/15 ja estao ocupadas — somar burst de requisicoes no mesmo minuto foi o que fez o rate
+  // limit derrubar a reconciliacao de vinculo em agosto.
+  if (CHATWOOT_ATIVO) {
+    console.log(`   Sincronizacao de contatos do Chatwoot: a cada ${Math.round(RECONCILIACAO_INTERVAL_MS / 60000)} min${CHATWOOT_DRY_RUN ? ' (DRY-RUN: nao escreve)' : ''}, max ${CHATWOOT_MAX_POR_CICLO}/ciclo`);
+    agendarReconciliacao('sincronizacao de contatos do Chatwoot', rodarSincronizacaoChatwoot, 20);
+  } else {
+    console.log('   Sincronizacao de contatos do Chatwoot: DESLIGADA (CHATWOOT_ATIVO=false)');
+  }
+
+  // Monitor Evolution API -> Chatwoot: SO LEITURA, existe pra prevenir a repeticao do incidente de
+  // 04/09/2026 (58 min sem o Chatwoot receber mensagem nenhuma, sem alarme nenhum). Cadencia PROPRIA
+  // (nao agendarReconciliacao/RECONCILIACAO_INTERVAL_MS) — 127.0.0.1, sem rate limit de terceiro a
+  // proteger, entao 5 min corta a janela cega de "nunca" para "no maximo ~5 min". setTimeout curto
+  // pra primeira checagem nao esperar o intervalo cheio: um deploy que ja sobe com o token quebrado
+  // nao pode esperar 5 min pro primeiro aviso.
+  if (EVOLUTION_MONITOR_ATIVO) {
+    if (evolutionConfigurado()) {
+      console.log(`   Monitor Evolution API -> Chatwoot: a cada ${Math.round(EVOLUTION_MONITOR_INTERVAL_MS / 60000)} min (instancia "${EVOLUTION_INSTANCE}")`);
+    } else {
+      console.log('   Monitor Evolution API -> Chatwoot: sem EVOLUTION_API_KEY — no-op ate ser configurado');
+    }
+    const dispararEvolution = () => monitorarEvolution().catch((e) => console.error(`  ❌ Erro no monitor Evolution: ${e.message}`));
+    setTimeout(dispararEvolution, 10 * 1000);
+    setInterval(dispararEvolution, EVOLUTION_MONITOR_INTERVAL_MS);
+  } else {
+    console.log('   Monitor Evolution API -> Chatwoot: DESLIGADO (EVOLUTION_MONITOR_ATIVO=false)');
+  }
+
 
   // Expor via ngrok para receber webhooks do Zernio
   const { spawn } = require('child_process');
@@ -8069,6 +9083,32 @@ module.exports = {
   // proposito: e totalmente observavel atraves de handleAgendamentoCalendar.
   buscarOuCriarContato,
   buscarDealPorContato,
+  // Chatwoot (ver src/chatwoot.js) — exportados para test-pipeline.js / test-chatwoot-flags.js.
+  // ehHostChatwoot e a decisao de credencial; chatwootRequisicao e o unico ponto de saida e e ele que
+  // se recusa a fazer POST /contacts (esta rotina nunca cria contato no Chatwoot).
+  ehHostChatwoot,
+  chatwootRequisicao,
+  chatwootConfigurado,
+  varrerContatosChatwoot,
+  montarCandidatosChatwoot,
+  acharContatoChatwoot,
+  dadosLocaisDoCliente,
+  sincronizarContatosChatwoot,
+  rodarSincronizacaoChatwoot,
+  stmtsChatwoot,
+  // Monitor Evolution API -> Chatwoot (ver src/evolution.js) — exportados para test-pipeline.js /
+  // test-evolution-flags.js. evolutionRequisicao e o unico ponto de saida, e so sabe fazer GET.
+  evolutionConfigurado,
+  evolutionRequisicao,
+  ehHostEvolutionLocal,
+  chatwootTokenValido,
+  medirSaudeEvolution,
+  monitorarEvolution,
+  stmtEvolutionSaude,
+  buscarMensagensEvolutionNaJanela,
+  resolverTelefoneChatwoot,
+  montarRelatorioRecuperacaoEvolution,
+
   aplicarViradaCobranca,
   atualizarNegocioMoskit,
   garantirDealExiste,

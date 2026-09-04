@@ -24,12 +24,12 @@ node test-telefone.js    # roda um arquivo de teste isolado (mesmo padrão para 
 ```
 
 `npm test` roda `rodar-testes.js`, que executa em sequência (parando no primeiro que falhar):
-`test-telefone.js`, `test-moskit-ids.js`, `test-atividade-moskit.js`, `test-evidencia.js`,
+`test-telefone.js`, `test-chatwoot.js`, `test-moskit-ids.js`, `test-atividade-moskit.js`, `test-evidencia.js`,
 `test-briefing.js`, `test-fila.js`, `test-payload.js`, `test-rotas.js`, `test-pipeline.js`,
 `test-agenda-dry-run.js`, `test-bloqueio-campos-obrigatorios-dry-run.js`, `test-guards-internos.js`, `test-agendamento-bloco-mensagens.js`,
 `test-transcricao.js`, `test-zapsign.js`, `test-notas-reuniao.js`,
 `test-cliente-retorno.js`, `test-cliente-retorno-flags.js`, `test-reuniao-retorno.js`,
-`test-reuniao-retorno-flags.js`.
+`test-reuniao-retorno-flags.js`, `test-chatwoot-flags.js`.
 Todos usam `DB_PATH` apontando para um arquivo inexistente (banco descartável) —
 **nunca** deixe um teste abrir `conversations.db` de produção.
 
@@ -136,6 +136,30 @@ Escrevem em dados reais de produção (Moskit e/ou banco real):
   mais que 40 com 45% em branco: a atenção do dono é o recurso escasso, não o número de linhas.
 - `test-cenarios-classificacao.js` e `test-simulacao.js` — chamam a OpenAI de verdade mas não têm
   asserção automática de pass/fail; servem para inspeção manual, não regressão.
+- `sondar-chatwoot.js [--contato=<id>] [--paginas=N]` — mede, contra a instância REAL do Chatwoot, os
+  cinco contratos que a sincronização de nomes assume e que **erram em silêncio**: se `page=N` pagina
+  de verdade (paginação ignorada em silêncio já aconteceu 3× com o Moskit neste repo — o loop relê a
+  primeira página, escreve 15 contatos e PARECE ter varrido 4 mil), em que formato o `phone_number`
+  está gravado (é o que decide se `filter equal_to`, que é comparação de STRING, casa algo), quantas
+  fichas têm nome vazio/telefone/humano (o tamanho do problema pelo lado do Chatwoot), se o
+  `identifier` já é usado por outra integração, e — a pergunta mais perigosa — **se o PUT mescla ou
+  SUBSTITUI `custom_attributes`**. Só leitura, e nada é gravado em disco. A sondagem do PUT é a única
+  exceção: exige `--contato=<id>` explícito e o contato tem de ser um de TESTE criado à mão.
+  **Rodar ANTES do backfill** — sem isso o resto é fé.
+- `backfill-chatwoot-nomes.js [--aplicar] [--refrescar-espelho] [--sem-varredura] [--limite=N]
+  [--so=<telefone>] [--db=<caminho>]` — preenche de uma vez o nome dos contatos que já existem no
+  Chatwoot (a rotina periódica pega os novos). Sem `--aplicar` é só leitura: mede, imprime o perfil por
+  fonte do nome e por classe do nome anterior, e escreve um CSV com uma linha por contato. Com
+  `--aplicar` **escreve nas fichas do Chatwoot**. Reusa a função de produção
+  (`sincronizarContatosChatwoot({detalhar:true})`), nunca uma cópia da regra.
+  ⚠️ **Diferente dos outros scripts manuais, este NÃO usa `DB_PATH` descartável** — e é deliberado: o
+  estado da sincronização (`nome_escrito`, `escrita_hash`, `travado_humano`) vive em
+  `chatwoot_contacts`, e é a memória que a rotina periódica lê depois. Gravar num banco temporário
+  faria o backfill rescanear o Chatwoot inteiro a cada execução, ignorar as travas de renomeação
+  humana que a produção já registrou, e fazer a rotina refazer todo PUT no ciclo seguinte. O padrão é
+  `conversations.db` — na VPS, o de produção, que é onde ele DEVE gravar. O script imprime o caminho e
+  a idade do banco, e grita se passar de 7 dias (todo nome vem dele). A pasta `chatwoot-backfill/`
+  está no `.gitignore`: telefone + nome + link do negócio de milhares de pessoas.
 - `sondar-notas.js [dealId]` — mede, contra as APIs reais, os contratos que a rotina de notas de
   reunião assume: se `GET /deals/{id}/notes` devolve o texto (e como pagina), se `events.list` traz
   `attachments[]` pela credencial do bot, e qual a cobertura real do passo "Telefone:" da cascata.
@@ -294,6 +318,8 @@ src/
                          se o caso descrito é posterior a ela e se o tema mudou (tudo sem rede)
   notas-reuniao.js       notas do Gemini → nota no negócio: parse do assunto, cascata que escolhe o
                          deal, texto da nota (só o link da transcrição), nome do anexo (tudo sem rede)
+  chatwoot.js            nome do contato no Chatwoot: se dá para escrever, qual nome, e o payload
+                         (classificação do nome atual, cascata de fontes, autoria) — tudo sem rede
   telefone.js            normalização de telefone e detecção de números internos (equipe)
   transcricao.js         transcrição de áudios do cliente via OpenAI (contrato: nunca lança)
   zapsign.js             contrato de prestação de serviço: campos do template, valor por extenso,
@@ -1148,6 +1174,300 @@ busca o que ela pede. Desligada por padrão (`REUNIAO_RETORNO_ATIVO`) e, quando 
   `test-cliente-retorno-flags.js`: prova, através do pipeline real, que desligado continua movendo o
   evento antigo como sempre fez, dry-run não move nada, e o modo ligado abre a reunião nova, cria o
   evento/Atividade com o título certo e preserva a anterior).
+
+### Chatwoot: o nome do contato, para a busca por nome funcionar
+
+O escritório atende pelo Chatwoot. Quando o número do cliente **não está salvo na agenda do WhatsApp**,
+o Chatwoot mostra a ficha só com o telefone — e pesquisar pelo NOME não encontra o cliente. O nome já
+existe do outro lado (o bot o extrai da conversa e grava no Moskit, mais o espelho local
+`moskit_contacts`): esta rotina leva um para o outro, casando por telefone. A decisão fica em
+[src/chatwoot.js](src/chatwoot.js) (puro, sem rede); o `index.js` só faz rede e banco. Desligada por
+padrão (`CHATWOOT_ATIVO`) e, quando ligada, em dry-run (`CHATWOOT_DRY_RUN` — chave mestra: nem
+`?aplicar=1` na rota vence).
+
+- **A decisão é de DANO, não de completude.** Deixar de preencher um nome mantém o status quo (o
+  atendente pesquisa pelo número). Preencher o nome ERRADO põe o nome de um cliente na ficha de
+  **conversa** de outro, com o histórico de mensagens do segundo à vista — e ninguém descobre lendo,
+  porque as duas fichas parecem plausíveis. Por isso o casamento é `mesmoClienteTelefone`
+  ([src/telefone.js](src/telefone.js)), que exige o DDD, e **não** `mesmoTelefone`: medido na base real,
+  22 pares de contatos compartilham os 8 dígitos finais sendo **pessoas diferentes**. Para *escrever*
+  há uma exigência extra — ≥10 dígitos nos dois lados, porque `mesmoClienteTelefone` casa por sufixo
+  quando um lado é curto ("não dá pra exigir o que não foi informado"), o que é correto para ler e
+  arriscado para escrever. E **ambiguidade não decide**: duas fichas com telefone equivalente viram
+  item acionável (merge manual), nunca um palpite — mesmo "candidato único ou nada" de `decidirDeal`.
+- **Import por CSV do Chatwoot está DESCARTADO.** Seria a rota sem código, e **cria contato duplicado
+  por telefone** (não há constraint de unicidade em `phone_number`; issue chatwoot#12325) — pioraria
+  exatamente a busca que estamos consertando.
+- **Não existe webhook de contato.** O Chatwoot só emite `conversation_*`/`message_*`. Logo o estado
+  local (`chatwoot_contacts`) é a **única** memória de "onde está esta ficha", "eu já escrevi isto" e
+  "alguém mexeu depois de mim" — e é por isso que a tabela existe em vez de a rotina ser sem estado.
+  (A assinatura HMAC de webhook do Chatwoot, `X-Chatwoot-Signature`, existe no branch de
+  desenvolvimento mas **não em release estável** — outro motivo para não haver webhook aqui.)
+- **`204` é sucesso, não 200.** O `PUT /contacts/{id}` responde 204. Código novo que testar `=== 200`
+  trata sucesso como falha, retenta para sempre e nunca grava o estado — `interpretarRespostaPut`
+  existe como função nomeada e com teste só por isso.
+- **Precedência (decisão do escritório): só preenche o que está vazio, é o próprio telefone, ou é
+  genérico.** Nome digitado por pessoa nunca é sobrescrito. O que sustenta isso *ao longo do tempo* é
+  a coluna `nome_escrito` (autoria, o mesmo desenho de `custom_fields_bot`/`campos_travados`): no 1º
+  ciclo o campo estava vazio e o bot escreveu; se a equipe corrigir depois para o nome de casada, sem
+  memória de autoria "o Chatwoot tem um nome humano" e "o Chatwoot tem o nome que eu mesmo pus" são
+  indistinguíveis, e o bot desfaz a correção da equipe. Divergiu do que gravamos ⇒ `travado_humano`,
+  permanente.
+- **Cascata de fontes do nome, decidida por MEDIÇÃO:** `moskit_contacts.name` → `last_data.nome` →
+  `conversations.contact_name`. O espelho do Moskit tem **0 nomes vazios e 0 nomes que são telefone** em
+  3.828 linhas, enquanto **91 dos 277 `contact_name` do WhatsApp (33%) são o próprio número** — o
+  próprio sintoma que o dono relata. Por isso o perfil do WhatsApp entra por último e passa pelo mesmo
+  filtro. Teto da funcionalidade: ~12,6% das conversas não têm nome utilizável em nenhuma fonte — é
+  lacuna, não bug.
+- **A lista de nomes genéricos era DUAS no `index.js`** (a sanitização do nome que a IA extrai e o
+  fallback para o nome de perfil) **e já tinham divergido**: só a segunda rejeitava `teste` e número
+  puro, e nenhuma das duas pegava "Não informado" **com acento** — a grafia natural em português, e
+  portanto a que o modelo devolve. Agora é uma só (`nomeUtilizavel`, em [src/chatwoot.js](src/chatwoot.js))
+  e o `index.js` importa de lá. Ela também tira o `*` do nome vindo do Moskit — **antes** de aplicar
+  os genéricos, de propósito: assim `*Cliente sem nome` vira `Cliente sem nome`, bate na lista e sai
+  como `null`, nunca escrito. O `*` fica no Moskit (`auditar-crm-relatar.js` depende do literal) e
+  nunca chega à tela do atendente.
+- **Duas decisões de payload que cortam dano de graça.** `phone_number` **nunca** vai no PUT: achamos a
+  ficha *pelo* telefone, não há o que corrigir nele, e reescrevê-lo pode mexer no que amarra o contato
+  ao canal do WhatsApp. E `custom_attributes` é **mesclado, nunca substituído**
+  (`montarPayloadContato` recebe `atributosAtuais`) — se o PUT substituir o objeto, mandar só a nossa
+  chave apagaria todo atributo personalizado do escritório, em toda a base, sem erro nenhum.
+  `additional_attributes` não é tocado.
+- **`identifier` = `moskit:<contactId>`, e só se o campo estiver vazio ou já for nosso** — outro valor
+  ali é de outra integração, e sobrescrever a quebra em silêncio. Colisão (o campo é único por conta,
+  então há outra ficha do mesmo cliente já marcada): **não retenta e não libera o identifier da outra**
+  (mutilar um cadastro para consertar outro); degrada para `{name, custom_attributes}` — o nome é o que
+  o dono pediu, o atalho é bônus — e avisa uma vez, dizendo quais fichas precisam de merge manual.
+- **Custom attribute sem definição: MEDIDO, e o resultado contraria a suposição.** A doc e os relatos
+  da comunidade dizem que chave sem definição em Settings → Custom Attributes é descartada em
+  silêncio. Na instância do escritório (Chatwoot 4.17.1), **não é**: um `PUT` gravou
+  `custom_attributes: {moskit_contato_id: "16497274"}` num contato cuja conta **não tem nenhuma
+  definição de atributo de contato** (`GET /custom_attribute_definitions` devolveu lista vazia), e o
+  `GET` seguinte trouxe o valor íntegro. O jsonb aceita a chave de qualquer jeito.
+  **O que continua valendo:** sem a definição, o atributo provavelmente não é *renderizado* na tela do
+  atendente — isso NÃO foi verificado, porque exige olhar a interface. Então criar as duas definições
+  (`moskit_contato_id` texto, `moskit_negocio_url` link, escopo Contact) segue sendo o certo para o
+  atalho ser útil a quem atende; o que caiu foi o medo de perder o dado. A conferência por
+  `GET /contacts/{id}` continua sendo a única prova de qualquer coisa aqui.
+- **Nunca cria contato no Chatwoot, e a garantia é estrutural.** O cliente HTTP expõe só
+  `chatwootGet`/`chatwootPut`; `chatwootRequisicao` **lança** em qualquer POST fora de
+  `/contacts/filter` (que é leitura apesar do verbo — a guarda é sobre o CAMINHO, não sobre o método) e
+  em qualquer método fora de GET/PUT/POST. `test-pipeline.js` afirma que nenhuma chamada da suíte é
+  `POST /contacts`. `ehInterno` é a **primeira** coisa avaliada, antes de casar, montar payload ou
+  tocar a rede: `TEAM_PHONES` nunca vira lead, deal, contato — nem nome no Chatwoot.
+- **A credencial só vai para o host de `CHATWOOT_BASE`** (`ehHostChatwoot`, molde de `ehHostZernio`):
+  hostname exato ou sufixo **com ponto**, porque `endsWith('chatwoot.com')` ingênuo entregaria o token
+  para `malchatwoot.com` — este repositório já vazou credencial exatamente assim.
+- **Respostas:** 2xx grava estado; colisão degrada e avisa 1×; **403/401 encerra o ciclo** (é global,
+  não por contato — insistir nos candidatos seriam milhares de 403); 404 apaga a linha do espelho;
+  429/5xx/timeout entram em cooldown exponencial e, ao estourar `CHATWOOT_MAX_TENTATIVAS`, a linha
+  desiste (estado terminal). Erro transitório **não** avisa — é o servidor pedindo calma, não "conferir
+  na mão" (a lição dos 6 negócios que inundaram o Telegram em agosto). Telegram só no acionável, um
+  resumo por ciclo deduplicado, e **zero nota no Moskit** (decisão de 03/09/2026).
+- **Idempotência:** `escrita_hash` sobre o payload inteiro (chaves ordenadas em profundidade). Nada
+  mudou ⇒ zero PUT. Medido contra um Chatwoot de mentira local: 1ª rodada escreve 35, 2ª escreve 0
+  (todos `sem_mudanca`). `deal_id` mudando (cliente-retorno zera a coluna) muda o hash e o link passa
+  a apontar para o negócio atual — comportamento desejado, e a razão de o hash cobrir o payload todo.
+- **Paginação ignorada em silêncio é ERRO ALTO.** `varrerContatosChatwoot` **lança** quando uma página
+  inteira não traz nenhum id novo. Aconteceu 3× com o Moskit neste repo (`/deals`, `/activities`,
+  `/contacts` ignoram `limit`/`page` e respondem 200 com a primeira página): o loop releria os mesmos
+  registros, escreveria 15 contatos e pareceria ter varrido a base inteira.
+- **Migração e prepares preguiçosos.** `chatwoot_contacts` nasce com `CREATE TABLE IF NOT EXISTS` **em
+  try/catch** e todos os statements passam por `stmtsChatwoot()` — mesmo motivo de
+  `stmtNotaPorAnexoToken()`: um `db.prepare` no topo do arquivo transformaria o catch numa armadilha
+  (o `require` morre com "no such table/column", exit 1, pm2 em loop de restart, e o bot inteiro sai
+  do ar por causa de uma funcionalidade **desligada por padrão**). Preguiçoso, o pior caso é a rota do
+  Chatwoot devolver 500. Regressão em `test-rotas.js` (o cenário da migração impossível, com uma VIEW
+  ocupando o nome).
+- ⚠️ **O nginx na frente do Chatwoot DESCARTA o header `api_access_token`, e o sintoma é 401 eterno.**
+  MEDIDO em 04/09/2026 na instância do escritório (`chatwoot.64-181-190-28.sslip.io`, Chatwoot 4.17.1
+  em Docker atrás de nginx nativo): o MESMO token dá **200 direto no container** (`127.0.0.1:3001`) e
+  **401 pelo domínio**. Causa: o padrão do nginx é `underscores_in_headers off`, que joga fora em
+  silêncio todo header cujo nome tem `_` — e o header de autenticação do Chatwoot tem dois. Perdemos
+  uma hora achando que era token vencido, e regeneramos o token duas vezes à toa.
+  **Por isso `CHATWOOT_BASE` em produção aponta para `http://127.0.0.1:3001`**: o bot roda na MESMA
+  VPS que o Chatwoot (ver a memória do projeto), então a chamada não precisa de proxy, nem de TLS, nem
+  de nginx configurado — e deixa de depender de uma configuração que ninguém lembra que existe. A
+  alternativa é `underscores_in_headers on;` no nginx, que serve para qualquer outra integração que
+  venha depois, mas exige mexer em produção. Para rodar de fora da VPS (dev), use um túnel:
+  `ssh -N -L 3001:127.0.0.1:3001 ubuntu@<vps>` e `CHATWOOT_BASE=http://127.0.0.1:3001`.
+- ⚠️ **`query_operator` do `/contacts/filter` tem de ser `null`, nunca `'AND'`.** MEDIDO no mesmo dia:
+  a instância está em **português** e o Chatwoot valida esse campo contra a string **traduzida** —
+  `'AND'` devolve `422 {"error":"Operador de consulta deve ser \"E\" ou \"OU\"."}`. `null` significa
+  "este é o último filtro, não encadeia" e é aceito em qualquer idioma. O sintoma era **mudo**: a
+  cascata caía para `/contacts/search`, que funciona e acha o contato — só queimava uma requisição
+  recusada por candidato, em todo ciclo, para sempre. Regressão em `test-pipeline.js`.
+- ⚠️ **O `identifier` JÁ ESTÁ OCUPADO pela Evolution API** — 89 de 90 fichas da amostra têm
+  `identifier` no formato `558681416526@s.whatsapp.net` (o container `chatwoot-evolution-1` na mesma
+  VPS é quem alimenta o WhatsApp do Chatwoot). A guarda "só escreve se estiver vazio ou já for
+  `moskit:`" é o que impede o bot de quebrar o vínculo WhatsApp↔ficha de 89 contatos em silêncio —
+  ela **funcionou**, e por isso o atalho para o Moskit vive apenas no custom attribute
+  `moskit_negocio_url`, não no `identifier`. Não "consertar" isso liberando a escrita.
+- **Números medidos da instância (04/09/2026), para calibrar sem chutar:** 122 contatos na conta,
+  **15 por página** (`page=N` pagina de verdade) ⇒ varredura completa em **9 requisições**, não
+  centenas. **Nenhum header de rate limit** é devolvido, então só a pausa fixa
+  (`CHATWOOT_PAUSA_MS`) protege. `phone_number` vem em `+E164` (78 de 90 com 12 dígitos, 5 com 13,
+  1 com 15, 1 com 6, e 5 fichas sem telefone nenhum). `/contacts/search` casa telefone em qualquer
+  formato, inclusive só o sufixo de 8 dígitos. **O tamanho do problema do dono: de 90 fichas
+  amostradas, 27 têm o telefone no lugar do nome e 4 têm nome genérico — 31 ganhariam nome; 59 já têm
+  nome humano e nunca serão tocadas.**
+- **A escrita foi validada em UM contato real (04/09/2026, ficha 78).** Antes:
+  `name: "558681810093"`. Depois: `name: "Sérgio Benvindo"`, com `identifier` da Evolution API
+  (`558681810093@s.whatsapp.net`) **preservado** e `custom_attributes.moskit_contato_id` gravado.
+  `GET /contacts/search?q=Sérgio` e `?q=Benvindo` passaram a encontrar a ficha, e a busca pelo
+  **número continua funcionando** — nada foi perdido. Segunda execução: **zero PUT** (`sem_mudanca`).
+  ⚠️ **A busca do Chatwoot é sensível a ACENTO**: `q=Sergio` devolve 0 resultados para
+  "Sérgio Benvindo". Não há o que fazer do nosso lado (é o `ILIKE` do Chatwoot sobre o nome, e gravar
+  uma versão sem acento poria um nome errado na ficha) — a equipe precisa digitar com acento, ou parte
+  do sobrenome.
+- **Inspeção e operação:** `POST /chatwoot/sincronizar-contatos` (`exigeAdmin`, dry-run por padrão,
+  `?aplicar=1`, `?limite=N`); `sondar-chatwoot.js` mede a instância antes de qualquer lote;
+  `backfill-chatwoot-nomes.js` corrige o acumulado. Rotina periódica na **fase 20** de
+  `agendarReconciliacao` — 0/5/10/15 já estão ocupadas, e somar burst no mesmo minuto foi o que fez o
+  rate limit derrubar a reconciliação de vínculo em agosto.
+- Regressões em `test-chatwoot.js` (módulo puro), `test-pipeline.js` (rede/banco: interno, nenhum
+  `POST /contacts`, nome humano, autoria, hash, colisão, 403, 404, 429, cascata de busca, paginação
+  falsa, resumo do Telegram) e `test-chatwoot-flags.js` (os dois modos com que isto vai a produção —
+  desligado e dry-run — cada um no seu processo, mesmo motivo de `test-agenda-dry-run.js`).
+
+### O Chatwoot NUNCA escreve mensagem de conversa — decisão de 04/09/2026, do dono
+
+`chatwootRequisicao` (`index.js`) recusa **qualquer** método que não seja GET contra **qualquer**
+caminho que toque `/messages` — criar, editar ou apagar mensagem de conversa está fora do escopo,
+incondicionalmente, para sempre. A guarda é por regex sobre o caminho
+(`/\/messages(\/|$|\?)/`), não por revisão de código: o mesmo desenho de `CHATWOOT_POSTS_PERMITIDOS`
+("a garantia fica no código, não na memória de quem escreve o próximo commit").
+
+Nasceu de um incidente real: uma tentativa de **recuperar** mensagens perdidas na janela do incidente
+abaixo (com o dono tendo pedido a recuperação) escreveu em conversas de cliente de verdade sem avisar
+que apareceriam com o timestamp de **agora** e a autoria do **usuário logado** (porque toda escrita
+usa o `CHATWOOT_API_TOKEN` pessoal) — e pareceu, do lado de quem estava vendo o Chatwoot ao vivo, um
+bot descontrolado mandando mensagem sozinho pro cliente. A frase final do dono foi literal: **"eu não
+quero, nunca mande mensagem pros meus clientes."** As 53 mensagens recuperadas antes dessa decisão
+**ficaram como estavam** (16 foram apagadas manualmente pelo próprio dono ao notar a atividade) — não
+foram nem completadas nem desfeitas depois, por decisão dele.
+
+`GET .../messages` continua permitido — é como o monitor abaixo e qualquer investigação futura leem
+o que está acontecendo numa conversa; só a **escrita** é proibida. A sincronização de nome de contato
+(`PUT /contacts/{id}`, seção "Chatwoot" acima) continua sendo a única exceção nomeada de escrita
+neste cliente — é campo de contato, nunca mensagem, e nasceu deliberada e testada antes deste
+incidente. Regressão em `test-pipeline.js` ("NUNCA escreve mensagem").
+
+### Monitor da Evolution API — nunca mais ficar mudo
+
+**O incidente, medido:** em 04/09/2026 um Access Token pessoal do Chatwoot apareceu exposto numa
+conversa e foi regenerado por segurança. A Evolution API (`chatwoot-evolution-1`, o serviço Docker
+que conecta o WhatsApp real ao Chatwoot, **na mesma VPS do bot**, instância `"escritorio"`) continuou
+configurada com o token **antigo**, agora inválido. Por **58 minutos** (12:27:10–13:25:13 UTC,
+medido pelos timestamps reais do container) **nenhuma mensagem de WhatsApp virou conversa no
+Chatwoot** — a equipe via a mensagem no WhatsApp normal, mas ela nunca chegava a quem atende pelo
+Chatwoot. O log da Evolution mostrava, repetido 111 vezes, só isto: `[ChatwootService] ERROR Error in
+createConversation: ApiError: Unauthorized`. **Nenhum alarme disparou** — só foi descoberto porque o
+dono notou manualmente. A correção pontual (religar o token certo via
+`POST http://127.0.0.1:8080/chatwoot/set/escritorio`) foi feita e verificada ao vivo; as mensagens
+perdidas na janela **não foram recuperadas** (ver seção acima) — decisão fechada, fora de escopo.
+
+- **Cinco sinais, com early-exit** (`src/evolution.js:avaliarSaudeEvolution`) — cada motivo vira uma
+  string estável, usada tanto pro dedup quanto pra escolher o texto do aviso: (1) Evolution
+  inacessível (`GET /instance/fetchInstances` falha) — os outros sinais nem foram medidos, não dá pra
+  confiar neles; (2) a instância `"escritorio"` sumiu da lista; (3) `connectionStatus !== 'open'` — a
+  sessão do WhatsApp caiu, causa **diferente** de hoje mas mesmo sintoma; (4) `enabled: false` em
+  `GET /chatwoot/find/escritorio` — mesmo GET que já traz o token, sinal de graça; (5) **o token que a
+  Evolution tem configurado não autentica mais** (`GET {CHATWOOT_BASE}/api/v1/profile` → 401) — o
+  causador de hoje. Testa o token que **veio da Evolution**, nunca `CHATWOOT_API_TOKEN` do bot — são
+  credenciais possivelmente diferentes, testar a errada validaria a coisa errada.
+- ⚠️ **"Não consegui medir" NUNCA vira "está quebrado" — sem `CHATWOOT_BASE` o 5º sinal é ignorado, não
+  reportado como falha.** Achado ao preparar o deploy em 04/09/2026: o `.env` da VPS tinha (e ainda
+  precisa ganhar) a seção da Evolution **sem** a do Chatwoot. Nesse estado `chatwootTokenValido`
+  montava a URL `"/api/v1/profile"` (base vazia), o `new URL()` falhava e a função devolvia `false` —
+  que `avaliarSaudeEvolution` lê como `token_invalido`. Ou seja: **um deploy num `.env` incompleto
+  dispararia um alarme falso de token inválido a cada 5 minutos**, no monitor cuja razão de existir é
+  que um aviso signifique incidente de verdade (alarme que cria ruído é como o incidente real passa
+  batido depois). Agora `medirSaudeEvolution` sai com `tokenValido: null` quando `CHATWOOT_BASE` está
+  vazio — `null` é "não medido" no contrato de `avaliarSaudeEvolution`, e os 4 primeiros sinais
+  continuam valendo — e `chatwootTokenValido` **lança** em vez de devolver `false`, para que nenhum
+  outro chamador (o `sondar-evolution.js`) confunda ausência de configuração com credencial inválida.
+  Regressão no modo `sem_chatwoot` de `test-evolution-flags.js` (processo próprio, `CHATWOOT_BASE=''`
+  fixado **antes** do require — `delete` não serviria: o `dotenv` do `index.js` preencheria a variável
+  apagada a partir do `.env` de quem roda, e o teste passaria a depender da máquina).
+- ⚠️ **O token nunca é persistido, nunca vai a log, nunca aparece no texto do Telegram** — fica só em
+  memória dentro da chamada que o testa e é descartado no fim do ciclo. É o mesmo tipo de credencial
+  que já vazou uma vez (o próprio causador do incidente); repetir isso no texto de um alerta seria o
+  oposto do que a funcionalidade existe pra evitar. `pareceConterSegredo` em `src/evolution.js` é a
+  regressão dessa garantia.
+- **Dedup por hash em SQLite, não variável de processo** (`evolution_saude`, uma linha só,
+  `ultimo_hash`/`avisado_hash`/`mudou_em`) — **precisa sobreviver a restart do pm2**: se a falha ainda
+  está ativa quando o processo reinicia, uma variável em memória esqueceria o estado e, na volta, não
+  saberia avisar "voltou ao normal", ou pior, reenviaria o mesmo aviso a cada restart. Um único hash
+  (`'ok'` ou `'falha:<motivo>'`) resolve as duas pontas — avisar quando quebra **e** quando volta —
+  com uma comparação: `hash !== avisado_hash` dispara e grava. Cobre também troca de causa em falha
+  contínua (`falha:token_invalido` → `falha:sessao_fechada` avisa de novo, mesmo sem passar por
+  `'ok'`). Nunca manda "voltou" na primeira execução (`avisado_hash IS NULL` + `hash='ok'` é estado
+  normal, não evento) — e por isso `avisado_hash` fica `NULL` enquanto tudo está saudável, só passa a
+  existir na primeira vez que há algo a decidir. **Provado com dois processos reais, não simulado**:
+  `test-evolution-flags.js` dispara uma falha num processo, mata o processo, sobe um processo NOVO
+  contra o mesmo banco (é exatamente o que o pm2 faz) e confirma que o aviso não repete.
+- **Cadência própria, 5 minutos, não `agendarReconciliacao`/`RECONCILIACAO_INTERVAL_MS`** (30 min): a
+  Evolution roda em `127.0.0.1`, sem rate limit de terceiro a proteger (diferente do Moskit, cujo 429
+  é o motivo do deslocamento de fase existir), e amarrar a 30 min reproduziria uma janela cega grande
+  demais — o incidente durou 58 min mudo por checar **zero** vezes. Primeira checagem poucos segundos
+  depois do boot, não espera o intervalo cheio: um deploy que já sobe com o token quebrado não pode
+  esperar 5 min pro primeiro aviso.
+- **Nasce LIGADO** (`EVOLUTION_MONITOR_ATIVO !== 'false'`) — a **única** exceção à convenção deste repo
+  de toda funcionalidade nova nascer desligada. Essa convenção existe para conter o dano de uma
+  **escrita** errada (nome errado numa ficha, nota indevida no CRM); este monitor é estritamente
+  leitura contra Evolution e Chatwoot, então o pior caso de estar ligado por engano é um Telegram a
+  mais, deduplicado. Sem `EVOLUTION_API_KEY` configurada vira no-op silencioso e documentado, não erro
+  martelado a cada 5 min.
+- **Cliente HTTP só faz GET, e um ÚNICO POST liberado** (`evolutionRequisicao`,
+  `EVOLUTION_POSTS_PERMITIDOS = /^\/chat\/findMessages\/[^/]+$/`) — mesma exceção de
+  `CHATWOOT_POSTS_PERMITIDOS`/`/contacts/filter` e pelo mesmo motivo: é busca (leitura) apesar do
+  verbo, porque a Evolution exige um corpo (paginação) que GET não carrega. Nenhum PUT, nenhum DELETE,
+  nenhum outro POST — a Evolution nunca é escrita por este monitor. `ehHostEvolutionLocal` exige
+  **duas coisas ao mesmo tempo**: o host estar na família loopback (`127.0.0.1`/`localhost`/`::1`) **e**
+  bater exatamente com o hostname configurado em `EVOLUTION_BASE` — um redirect que trocasse a string
+  do host (mesmo dentro da família loopback, ex. `127.0.0.1` → `localhost`) não passa batido.
+- **Texto do alerta, por motivo, sempre acionável, nunca com payload fixo de correção.** O aviso de
+  `token_invalido` orienta buscar a config atual via `GET /chatwoot/find/escritorio` antes de repostar
+  — em vez de embutir um corpo de `POST /chatwoot/set` pronto no texto, que correria o risco de faltar
+  um campo que o endpoint exija (o schema completo nunca foi 100% documentado) e criar um **segundo**
+  jeito de quebrar a integração. O aviso de recuperação confirma que voltou e por quanto tempo ficou
+  fora — e **nunca** sugere recuperar as mensagens perdidas dentro do Chatwoot, decisão já fechada e
+  fora de escopo (ver a seção acima, "O Chatwoot NUNCA escreve mensagem de conversa").
+- **Relatório de mensagens recebidas durante a falha — pedido do dono em 04/09/2026, DEPOIS do
+  incidente.** Numa recuperação de verdade (`falha:*` → `ok`, nunca no "já estava ok"), uma SEGUNDA
+  mensagem no Telegram (`montarRelatorioRecuperacaoEvolution`) lista quem escreveu enquanto a
+  integração estava quebrada — **por número (quando confirmado), nome e horário, nunca o conteúdo da
+  mensagem**: é o time indo conferir manualmente no WhatsApp normal, não o bot tocando no Chatwoot.
+  Só mensagem **recebida** (`fromMe: false` — o pedido foi literal, "mensagens recebidas"), nunca de
+  **grupo** (`@g.us`, vários participantes, não cabe num relatório "por número") e nunca de número da
+  equipe (`ehInterno`, quando o telefone é resolvido).
+  ⚠️ **O identificador da Evolution (`remoteJid`) é frequentemente um `@lid` — um ID de privacidade do
+  WhatsApp, NÃO o telefone** — e a própria Evolution não expõe o telefone por trás dele em nenhum
+  endpoint medido (nem `/chat/findContacts`); só mensagem de **grupo** traz o telefone real
+  (`participantAlt`). Por isso o telefone de cada contato é resolvido buscando o **nome** (`pushName`,
+  o perfil do WhatsApp) na API do Chatwoot (`resolverTelefoneChatwoot`) — que já resolveu esse
+  telefone quando criou o contato, por um canal que a Evolution não expõe pra fora. **Só aceita
+  candidato ÚNICO** — mesmo "ambiguidade não decide" do resto do projeto (`buscarOuCriarContato`,
+  `decidirDeal`); nome comum ou dois contatos parecidos não elegem um telefone por palpite. Sem
+  resolver, o relatório mostra só o nome, marcado como "telefone não confirmado" — melhor um cliente
+  sem número que um número errado. Janela do relatório capada em `EVOLUTION_RELATORIO_MAX_JANELA_MS`
+  (48h) e contatos exibidos capados em `RELATORIO_MAX_CONTATOS` (25, com "...e mais N" — mesmo padrão
+  do resumo do Chatwoot).
+- **Inspeção manual:** `node sondar-evolution.js` — molde de `sondar-chatwoot.js`, só leitura, mesmo
+  bracket de proteção (`WORKER_MODE=1`, `DB_PATH` descartável, Telegram desligado). Mostra o token
+  **mascarado** (nunca inteiro), testa se autentica, e imprime o texto exato que o Telegram receberia
+  usando a mesma função pura do monitor real — sem mandar. Nunca chama `POST /chatwoot/set` — é ação
+  de escrita, fora do escopo "sondar", mesmo espírito do script irmão nunca criar contato.
+- Regressões em `test-evolution.js` (módulo puro: os 5 motivos, prioridade entre motivos simultâneos,
+  `pareceConterSegredo`, `montarRelatorioMensagensPerdidas` — cabeçalho, ordenação por horário mais
+  cedo, teto de contatos, nunca conteúdo de mensagem), `test-pipeline.js` (rede/banco: ciclo saudável,
+  cada motivo, dedup, troca de motivo em falha contínua, recuperação, guardas de host/verbo,
+  `buscarMensagensEvolutionNaJanela` excluindo grupo/`fromMe`/fora-da-janela,
+  `resolverTelefoneChatwoot` com candidato único × ambíguo × nenhum, e o fluxo completo — recuperação
+  manda o "voltou" E o relatório em mensagens separadas, exceto quando a janela está vazia) e
+  `test-evolution-flags.js` (o modo desligado, e a prova de persistência com dois processos reais
+  compartilhando o mesmo banco).
 
 ### Segurança das rotas
 

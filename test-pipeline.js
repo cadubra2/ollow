@@ -51,6 +51,26 @@ process.env.RETORNO_FOLGA_HORAS = '2';
 // src/telefone.js le TEAM_PHONES como `const` no require abaixo (mesmo motivo das flags acima) —
 // numero dedicado so pro teste do ramo 'interno' de processarConversaDirect.
 process.env.TEAM_PHONES = '5511900009999';
+// Chatwoot: em producao nasce DESLIGADO e em dry-run, e as duas flags sao lidas como const no
+// require de index.js abaixo. Aqui vale o inverso, pelo mesmo motivo de NOTAS_ANEXO_ATIVO — o caminho
+// que ESCREVE e o que pode errar. O modo padrao (desligado + dry-run) tem arquivo proprio:
+// test-chatwoot-flags.js. Pausa zerada para a suite nao esperar 300ms por contato.
+process.env.CHATWOOT_ATIVO = 'true';
+process.env.CHATWOOT_DRY_RUN = 'false';
+process.env.CHATWOOT_BASE = 'https://chat.exemplo.com';
+process.env.CHATWOOT_ACCOUNT_ID = '9';
+process.env.CHATWOOT_API_TOKEN = 'token-falso-chatwoot';
+process.env.CHATWOOT_PAUSA_MS = '0';
+process.env.CHATWOOT_MAX_TENTATIVAS = '3';
+// Monitor Evolution API -> Chatwoot: em producao nasce LIGADO (e so leitura), mas aqui e preciso
+// FIXAR (nao herdar do .env real) pelo mesmo motivo de toda flag lida como const no require abaixo.
+// Sem EVOLUTION_API_KEY o monitor vira no-op — a suite de rede/dedup precisa da chave pra exercitar
+// o caminho de verdade.
+process.env.EVOLUTION_MONITOR_ATIVO = 'true';
+process.env.EVOLUTION_BASE = 'http://127.0.0.1:8080';
+process.env.EVOLUTION_API_KEY = 'chave-falsa-evolution';
+process.env.EVOLUTION_INSTANCE = 'escritorio';
+process.env.EVOLUTION_MONITOR_INTERVAL_MS = '300000';
 
 // ---------- dublê do axios ----------
 const axios = require('axios');
@@ -135,6 +155,12 @@ const {
   processarConversaDirect, montarHistorico, equipeEnviouCondicoesDeValor,
   janelaAtendimento, consultaDoAtendimento, lerDealsAnteriores, abrirNovoAtendimento, avisarRetornoUmaVez,
   camposPendentes, ASSUNTO_NEUTRO,
+  sincronizarContatosChatwoot, rodarSincronizacaoChatwoot, varrerContatosChatwoot,
+  acharContatoChatwoot, dadosLocaisDoCliente, stmtsChatwoot, chatwootRequisicao, ehHostChatwoot,
+  montarCandidatosChatwoot,
+  evolutionConfigurado, evolutionRequisicao, ehHostEvolutionLocal, chatwootTokenValido,
+  medirSaudeEvolution, monitorarEvolution, stmtEvolutionSaude,
+  buscarMensagensEvolutionNaJanela, resolverTelefoneChatwoot, montarRelatorioRecuperacaoEvolution,
 } = require('./index');
 const { lerFila, salvarFila } = require('./src/fila');
 const moskitIds = require('./src/moskit-ids');
@@ -3943,8 +3969,632 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     igual('sem janela: o bloco e detectado (controle)', semJanela.bloco_recalculado.length, 1);
   }
 
+  // ============================================================
+  console.log('\n💬 Chatwoot: preencher o nome do contato a partir do Moskit');
+  // ============================================================
+  // O que esta em jogo: preencher o nome errado poe o nome de um cliente na ficha de CONVERSA de
+  // outro, com o historico de mensagens do segundo a vista. Por isso metade das assercoes e sobre
+  // NAO escrever.
+  {
+    const chatwootModulo = require('./src/chatwoot');
+    const sChat = stmtsChatwoot();
+
+    // A rotina varre `conversations` ordenada por updated_at: as seções anteriores deixaram dezenas
+    // de linhas, e sem limpar os candidatos deste bloco seriam os do teste de agendamento.
+    const zerar = () => {
+      db.prepare('DELETE FROM conversations').run();
+      db.prepare('DELETE FROM chatwoot_contacts').run();
+      db.prepare('DELETE FROM moskit_contacts').run();
+      limpar();
+    };
+
+    // Pre-semeia o espelho do Chatwoot para a cascata de BUSCA nao precisar de rede — o que este
+    // bloco mede e a decisao de escrita, e a busca tem teste proprio abaixo.
+    const semearChatwoot = (chave, chatwootId, nome = '') =>
+      sChat.upsertVisto.run(chave, chatwootId, `+${chave}`, nome, '');
+    const semearMoskit = (chave, moskitId, nome) =>
+      db.prepare("INSERT OR REPLACE INTO moskit_contacts (phone, moskit_id, name) VALUES (?,?,?)").run(chave, moskitId, nome);
+
+    // Ficha devolvida pelo GET /contacts/{id} — e ela que traz custom_attributes e o nome ATUAL.
+    const respondeFicha = (id, name, extras = {}) => (url) => {
+      if (url.endsWith(`/contacts/${id}`)) {
+        return { status: 200, data: { payload: { id, name, phone_number: '+558699999999', identifier: '', custom_attributes: {}, ...extras } } };
+      }
+      return { status: 200, data: {} };
+    };
+
+    const CHAVE = '558699999999';
+
+    // ---------- o caminho felizmente comum ----------
+    {
+      zerar();
+      semearChatwoot(CHAVE, 500, '558699999999');
+      semearMoskit(CHAVE, 4711, '*Maria de Fatima');
+      semear(CHAVE, { deal_id: 48407608, contact_name: '558699999999' });
+      rede.get = respondeFicha(500, '558699999999');
+      // 204 e o sucesso documentado do PUT do Chatwoot — nao 200.
+      rede.put = () => ({ status: 204, data: '' });
+
+      const r = await sincronizarContatosChatwoot({ aplicar: true });
+      igual('nome vazio/telefone => 1 escrita', r.escritos, 1);
+      const put = de('PUT', '/contacts/500')[0];
+      checar('PUT foi no contato certo', !!put, rede.chamadas.map((c) => c.metodo + ' ' + c.url));
+      igual('nome do Moskit, sem o "*"', put.corpo.name, 'Maria de Fatima');
+      igual('identifier com prefixo', put.corpo.identifier, 'moskit:4711');
+      checar('link do negocio no custom attribute', /\/\?\/deal\/48407608$/.test(put.corpo.custom_attributes.moskit_negocio_url), put.corpo.custom_attributes);
+      // phone_number NUNCA vai: reescrever o numero pode mexer no que amarra a ficha ao canal.
+      checar('PUT nao manda phone_number', !('phone_number' in put.corpo), Object.keys(put.corpo));
+      igual('estado gravado (nome_escrito)', sChat.get.get(CHAVE).nome_escrito, 'Maria de Fatima');
+      checar('hash gravado', !!sChat.get.get(CHAVE).escrita_hash);
+
+      // Idempotencia: nada mudou => zero PUT no segundo ciclo.
+      limpar();
+      rede.get = respondeFicha(500, 'Maria de Fatima');
+      rede.put = () => ({ status: 204, data: '' });
+      const r2 = await sincronizarContatosChatwoot({ aplicar: true });
+      igual('2o ciclo nao escreve nada', de('PUT', '/contacts').length, 0);
+      igual('e o motivo e "sem mudanca"', r2.pulados.sem_mudanca, 1);
+    }
+
+    // ---------- a garantia estrutural: nunca cria contato ----------
+    {
+      const todos = rede.chamadas.filter((c) => c.metodo === 'POST' && /\/contacts$/.test(c.url));
+      igual('NENHUM POST /contacts em nenhum momento', todos.length, 0);
+      const erro = await esperarErro(() => chatwootRequisicao('post', '/contacts'));
+      checar('e o cliente HTTP se recusa a fazer isso', /nao e permitido/.test(erro || ''), erro);
+      const erroDel = await esperarErro(() => chatwootRequisicao('delete', '/contacts/1'));
+      checar('DELETE tambem nao existe no cliente', /metodo nao permitido/.test(erroDel || ''), erroDel);
+    }
+
+    // ---------- NUNCA escreve mensagem: decisao do dono, 04/09/2026, incidente real ----------
+    {
+      const naoManda = async (metodo, caminho) => {
+        const erro = await esperarErro(() => chatwootRequisicao(metodo, caminho));
+        checar(`${metodo.toUpperCase()} ${caminho} e recusado`, /NUNCA escreve mensagem/.test(erro || ''), erro);
+      };
+      await naoManda('post', '/conversations/114/messages');
+      await naoManda('put', '/conversations/114/messages/5');
+      await naoManda('delete', '/conversations/114/messages/5');
+      await naoManda('post', '/conversations/9/messages?private=false'); // querystring nao escapa a guarda
+      // GET continua liberado — e como o monitor e as investigacoes leem o que esta acontecendo.
+      rede.get = () => ({ status: 200, data: { payload: [] } });
+      const semErro = await esperarErro(() => chatwootRequisicao('get', '/conversations/114/messages'));
+      checar('GET em mensagem continua permitido (so leitura)', semErro === null, semErro);
+    }
+
+    // ---------- numero interno nunca vira nome no Chatwoot ----------
+    {
+      zerar();
+      const INTERNO = '5511900009999'; // TEAM_PHONES, fixado no topo do arquivo
+      semearChatwoot(INTERNO, 501, '');
+      semearMoskit(INTERNO, 4712, 'Alice Pimentel');
+      semear(INTERNO, { contact_name: 'Alice' });
+      const r = await sincronizarContatosChatwoot({ aplicar: true });
+      igual('interno e pulado', r.pulados.interno, 1);
+      igual('e nada foi analisado', r.analisados, 0);
+      // A guarda vem antes de casar, montar payload e tocar a rede.
+      igual('nenhuma requisicao ao Chatwoot', rede.chamadas.filter((c) => c.url.includes('chat.exemplo.com')).length, 0);
+    }
+
+    // ---------- precedencia: nome humano nunca e sobrescrito ----------
+    {
+      zerar();
+      semearChatwoot(CHAVE, 502, 'Maria Aparecida');
+      semearMoskit(CHAVE, 4711, 'Maria de Fatima');
+      semear(CHAVE, { contact_name: 'Maria' });
+      rede.get = respondeFicha(502, 'Maria Aparecida');
+      const r = await sincronizarContatosChatwoot({ aplicar: true });
+      igual('nome humano => nao escreve', r.escritos, 0);
+      igual('e o motivo diz por que', r.pulados.nome_humano, 1);
+      igual('zero PUT', de('PUT', '/contacts').length, 0);
+    }
+
+    // ---------- autoria: renomeacao humana trava para sempre ----------
+    {
+      zerar();
+      semearChatwoot(CHAVE, 503, 'Maria de Fatima');
+      db.prepare("UPDATE chatwoot_contacts SET nome_escrito = 'Maria de Fatima' WHERE chave = ?").run(CHAVE);
+      semearMoskit(CHAVE, 4711, 'Maria de Fatima Silva');
+      semear(CHAVE, {});
+      // A equipe corrigiu para o nome de casada depois do bot.
+      rede.get = respondeFicha(503, 'Maria Aparecida Souza');
+      const r = await sincronizarContatosChatwoot({ aplicar: true });
+      igual('divergiu do que o bot escreveu => pula', r.pulados.humano_renomeou, 1);
+      igual('e trava a linha', sChat.get.get(CHAVE).travado_humano, 1);
+
+      // Travado nunca mais e reavaliado, nem com nome novo no Moskit.
+      limpar();
+      rede.get = respondeFicha(503, 'Maria Aparecida Souza');
+      const r2 = await sincronizarContatosChatwoot({ aplicar: true });
+      igual('travado => pula sem tocar a rede', r2.pulados.travado_humano, 1);
+      igual('zero requisicao', rede.chamadas.filter((c) => c.url.includes('chat.exemplo.com')).length, 0);
+    }
+
+    // ---------- sem nome utilizavel: nao gasta requisicao nenhuma ----------
+    {
+      zerar();
+      semearChatwoot(CHAVE, 504, '');
+      semearMoskit(CHAVE, 4711, '*Cliente sem nome');
+      semear(CHAVE, { contact_name: '558699999999' });
+      const r = await sincronizarContatosChatwoot({ aplicar: true });
+      igual('placeholder do bot nao e nome', r.pulados.sem_nome_utilizavel, 1);
+      igual('nenhuma requisicao', rede.chamadas.filter((c) => c.url.includes('chat.exemplo.com')).length, 0);
+    }
+
+    // ---------- duas fichas para o mesmo cliente: nao elege vencedor ----------
+    {
+      zerar();
+      // Duas grafias do MESMO numero ja no espelho do Chatwoot, e a conversa chega numa TERCEIRA
+      // (com o nono digito). Sem casar exato em nenhuma, a peneira por sufixo acha as duas — e a
+      // regra e "candidato unico ou nada", nunca eleger uma por palpite.
+      semearChatwoot('558699999999', 505, '');
+      sChat.upsertVisto.run('8699999999', 506, '8699999999', '', '');
+      semearMoskit('5586999999999', 4711, 'Maria de Fatima');
+      semear('5586999999999', { contact_name: 'Maria' });
+      const r = await sincronizarContatosChatwoot({ aplicar: true, detalhar: true });
+      igual('entra na lista de acionaveis', r.ambiguos.length, 1);
+      checar('com os dois ids', JSON.stringify(r.ambiguos[0].ids) === JSON.stringify([505, 506]), r.ambiguos);
+      // O que importa: para a chave AMBIGUA nao se elege vencedor. As duas fichas duplicadas, cada
+      // uma vista pela sua propria chave exata, sao candidatas legitimas e recebem nome — nao ha
+      // ambiguidade do ponto de vista delas. A ambiguidade existe so para a terceira grafia (a da
+      // conversa), e e ela que tem de sair sem escrita.
+      const daChaveAmbigua = (r.detalhe || []).filter((d) => d.chave === '5586999999999');
+      igual('a chave ambigua produz exatamente um desfecho', daChaveAmbigua.length, 1);
+      igual('e esse desfecho e "ambiguo", nao uma escrita', daChaveAmbigua[0].resultado, 'ambiguo');
+    }
+
+    // ---------- colisao de identifier: degrada para o nome ----------
+    {
+      zerar();
+      semearChatwoot(CHAVE, 507, '');
+      semearMoskit(CHAVE, 4711, 'Maria de Fatima');
+      semear(CHAVE, { deal_id: 48407608 });
+      rede.get = respondeFicha(507, '');
+      let n = 0;
+      rede.put = () => {
+        n++;
+        // 1a tentativa: o identifier moskit:4711 ja esta em outra ficha do mesmo cliente.
+        if (n === 1) return { status: 422, data: { message: 'Identifier has already been taken' } };
+        return { status: 204, data: '' };
+      };
+      const r = await sincronizarContatosChatwoot({ aplicar: true });
+      igual('duas tentativas de PUT', de('PUT', '/contacts/507').length, 2);
+      const segundo = de('PUT', '/contacts/507')[1];
+      checar('a 2a vai SEM identifier', !('identifier' in segundo.corpo), Object.keys(segundo.corpo));
+      igual('mas com o nome, que e o que o dono pediu', segundo.corpo.name, 'Maria de Fatima');
+      igual('conta como escrito', r.escritos, 1);
+      igual('e vira item acionavel', r.colisoes.length, 1);
+    }
+
+    // ---------- 403 encerra o ciclo (e global, nao por contato) ----------
+    {
+      zerar();
+      for (const [chave, id] of [['558611111111', 601], ['558622222222', 602], ['558633333333', 603]]) {
+        semearChatwoot(chave, id, '');
+        semearMoskit(chave, 4700 + id, 'Cliente Real Um');
+        semear(chave, {});
+      }
+      rede.get = (url) => {
+        const m = url.match(/\/contacts\/(\d+)$/);
+        return m ? { status: 200, data: { payload: { id: Number(m[1]), name: '', phone_number: '+558611111111', identifier: '', custom_attributes: {} } } } : { status: 200, data: {} };
+      };
+      rede.put = () => ({ status: 403, data: { error: 'forbidden' } });
+      const r = await sincronizarContatosChatwoot({ aplicar: true });
+      igual('para no primeiro 403', de('PUT', '/contacts').length, 1);
+      igual('e diz por que encerrou', r.encerrado_por, 'proibido');
+      igual('nada escrito', r.escritos, 0);
+    }
+
+    // ---------- 404: a ficha sumiu do Chatwoot ----------
+    {
+      zerar();
+      semearChatwoot(CHAVE, 508, '');
+      semearMoskit(CHAVE, 4711, 'Maria de Fatima');
+      semear(CHAVE, {});
+      rede.get = () => ({ status: 404, data: {} });
+      const r = await sincronizarContatosChatwoot({ aplicar: true });
+      igual('contato sumiu', r.pulados.contato_sumiu, 1);
+      checar('e a linha do espelho e apagada', !sChat.get.get(CHAVE), sChat.get.get(CHAVE));
+    }
+
+    // ---------- 429/erro transitorio: backoff, sem aviso ----------
+    {
+      zerar();
+      semearChatwoot(CHAVE, 509, '');
+      semearMoskit(CHAVE, 4711, 'Maria de Fatima');
+      semear(CHAVE, {});
+      rede.get = respondeFicha(509, '');
+      rede.put = () => ({ status: 429, data: {} });
+      await sincronizarContatosChatwoot({ aplicar: true });
+      const linhaCw = sChat.get.get(CHAVE);
+      igual('conta a falha', linhaCw.falhas, 1);
+      checar('e entra em cooldown', Number(linhaCw.backoff_ate) > Date.now(), linhaCw.backoff_ate);
+      checar('sem desistir na primeira', !linhaCw.desistiu, linhaCw.desistiu);
+
+      // Em cooldown, nao toca a rede.
+      limpar();
+      rede.get = respondeFicha(509, '');
+      const r2 = await sincronizarContatosChatwoot({ aplicar: true });
+      igual('em backoff => pula', r2.pulados.backoff, 1);
+      igual('sem requisicao', rede.chamadas.filter((c) => c.url.includes('chat.exemplo.com')).length, 0);
+    }
+
+    // ---------- dry-run: mede sem escrever ----------
+    {
+      zerar();
+      semearChatwoot(CHAVE, 510, '');
+      semearMoskit(CHAVE, 4711, 'Maria de Fatima');
+      semear(CHAVE, {});
+      rede.get = respondeFicha(510, '');
+      rede.put = () => ({ status: 204, data: '' });
+      const r = await sincronizarContatosChatwoot({ aplicar: false });
+      igual('nao escreve', r.escritos, 0);
+      igual('mas diz o que escreveria', r.escreveria, 1);
+      igual('zero PUT', de('PUT', '/contacts').length, 0);
+      igual('com amostra auditavel', r.amostra[0].para, 'Maria de Fatima');
+      igual('e a fonte do nome', r.amostra[0].fonte, 'espelho_moskit');
+    }
+
+    // ---------- cascata de busca: filter e depois search ----------
+    {
+      zerar();
+      semearMoskit(CHAVE, 4711, 'Maria de Fatima');
+      semear(CHAVE, {});
+      // filter nao acha (formato divergente no Chatwoot) — e isso NAO prova que o contato nao existe.
+      rede.post = (url) => (url.endsWith('/contacts/filter') ? { status: 200, data: { payload: [] } } : { status: 200, data: {} });
+      rede.get = (url) => {
+        if (url.includes('/contacts/search')) return { status: 200, data: { payload: [{ id: 520, name: '', phone_number: '8699999999' }] } };
+        if (url.endsWith('/contacts/520')) return { status: 200, data: { payload: { id: 520, name: '', phone_number: '8699999999', identifier: '', custom_attributes: {} } } };
+        return { status: 200, data: {} };
+      };
+      rede.put = () => ({ status: 204, data: '' });
+      const r = await sincronizarContatosChatwoot({ aplicar: true });
+      igual('search acha o que o filter nao achou', r.escritos, 1);
+      checar('e o filter foi tentado antes', de('POST', '/contacts/filter').length === 1, rede.chamadas.map((c) => c.url));
+      // query_operator NULL, nao 'AND'. MEDIDO em 04/09/2026 contra a instancia real: o Chatwoot
+      // valida esse campo contra a string TRADUZIDA do idioma da instancia, e a do escritorio esta em
+      // portugues — 'AND' devolveu 422 "Operador de consulta deve ser E ou OU". O sintoma era mudo,
+      // porque a cascata caia para /contacts/search e ACHAVA o contato: so queimava uma requisicao
+      // recusada por candidato, em todo ciclo, para sempre.
+      igual('e o filter manda query_operator null (nao "AND", que quebra em pt-BR)',
+        de('POST', '/contacts/filter')[0].corpo.payload[0].query_operator, null);
+      // Nunca busca por nome: o cliente nao tem nome no Chatwoot, e casar por nome poria a ficha de
+      // um cliente na de outro.
+      const busca = de('GET', '/contacts/search')[0];
+      igual('a busca e pelo sufixo do telefone', busca.cfg.params.q, '99999999');
+    }
+
+    // ---------- nao encontrado: nao retenta a cada ciclo ----------
+    {
+      zerar();
+      semearMoskit(CHAVE, 4711, 'Maria de Fatima');
+      semear(CHAVE, {});
+      rede.post = () => ({ status: 200, data: { payload: [] } });
+      rede.get = () => ({ status: 200, data: { payload: [] } });
+      const r = await sincronizarContatosChatwoot({ aplicar: true });
+      igual('marca como nao encontrado', r.nao_encontrados, 1);
+      limpar();
+      rede.post = () => ({ status: 200, data: { payload: [] } });
+      rede.get = () => ({ status: 200, data: { payload: [] } });
+      const r2 = await sincronizarContatosChatwoot({ aplicar: true });
+      igual('e nao gasta 2 requisicoes por ciclo para sempre', r2.pulados.nao_encontrado_recente, 1);
+      igual('sem tocar a rede', rede.chamadas.filter((c) => c.url.includes('chat.exemplo.com')).length, 0);
+    }
+
+    // ---------- varredura: paginacao ignorada em silencio e ERRO ALTO ----------
+    {
+      zerar();
+      // Aconteceu 3x com o Moskit neste repo: o parametro de pagina e ignorado, a pagina 2 volta
+      // identica a 1, e o loop "varre" 4 mil contatos relendo 15 — parecendo ter funcionado.
+      rede.get = () => ({ status: 200, data: { meta: { count: 4000 }, payload: [{ id: 1, name: 'A', phone_number: '+558611111111' }] } });
+      const erro = await esperarErro(() => varrerContatosChatwoot({ maxPaginas: 5 }));
+      checar('varredura falha alto quando a pagina nao avanca', /paginacao do Chatwoot nao avanca/.test(erro || ''), erro);
+
+      // Controle: paginacao de verdade varre e para na pagina vazia.
+      limpar();
+      let pag = 0;
+      rede.get = () => {
+        pag++;
+        if (pag > 2) return { status: 200, data: { meta: { count: 3 }, payload: [] } };
+        return { status: 200, data: { meta: { count: 3 }, payload: [{ id: pag * 10, name: 'X', phone_number: `+5586111111${pag}${pag}` }] } };
+      };
+      const rv = await varrerContatosChatwoot({ maxPaginas: 10 });
+      igual('varredura normal conta os contatos', rv.contatos, 2);
+      igual('e grava no espelho', rv.gravados, 2);
+    }
+
+    // ---------- o resumo do Telegram so leva o acionavel ----------
+    {
+      zerar();
+      semearChatwoot(CHAVE, 511, '');
+      semearMoskit(CHAVE, 4711, 'Maria de Fatima');
+      semear(CHAVE, {});
+      rede.get = respondeFicha(511, '');
+      rede.put = () => ({ status: 204, data: '' });
+      await rodarSincronizacaoChatwoot();
+      // Sucesso de rotina e Familia B: nao vira aviso, viraria ruido diario.
+      igual('sucesso nao manda Telegram', telegrams().length, 0);
+
+      zerar();
+      semearChatwoot('558644444444', 512, '');
+      sChat.upsertVisto.run('8644444444', 513, '8644444444', '', '');
+      semearMoskit('5586944444444', 4711, 'Maria de Fatima');
+      semear('5586944444444', {});
+      await rodarSincronizacaoChatwoot();
+      igual('mas duas fichas para o mesmo cliente manda', telegrams().length, 1);
+      checar('e o aviso diz que precisa de merge manual', /merge manual/.test(telegrams()[0].corpo.text), telegrams()[0].corpo.text);
+    }
+
+    // ---------- ficha do Chatwoot SEM conversa: o segundo conjunto de candidatos ----------
+    {
+      // MEDIDO em 04/09/2026 na instancia real: 4 fichas mostravam o telefone, tinham nome no Moskit
+      // e NUNCA seriam preenchidas, porque a rotina varria apenas `conversations` e esses clientes
+      // nunca escreveram para o bot. O conjunto que o escritorio quer consertar e definido pelo
+      // CHATWOOT, nao pelo nosso log de conversas.
+      zerar();
+      const SEM_CONVERSA = '558677776666';
+      semearChatwoot(SEM_CONVERSA, 700, '558677776666');
+      semearMoskit(SEM_CONVERSA, 4799, 'Dayse Moreira');
+      // De proposito: NENHUMA linha em conversations para este telefone.
+
+      const chaves = montarCandidatosChatwoot(100).map((c) => c.chat_id);
+      checar('ficha sem conversa entra na fila', chaves.includes(SEM_CONVERSA), chaves);
+
+      rede.get = respondeFicha(700, '558677776666');
+      rede.put = () => ({ status: 204, data: '' });
+      const r = await sincronizarContatosChatwoot({ aplicar: true });
+      igual('e o nome do Moskit e escrito', r.escritos, 1);
+      igual('com o nome certo', de('PUT', '/contacts/700')[0].corpo.name, 'Dayse Moreira');
+      // Sem conversa nao ha deal: o link do negocio nao pode entrar como string vazia nem quebrada.
+      const attrs = de('PUT', '/contacts/700')[0].corpo.custom_attributes || {};
+      checar('e sem link de negocio (nao existe deal)', !('moskit_negocio_url' in attrs), attrs);
+
+      // Ficha que JA tem nome de pessoa nao entra na fila: seria um GET por ciclo para concluir
+      // "nao mexer", e essa decisao nao depende de rede.
+      zerar();
+      semearChatwoot('558677775555', 701, 'Maria Aparecida');
+      semearMoskit('558677775555', 4798, 'Maria Fatima');
+      const chaves2 = montarCandidatosChatwoot(100).map((c) => c.chat_id);
+      checar('ficha com nome humano NAO entra na fila', !chaves2.includes('558677775555'), chaves2);
+
+      // A conversa tem precedencia sobre a ficha: e ela que traz deal_id e o nome extraido pela IA.
+      zerar();
+      semearChatwoot(CHAVE, 702, '558699999999');
+      semearMoskit(CHAVE, 4797, 'Cliente Com Deal');
+      semear(CHAVE, { deal_id: 48407608 });
+      const candidatos = montarCandidatosChatwoot(100).filter((c) => c.chat_id === CHAVE);
+      igual('a mesma chave nao entra duas vezes', candidatos.length, 1);
+      igual('e a versao que vale e a da conversa (tem deal_id)', candidatos[0].deal_id, 48407608);
+    }
+
+    // ---------- a decisao de credencial ----------
+    {
+      checar('host exato', ehHostChatwoot('chat.exemplo.com') === true);
+      checar('subdominio', ehHostChatwoot('a.chat.exemplo.com') === true);
+      // endsWith('chat.exemplo.com') ingenuo entregaria o token para malchat.exemplo.com — este
+      // repositorio ja vazou credencial exatamente assim (a chave do Zernio para CDN da Meta).
+      checar('sufixo SEM ponto nao e o Chatwoot', ehHostChatwoot('malchat.exemplo.com') === false);
+      checar('host de terceiro', ehHostChatwoot('evil.com') === false);
+    }
+  }
+
+  // ============================================================
+  console.log('\n🩺 Monitor Evolution API -> Chatwoot: nunca mais ficar mudo');
+  // ============================================================
+  // O incidente de 04/09/2026: um token do Chatwoot foi regenerado, a Evolution continuou com o
+  // antigo, e 58 minutos de WhatsApp nunca viraram conversa no Chatwoot — sem alarme nenhum. O que
+  // esta em jogo aqui e nao repetir isso: detectar e avisar, so leitura, com dedup que sobrevive a
+  // restart do pm2 (por isso o estado e SQLite, nao variavel de processo).
+  {
+    const zerarEvolution = () => {
+      db.prepare('DELETE FROM evolution_saude').run();
+      db.prepare("INSERT INTO evolution_saude (id) VALUES (1)").run();
+      limpar();
+    };
+
+    const respostaOk = (url) => {
+      if (url.includes('/instance/fetchInstances')) return { status: 200, data: [{ name: 'escritorio', connectionStatus: 'open' }] };
+      if (url.includes('/chatwoot/find/')) return { status: 200, data: { enabled: true, accountId: '9', token: 'token-evolution-valido', url: 'http://rails:3000', nameInbox: 'WhatsApp' } };
+      if (url.includes('/api/v1/profile')) return { status: 200, data: { id: 1 } };
+      return { status: 200, data: {} };
+    };
+
+    // ---------- ciclo saudavel: zero Telegram ----------
+    {
+      zerarEvolution();
+      rede.get = respostaOk;
+      const r = await monitorarEvolution();
+      igual('ciclo saudavel: ok', r.veredito.ok, true);
+      igual('ciclo saudavel: hash "ok"', r.hash, 'ok');
+      igual('ciclo saudavel: zero Telegram (primeira execucao "ok" nao e evento)', telegrams().length, 0);
+      igual('estado gravado no banco', stmtEvolutionSaude.get().ultimo_hash, 'ok');
+      // Nao grava avisado_hash quando o ciclo e 'ok' e nunca houve nada a desfazer — nao ha aviso
+      // "voltou" a evitar ainda. avisado_hash so passa a existir na PRIMEIRA vez que ha algo a
+      // decidir (uma falha, que dispara e grava; ou uma recuperacao de falha anterior).
+      igual('avisado_hash fica NULL em ciclo saudavel sem falha anterior (nada a desfazer ainda)', stmtEvolutionSaude.get().avisado_hash, null);
+    }
+
+    // ---------- token invalido: o causador do incidente real ----------
+    {
+      zerarEvolution();
+      rede.get = (url) => (url.includes('/api/v1/profile') ? { status: 401, data: {} } : respostaOk(url));
+      const r = await monitorarEvolution();
+      igual('token invalido: motivo certo', r.veredito.motivo, 'token_invalido');
+      igual('1 Telegram', telegrams().length, 1);
+      checar('o texto e acionavel (fala em religar)', /religar/i.test(telegrams()[0].corpo.text), telegrams()[0].corpo.text);
+      checar('o texto NUNCA contem o valor do token testado', !telegrams()[0].corpo.text.includes('token-evolution-valido'));
+      igual('hash gravado', stmtEvolutionSaude.get().ultimo_hash, 'falha:token_invalido');
+    }
+
+    // ---------- mesmo motivo repetido: dedup, zero Telegram novo ----------
+    {
+      limpar();
+      rede.get = (url) => (url.includes('/api/v1/profile') ? { status: 401, data: {} } : respostaOk(url));
+      await monitorarEvolution();
+      igual('mesma falha persistindo => zero Telegram novo', telegrams().length, 0);
+    }
+
+    // ---------- token volta a validar: aviso de recuperacao, sem sugerir recuperar mensagem ----------
+    {
+      limpar();
+      rede.get = respostaOk;
+      const r = await monitorarEvolution();
+      igual('voltou: hash "ok"', r.hash, 'ok');
+      igual('1 Telegram de recuperacao', telegrams().length, 1);
+      checar('confirma que voltou', /voltou ao normal/i.test(telegrams()[0].corpo.text), telegrams()[0].corpo.text);
+      checar('NUNCA sugere recuperar mensagem perdida (decisao fechada com o dono)', !/recuperar.*mensage/i.test(telegrams()[0].corpo.text), telegrams()[0].corpo.text);
+    }
+
+    // ---------- troca de motivo em falha continua: avisa de novo (nao so quando volta a "ok") ----------
+    {
+      zerarEvolution();
+      rede.get = (url) => (url.includes('/api/v1/profile') ? { status: 401, data: {} } : respostaOk(url));
+      await monitorarEvolution(); // fica em token_invalido, ja avisado
+      limpar();
+      rede.get = (url) => (url.includes('/instance/fetchInstances') ? { status: 200, data: [{ name: 'escritorio', connectionStatus: 'close' }] } : respostaOk(url));
+      const r = await monitorarEvolution();
+      igual('motivo mudou para sessao_fechada', r.veredito.motivo, 'sessao_fechada');
+      igual('e avisa de novo, mesmo ainda quebrado', telegrams().length, 1);
+    }
+
+    // ---------- instancia sumiu / evolution inacessivel ----------
+    {
+      zerarEvolution();
+      rede.get = () => ({ status: 200, data: [] }); // sem a instancia "escritorio" na lista
+      const r1 = await monitorarEvolution();
+      igual('instancia sumida', r1.veredito.motivo, 'instancia_nao_encontrada');
+
+      zerarEvolution();
+      rede.get = () => { throw new Error('ECONNREFUSED'); };
+      const r2 = await monitorarEvolution();
+      igual('evolution inacessivel', r2.veredito.motivo, 'evolution_inacessivel');
+      igual('ainda assim manda 1 Telegram', telegrams().length, 1);
+    }
+
+    // ---------- guardas estruturais do cliente ----------
+    {
+      // Duas checagens independentes por design: precisa estar na familia loopback E bater
+      // EXATAMENTE com o hostname configurado em EVOLUTION_BASE (aqui, '127.0.0.1'). 'localhost' e
+      // loopback tambem, mas NAO bate com a base configurada — e por isso e recusado: um redirect
+      // que trocasse a string do host (mesmo dentro da familia loopback) nao deveria passar batido.
+      checar('bate com o host configurado (127.0.0.1)', ehHostEvolutionLocal('127.0.0.1') === true);
+      checar('loopback mas host DIFERENTE do configurado e recusado', ehHostEvolutionLocal('localhost') === false);
+      checar('host de terceiro e recusado', ehHostEvolutionLocal('evil.com') === false);
+      // So GET, e um UNICO POST liberado (/chat/findMessages/{instancia}, leitura apesar do verbo —
+      // mesma excecao de /contacts/filter no Chatwoot). Nenhum outro POST, nenhum PUT, nenhum DELETE.
+      const erroPostArbitrario = await esperarErro(() => evolutionRequisicao('/instance/logout', { metodo: 'post' }));
+      checar('POST fora do caminho liberado e recusado', /nao e permitido/.test(erroPostArbitrario || ''), erroPostArbitrario);
+      const erroPut = await esperarErro(() => evolutionRequisicao('/instance/logout', { metodo: 'put' }));
+      checar('PUT nunca e permitido (nem existe caminho liberado pra ele)', /metodo nao permitido/.test(erroPut || ''), erroPut);
+    }
+
+    // ---------- buscarMensagensEvolutionNaJanela: o relatorio pedido pelo dono em 04/09/2026 ----------
+    {
+      const t = (hhmm) => Date.parse(`2026-09-04T${hhmm}:00Z`);
+      const registro = (id, jid, ts, fromMe, pushName) => ({ key: { id, remoteJid: jid, fromMe }, messageTimestamp: Math.floor(ts / 1000), pushName });
+
+      rede.post = (url, corpo) => {
+        if (!url.includes('/chat/findMessages/')) return { status: 200, data: {} };
+        if (corpo.page > 1) return { status: 200, data: { messages: { records: [] } } }; // 1 pagina basta pro teste
+        return {
+          status: 200,
+          data: {
+            messages: {
+              records: [
+                registro('1', '558699999999@s.whatsapp.net', t('12:31'), false, 'Maria'),
+                registro('2', '558699999999@s.whatsapp.net', t('12:45'), false, 'Maria'),
+                registro('3', '999@lid', t('12:20'), false, '🌻'),
+                registro('4', '120363410213066890@g.us', t('12:25'), false, 'Alguem do Grupo'), // grupo: fora
+                registro('5', '558699999999@s.whatsapp.net', t('12:50'), true, 'Você'), // fromMe: fora ("recebida" e so do cliente)
+                registro('6', '558611110000@s.whatsapp.net', t('11:00'), false, 'Fora da janela'), // antes de "desde": fora
+              ],
+            },
+          },
+        };
+      };
+
+      const contatos = await buscarMensagensEvolutionNaJanela(t('12:00'), t('13:00'));
+      igual('so 2 contatos ficam (grupo, fromMe e fora-da-janela excluidos)', contatos.length, 2);
+      const maria = contatos.find((c) => c.remoteJid.includes('558699999999'));
+      igual('Maria com as 2 mensagens dela', maria.horarios.length, 2);
+      igual('pushName capturado', maria.pushName, 'Maria');
+      const semNome = contatos.find((c) => c.remoteJid === '999@lid');
+      igual('contato so por @lid tambem entra (sem telefone, mas com nome)', semNome.pushName, '🌻');
+    }
+
+    // ---------- resolverTelefoneChatwoot: candidato unico ou nada — nunca palpite ----------
+    {
+      rede.get = (url) => {
+        if (!url.includes('/contacts/search')) return { status: 200, data: {} };
+        // O dublê do GET so passa a URL pro handler, sem os params (que vao em cfg, nao na string da
+        // URL) — o proprio jeito que ele registra a chamada e como recuperamos o "q" que foi mandado.
+        const ultima = rede.chamadas[rede.chamadas.length - 1];
+        const q = ultima?.cfg?.params?.q;
+        if (q === 'Maria Unica') return { status: 200, data: { payload: [{ id: 1, phone_number: '+558699999999' }] } };
+        if (q === 'Nome Ambiguo') return { status: 200, data: { payload: [{ id: 1, phone_number: '+558611111111' }, { id: 2, phone_number: '+558622222222' }] } };
+        return { status: 200, data: { payload: [] } };
+      };
+      igual('candidato unico => resolve', await resolverTelefoneChatwoot('Maria Unica'), '+558699999999');
+      igual('dois candidatos => null, NAO chuta um', await resolverTelefoneChatwoot('Nome Ambiguo'), null);
+      igual('nenhum candidato => null', await resolverTelefoneChatwoot('Ninguem Assim'), null);
+      igual('nome vazio => null, nem tenta a rede', await resolverTelefoneChatwoot(''), null);
+    }
+
+    // ---------- o fluxo completo: recuperacao dispara o alerta E o relatorio, em mensagens separadas ----------
+    {
+      const t = (hhmm) => Date.parse(`2026-09-04T${hhmm}:00Z`);
+      const registro = (id, jid, ts, fromMe, pushName) => ({ key: { id, remoteJid: jid, fromMe }, messageTimestamp: Math.floor(ts / 1000), pushName });
+
+      db.prepare('DELETE FROM evolution_saude').run();
+      db.prepare("INSERT INTO evolution_saude (id, ultimo_hash, avisado_hash, mudou_em) VALUES (1, 'falha:token_invalido', 'falha:token_invalido', ?)")
+        .run(new Date(t('12:00')).toISOString().slice(0, 19).replace('T', ' '));
+      limpar();
+
+      rede.get = (url) => {
+        if (url.includes('/instance/fetchInstances')) return { status: 200, data: [{ name: 'escritorio', connectionStatus: 'open' }] };
+        if (url.includes('/chatwoot/find/')) return { status: 200, data: { enabled: true, accountId: '9', token: 'tok-valido' } };
+        if (url.includes('/api/v1/profile')) return { status: 200, data: {} };
+        if (url.includes('/contacts/search')) return { status: 200, data: { payload: [{ id: 1, phone_number: '+558699999999' }] } };
+        return { status: 200, data: {} };
+      };
+      rede.post = (url, corpo) => {
+        if (!url.includes('/chat/findMessages/')) return { status: 200, data: {} };
+        if (corpo.page > 1) return { status: 200, data: { messages: { records: [] } } };
+        return { status: 200, data: { messages: { records: [registro('1', '558699999999@s.whatsapp.net', t('12:31'), false, 'Maria')] } } };
+      };
+
+      await monitorarEvolution();
+      igual('duas mensagens no Telegram: o "voltou" e o relatorio', telegrams().length, 2);
+      checar('a primeira confirma a recuperacao', /voltou ao normal/i.test(telegrams()[0].corpo.text), telegrams()[0].corpo.text);
+      checar('a segunda e o relatorio, com numero/nome/horario', /Maria/.test(telegrams()[1].corpo.text) && /558699999999/.test(telegrams()[1].corpo.text), telegrams()[1].corpo.text);
+
+      // Controle: se NAO tem nada na janela, so manda o "voltou" — nao um relatorio vazio.
+      db.prepare('DELETE FROM evolution_saude').run();
+      db.prepare("INSERT INTO evolution_saude (id, ultimo_hash, avisado_hash, mudou_em) VALUES (1, 'falha:token_invalido', 'falha:token_invalido', ?)")
+        .run(new Date(t('12:00')).toISOString().slice(0, 19).replace('T', ' '));
+      limpar();
+      rede.get = (url) => {
+        if (url.includes('/instance/fetchInstances')) return { status: 200, data: [{ name: 'escritorio', connectionStatus: 'open' }] };
+        if (url.includes('/chatwoot/find/')) return { status: 200, data: { enabled: true, accountId: '9', token: 'tok-valido' } };
+        if (url.includes('/api/v1/profile')) return { status: 200, data: {} };
+        return { status: 200, data: {} };
+      };
+      rede.post = (url, corpo) => (url.includes('/chat/findMessages/') ? { status: 200, data: { messages: { records: [] } } } : { status: 200, data: {} });
+      await monitorarEvolution();
+      igual('janela vazia => so o "voltou", sem relatorio vazio', telegrams().length, 1);
+    }
+  }
+
   db.close();
   console.log(`\n${'='.repeat(50)}`);
   console.log(`${passou} passaram · ${falhou} falharam`);
   process.exit(falhou ? 1 : 0);
-})();
+})().catch((e) => {
+  // index.js registra um handler global de unhandledRejection que LOGA e nao muda o exit code —
+  // correto para producao (promise rejeitada nao deve matar o bot), pessimo aqui: um throw dentro
+  // desta IIFE imprimia o erro e o processo saia 0, ou seja FALHA PASSANDO COMO SUITE VERDE, sem
+  // nem chegar a imprimir o resumo. Medido nesta sessao: uma excecao na secao do Chatwoot deu
+  // "exit=0". Os outros test-*.js com IIFE async tem o mesmo buraco.
+  console.error('o teste lancou fora de uma assercao:', e?.stack || e?.message || e);
+  process.exit(1);
+});
