@@ -2147,6 +2147,34 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     checar('   e nenhum contato duplicado foi criado', !contatoCriado);
   }
   {
+    // MEDIDO em 04/09/2026 na base real: 22 pares de contatos compartilham os 8 dígitos finais sendo
+    // pessoas DIFERENTES — "Pedro Amorim (55 99 84452303)" x "Lilian Naves (55 34 84452303)".
+    // Casá-los poria o negócio de um cliente sob a ficha do outro. Achado pela simulação de 10 leads,
+    // que ligou um deal ao contato errado exatamente assim.
+    limpar();
+    db.prepare("DELETE FROM moskit_contacts WHERE phone LIKE '%84452303'").run();
+    db.prepare('INSERT INTO moskit_contacts (phone, moskit_id, name, raw_data) VALUES (?,?,?,?)')
+      .run('559984452303', 6001, 'Pedro Amorim', '{}');
+    let criado = false;
+    rede.get = (url) => (url.includes('/contacts') ? { status: 200, data: [] } : { status: 200, data: {} });
+    rede.post = (url) => { if (url.includes('/contacts')) criado = true; return { status: 201, data: { id: 6002 } }; };
+    const id = await buscarOuCriarContato('553484452303', 'Lilian Naves');
+    igual('DDD diferente com mesmo sufixo → NÃO é o mesmo cliente', id, 6002);
+    checar('   criou contato próprio em vez de reusar o do outro cliente', criado);
+  }
+  {
+    // Contraprova: mesmo DDD, só variando o nono dígito e o DDI → é a mesma pessoa e tem que casar.
+    limpar();
+    db.prepare("DELETE FROM moskit_contacts WHERE phone LIKE '%94751616'").run();
+    db.prepare('INSERT INTO moskit_contacts (phone, moskit_id, name, raw_data) VALUES (?,?,?,?)')
+      .run('8694751616', 6010, 'Jéssica', '{}');
+    let criado = false;
+    rede.post = (url) => { if (url.includes('/contacts')) criado = true; return { status: 201, data: { id: 6011 } }; };
+    const id = await buscarOuCriarContato('558694751616', 'Jéssica');
+    igual('mesmo DDD, com e sem DDI → é o mesmo cliente', id, 6010);
+    checar('   e não criou duplicata', !criado);
+  }
+  {
     // Contraprova da ambiguidade: dois contatos DIFERENTES com o mesmo sufixo não podem eleger um
     // vencedor no palpite — cai para a busca na API, que é quem sabe desempatar.
     limpar();
@@ -2172,6 +2200,93 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     const id = await buscarOuCriarContato(comDdi, 'Cliente Antigo');
     igual('contato do CRM gravado sem DDI é achado na busca da API', id, 5555);
     checar('   e nenhum contato duplicado foi criado', !contatoCriado);
+  }
+
+  // ============================================================
+  // MEDIDO em 04/09/2026 pela simulacao de 10 leads (simular-10-leads-funil-teste.js): com 4.267
+  // contatos na conta e 10 por pagina, chegar ao fim da lista exigiria 427 paginas contra um teto de
+  // 20 — entao TODO lead novo estourava o teto e lancava, e nenhum cliente conseguia ser cadastrado.
+  // O erro estava nos logs de producao sem ninguem ter ligado uma coisa na outra. A saida nao e
+  // aumentar o teto (427 requisicoes por lead), e reconhecer quando "nao achei" ja basta: a listagem
+  // vem do mais novo pro mais antigo, entao alcancar uma pagina que o espelho JA conhece prova que
+  // as duas coberturas se encontraram.
+  console.log('\n=== buscarOuCriarContato: teto de paginas nao pode impedir cliente novo ===');
+  {
+    limpar();
+    const tel = '5586999990020';
+    db.prepare('DELETE FROM moskit_contacts').run();
+    // Espelho conhece um contato antigo; a API devolve uma pagina so com ele (e sempre mais token,
+    // como acontece de verdade numa conta de milhares de contatos).
+    db.prepare('INSERT INTO moskit_contacts (phone, moskit_id, name, raw_data) VALUES (?,?,?,?)')
+      .run('5586988887777', 4242, 'Cliente Antigo', '{}');
+    let paginas = 0;
+    rede.get = (url) => {
+      if (!url.includes('/contacts')) return { status: 200, data: {} };
+      paginas++;
+      return {
+        status: 200,
+        data: [{ id: 4242, name: 'Cliente Antigo', phones: [{ number: '5586988887777' }] }],
+        headers: { 'x-moskit-listing-next-page-token': 'sempre-tem-mais' },
+      };
+    };
+    let criado = false;
+    rede.post = (url) => { if (url.includes('/contacts')) criado = true; return { status: 201, data: { id: 5150 } }; };
+    const id = await buscarOuCriarContato(tel, 'Cliente Novo');
+    igual('alcancou o espelho → conclui "nao existe" e CRIA o contato novo', id, 5150);
+    checar('   POST /contacts foi chamado', criado);
+    checar('   e parou na 1a pagina em vez de varrer o teto inteiro', paginas === 1, paginas);
+  }
+  {
+    // O outro lado: espelho VAZIO e a lista nunca acaba → a duvida e real, e ai LANCA mesmo (a
+    // protecao de 24/08 continua de pe onde ela faz sentido).
+    limpar();
+    db.prepare('DELETE FROM moskit_contacts').run();
+    rede.get = (url) => (url.includes('/contacts')
+      ? { status: 200, data: [{ id: 1, name: 'Outro', phones: [{ number: '5511777776666' }] }], headers: { 'x-moskit-listing-next-page-token': 'sempre-tem-mais' } }
+      : { status: 200, data: {} });
+    let criado = false;
+    rede.post = (url) => { if (url.includes('/contacts')) criado = true; return { status: 201, data: { id: 9 } }; };
+    const erro = await esperarErro(() => buscarOuCriarContato('5586999990021', 'Fulano'));
+    checar('espelho vazio + lista infinita → LANCA em vez de criar as cegas', !!erro && !criado, { erro, criado });
+    checar('   e a mensagem diz o que fazer (importar-moskit)', String(erro).includes('importar-moskit'), erro);
+  }
+  {
+    // MEDIDO em 04/09/2026 contra a API real: com `pageToken` a listagem de /contacts devolve a MESMA
+    // primeira página indefinidamente — o parâmetro é ignorado em silêncio. O nome que funciona é
+    // `nextPageToken`, o mesmo que importarContatosMoskit sempre usou. Este teste trava a paginação
+    // pelo NOME do parâmetro: se alguém voltar para `pageToken`, a busca gira em falso de novo.
+    limpar();
+    db.prepare('DELETE FROM moskit_contacts').run();
+    let chamadasContatos = 0;
+    rede.get = (url) => {
+      if (!url.includes('/contacts')) return { status: 200, data: {} };
+      chamadasContatos++;
+      // 1ª página devolve token; a partir da 2ª, fim da lista. Se o código parar de mandar o token
+      // (ou mandar com o nome errado), ele nunca sai da 1ª e estoura o teto em vez de criar.
+      if (chamadasContatos === 1) {
+        return { status: 200, data: [{ id: 1, name: 'A', phones: [{ number: '5586911111111' }] }], headers: { 'x-moskit-listing-next-page-token': 'tok2' } };
+      }
+      return { status: 200, data: [{ id: 2, name: 'B', phones: [{ number: '5586922222222' }] }], headers: {} };
+    };
+    rede.post = () => ({ status: 201, data: { id: 4321 } });
+    const id = await buscarOuCriarContato('5586933333333', 'Cliente Novo');
+    const paginas = de('GET', '/contacts').map((c) => c.cfg?.params || {});
+    igual('paginação de /contacts avança de verdade → chega ao fim e cria', id, 4321);
+    checar('   a 2ª página foi pedida com nextPageToken (não pageToken)', paginas[1]?.nextPageToken === 'tok2', paginas[1]);
+    checar('   e nenhuma chamada usou o parâmetro que a API ignora', !paginas.some((p) => 'pageToken' in p), paginas);
+  }
+  {
+    // A varredura alimenta o espelho pelo caminho — e o que faz a cobertura crescer sozinha, em vez
+    // de depender de alguem lembrar de chamar /importar-moskit.
+    limpar();
+    db.prepare('DELETE FROM moskit_contacts').run();
+    rede.get = (url) => (url.includes('/contacts')
+      ? { status: 200, data: [{ id: 777, name: 'Passou Por Aqui', phones: [{ number: '5586955554444' }] }], headers: {} }
+      : { status: 200, data: {} });
+    rede.post = () => ({ status: 201, data: { id: 888 } });
+    await buscarOuCriarContato('5586999990022', 'Fulano');
+    const gravado = db.prepare('SELECT moskit_id FROM moskit_contacts WHERE phone = ?').get('5586955554444');
+    igual('contato visto na varredura entra no espelho', gravado?.moskit_id, 777);
   }
 
   // ============================================================

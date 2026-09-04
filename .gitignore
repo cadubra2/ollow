@@ -81,3 +81,7 @@ docs/pop/assets.rar
 
 # Documento avulso, nao faz parte do codigo do bot.
 Apresentacao_Comite_IA.docx
+
+# Registro do que a simulacao de leads criou no funil de teste (ids de negocio/contato reais, ainda
+# que ficticios). E estado de execucao, nao codigo: quem rodou apaga com `--limpar`.
+.simulacao-10-criados.json

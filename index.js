@@ -13,7 +13,7 @@ const { detectarBlocoCondicoes, contarAnexosIlegiveisEquipe } = require('./src/b
 const { apurarDuplaConfirmacao, descreverPendencia } = require('./src/agendamento');
 const { enfileirar, TEMP_DIR } = require('./src/fila');
 const { jaExiste, normalizarMensagens } = require('./src/mensagens');
-const { chaveConversa, ehInterno, TEAM_SUFIXOS, mesmoTelefone, SUFIXO_COMPARACAO } = require('./src/telefone');
+const { chaveConversa, ehInterno, TEAM_SUFIXOS, mesmoClienteTelefone, SUFIXO_COMPARACAO } = require('./src/telefone');
 const { transcreverAudio } = require('./src/transcricao');
 const { montarPayloadAtividade, horarioNaiveParaInstante } = require('./src/atividade-moskit');
 const MOSKIT_IDS = require('./src/moskit-ids');
@@ -143,7 +143,18 @@ const ZERNIO_API_KEY = process.env.ZERNIO_API_KEY;
 
 // Teto de paginas na busca de contato: protege contra base grande + resposta sem token de proxima
 // pagina, que viraria loop. 20 x 100 cobre a base atual com folga.
-const MAX_PAGINAS_BUSCA_CONTATO = Number(process.env.MAX_PAGINAS_BUSCA_CONTATO) || 20;
+// 200 paginas x 10 contatos = 2.000 de folga sobre a defasagem do espelho local. NAO e o custo
+// normal de um lead: a varredura para assim que alcanca uma pagina que o espelho ja conhece (ver
+// buscarOuCriarContato), entao com o espelho em dia ela termina na PRIMEIRA pagina. O teto so entra
+// em jogo na primeira busca depois de uma defasagem grande — e, como a varredura alimenta o espelho
+// enquanto anda, esse custo e pago UMA vez e as buscas seguintes voltam a parar na pagina 1.
+//
+// Era 20 (=200 contatos) ate 04/09/2026, e isso quebrava tudo: a conta tem 4.267 contatos, o espelho
+// estava ~400 atras, e nenhum lead novo conseguia ser cadastrado — ver o comentario da funcao.
+const MAX_PAGINAS_BUSCA_CONTATO = Number(process.env.MAX_PAGINAS_BUSCA_CONTATO) || 200;
+// Piso de espacamento entre paginas da varredura de contatos. O Moskit aceita 6 req/s e 240/min
+// (CLAUDE.md); sem pausa, uma varredura de catch-up dispararia 429 no meio e a busca lancaria.
+const PAUSA_PAGINA_CONTATO_MS = Number(process.env.PAUSA_PAGINA_CONTATO_MS) || 200;
 // Teto da busca de deal por contato (buscarDealPorContato) — pagina de 10 (?start=, /deals ignora
 // `limit`), entao 20 paginas = 200 deals mais recentes da conta. Paginar a conta inteira (3000+, ~90s)
 // e impraticavel dentro de um ciclo de processamento; os deals mais recentes sao onde o cenario real
@@ -1506,7 +1517,12 @@ async function buscarOuCriarContato(phone, name) {
     // contatos DIFERENTES compartilham o sufixo, nao da pra saber qual e; cai pra busca na API em
     // vez de chutar (mesmo "candidato unico ou nada" de decidirDeal, em src/notas-reuniao.js).
     const sufixo = phoneClean.slice(-SUFIXO_COMPARACAO);
-    const candidatos = stmtMoskitPorSufixo.all(sufixo).filter((c) => c.moskit_id);
+    // O LIKE por sufixo e so o filtro barato do banco; quem decide se e a mesma pessoa e
+    // `mesmoClienteTelefone`, que tambem exige o DDD. MEDIDO na base real: 22 pares de contatos
+    // compartilham os 8 digitos finais sendo pessoas DIFERENTES (ex.: DDD 99 x DDD 34) — sem esta
+    // segunda peneira, o negocio de um cliente entraria na ficha de outro.
+    const candidatos = stmtMoskitPorSufixo.all(sufixo)
+      .filter((c) => c.moskit_id && mesmoClienteTelefone(c.phone, phoneDigits));
     const ids = new Set(candidatos.map((c) => c.moskit_id));
     if (ids.size === 1) {
       const achado = candidatos[0];
@@ -1535,14 +1551,47 @@ async function buscarOuCriarContato(phone, name) {
   // status fora de 200-299 ou uma excecao INTERROMPEM com erro (a fila retenta depois) em vez de
   // duplicar o contato; so a paginacao chegar ao fim de verdade (ultima pagina, sem pageToken) e que
   // autoriza concluir "nao existe, pode criar".
+  //
+  // MEDIDO em 04/09/2026 pela simulacao de 10 leads num funil de teste
+  // (simular-10-leads-funil-teste.js): do jeito que estava, NENHUM cliente novo conseguia ser
+  // cadastrado. A conta tem 4.267 contatos e `/contacts` devolve 10 por pagina (o `limit: 100` do
+  // params e ignorado em silencio — medido na auditoria de 02/09), entao chegar ao fim da lista
+  // exigiria 427 paginas contra um teto de 20. Como so "chegar ao fim de verdade" autorizava
+  // concluir "nao existe", todo lead novo estourava o teto e LANCAVA: a conversa ia pra fila,
+  // queimava as 3 tentativas e era descartada. O erro estava nos logs de producao —
+  // "[worker] 558699733370 FALHOU 3x — desistindo: busca de contato por telefone nao terminou em 20
+  // paginas" — sem ninguem ter ligado uma coisa na outra. A trava de 24/08 estava certa no espirito
+  // ("rede instavel nao e prova de que nao existe"), mas foi calibrada quando se acreditava que
+  // `limit: 100` funcionava; com 10 por pagina ela passou a disparar SEMPRE.
+  //
+  // O conserto nao e aumentar o teto (427 requisicoes por lead, a 6 req/s, seria mais de um minuto
+  // por cliente e um banho de rate limit). E perceber QUANDO "nao achei" ja e resposta suficiente:
+  // a listagem vem ordenada do mais novo pro mais antigo, e o espelho local cobre tudo que existia
+  // ate a ultima importacao. Se a varredura alcanca uma pagina inteira que o espelho JA conhece, as
+  // duas coberturas se encontram — tudo que e mais antigo que essa pagina ja foi consultado no
+  // espelho — e "nao existe" passa a ser uma conclusao, nao um chute. So quando nem isso acontece
+  // (espelho vazio ou muito defasado) e que a duvida continua real e vale lancar.
   if (phoneDigits.length >= 8) {
     let pageToken = null;
     let chegouAoFim = false;
+    let alcancouEspelho = false;
+    const vistosNestaBusca = new Set();
     for (let pagina = 0; pagina < MAX_PAGINAS_BUSCA_CONTATO; pagina++) {
       let listRes;
       try {
+        // `nextPageToken`, NAO `pageToken`. MEDIDO em 04/09/2026 contra a API real: com `pageToken`
+        // a listagem devolve a MESMA primeira pagina indefinidamente (4 chamadas seguidas, os mesmos
+        // 10 ids, o mesmo token de volta) — o parametro e ignorado em silencio, como tantos outros
+        // nesta API. A varredura entao girava em falso ate estourar o teto e lancar, e nenhum cliente
+        // novo conseguia ser cadastrado.
+        //
+        // O nome certo ja estava no repositorio: `importarContatosMoskit`, logo abaixo, sempre usou
+        // `nextPageToken` — e e por isso que o espelho tem 3.8k contatos enquanto esta busca nunca
+        // passava dos 10 primeiros. Duas funcoes paginando o MESMO endpoint com nomes diferentes, e
+        // so uma delas certa: a mesma classe de divergencia silenciosa que src/moskit-ids.js existe
+        // para evitar. (`?start=` tambem funciona aqui, como em /deals e /activities.)
         listRes = await axios.get(`${MOSKIT_BASE}/contacts`, {
-          params: { limit: 100, sort: 'id', order: 'desc', ...(pageToken ? { pageToken } : { page: 1 }) },
+          params: { limit: 100, sort: 'id', order: 'desc', ...(pageToken ? { nextPageToken: pageToken } : { page: 1 }) },
           headers: apiHeaders,
           validateStatus: (s) => s < 500,
           timeout: TIMEOUT_HTTP_MS,
@@ -1560,21 +1609,47 @@ async function buscarOuCriarContato(phone, name) {
       // sem DDI ("8694751616") nunca casava com o numero que chega do WhatsApp ("558694751616") —
       // ver o comentario do espelho local acima, com a medicao de 03/09/2026.
       const found = contatos.find((c) => (c.phones || [])
-        .some((p) => mesmoTelefone(p.number, phoneDigits)));
+        .some((p) => mesmoClienteTelefone(p.number, phoneDigits)));
       if (found) {
         // Alimenta o espelho pra que a proxima rodada nem precise da rede.
         stmtMoskitUpsert.run(phoneClean, found.id, found.name || '', JSON.stringify(found));
         return found.id;
       }
 
+      // Toda pagina que passa por aqui alimenta o espelho: alem de acelerar as proximas rodadas, e
+      // o que faz a cobertura local crescer sozinha em vez de depender de alguem lembrar de chamar
+      // /importar-moskit na mao (que hoje e a UNICA coisa que atualiza esta tabela).
+      let jaConhecidos = 0;
+      for (const c of contatos) {
+        const numero = String(c.phones?.[0]?.number || '').replace(/\D/g, '');
+        if (numero.length >= 8) {
+          const chave = numero.slice(-13);
+          // So conta como "ja conhecido" quem estava no espelho ANTES desta busca comecar. Sem esta
+          // ressalva, a propria varredura forjaria o encontro das coberturas: bastaria a API repetir
+          // uma pagina — que e exatamente como ela se comporta quando a paginacao quebra (medido em
+          // /deals e /activities, onde parametro errado devolve a primeira pagina de novo) — para o
+          // contato gravado na volta anterior ser contado como conhecido na seguinte, e a busca
+          // concluir "nao existe" depois de ter visto 10 contatos.
+          if (!vistosNestaBusca.has(c.id) && stmtMoskitGet.get(chave)?.moskit_id) jaConhecidos++;
+          vistosNestaBusca.add(c.id);
+          stmtMoskitUpsert.run(chave, c.id, c.name || '', JSON.stringify(c));
+        }
+      }
+      // As duas coberturas se encontraram: esta pagina inteira ja era conhecida do espelho, e a
+      // listagem vem do mais novo pro mais antigo — logo tudo abaixo dela tambem esta no espelho,
+      // que ja foi consultado la em cima. "Nao existe" deixa de ser chute.
+      if (contatos.length > 0 && jaConhecidos === contatos.length) { alcancouEspelho = true; break; }
+
       pageToken = listRes.headers?.['x-moskit-listing-next-page-token']
         || listRes.headers?.['x-ollow-listing-next-page-token'];
       if (!pageToken || contatos.length === 0) { chegouAoFim = true; break; }
+      if (PAUSA_PAGINA_CONTATO_MS > 0) await new Promise((r) => setTimeout(r, PAUSA_PAGINA_CONTATO_MS));
     }
-    if (!chegouAoFim) {
-      // Teto de MAX_PAGINAS_BUSCA_CONTATO atingido sem achar nem chegar ao fim real da lista — nao
-      // sabemos se existe ou nao, e criar as ciegas e exatamente o bug que isto corrige.
-      throw new Error(`busca de contato por telefone nao terminou em ${MAX_PAGINAS_BUSCA_CONTATO} paginas — nao seguro pra concluir que o contato nao existe`);
+    if (!chegouAoFim && !alcancouEspelho) {
+      // Nem chegou ao fim da lista, nem encontrou o espelho pelo caminho: a duvida e real (espelho
+      // vazio ou muito defasado em relacao ao que foi criado no CRM desde a ultima importacao).
+      // Criar as cegas aqui e exatamente o bug de contato duplicado de 24/08.
+      throw new Error(`busca de contato por telefone nao terminou em ${MAX_PAGINAS_BUSCA_CONTATO} paginas e nao alcancou o espelho local — rode POST /importar-moskit para atualizar o espelho antes de concluir que o contato nao existe`);
     }
   }
 

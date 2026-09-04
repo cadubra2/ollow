@@ -28,6 +28,43 @@ function mesmoTelefone(a, b) {
   return ca.slice(-8) === cb.slice(-8);
 }
 
+// Tira o DDI 55 quando ele esta presente, para sobrar "DDD + numero". Numero brasileiro completo tem
+// 10 (fixo/celular antigo) ou 11 (celular com o nono digito) digitos depois do DDI; com o 55 na
+// frente vira 12 ou 13. Abaixo disso nao da pra afirmar que os dois primeiros digitos sao DDD.
+function semDdi(digitos) {
+  if (digitos.length >= 12 && digitos.startsWith('55')) return digitos.slice(2);
+  return digitos;
+}
+
+// A comparacao usada para decidir se dois cadastros sao a MESMA PESSOA — mais rigorosa que
+// mesmoTelefone, porque o custo do erro e diferente.
+//
+// MEDIDO em 04/09/2026 na base real (4.178 contatos com telefone): 126 sufixos de 8 digitos sao
+// compartilhados por mais de um contato. 104 sao a mesma pessoa cadastrada duas vezes — o caso que
+// queremos unificar — mas 22 sao pessoas DIFERENTES, e o exemplo que fecha a questao e
+// "Pedro Amorim (55 99 84452303)" x "Lilian Naves (55 34 84452303)": DDDs diferentes, estados
+// diferentes, mesmos 8 digitos finais. Casar esses dois poria o negocio de um cliente sob a ficha de
+// outro — vazamento de dado entre clientes, e do tipo que ninguem descobre lendo, porque os dois
+// registros parecem plausiveis.
+//
+// Achado pela simulacao de 10 leads no funil de teste (simular-10-leads-funil-teste.js), que ligou o
+// deal do cenario 8 ao contato ERRADO justamente por essa colisao. `mesmoTelefone` continua como
+// esta para o uso original (lista da equipe em ehInterno, ~12 numeros, onde colisao e improvavel e o
+// custo e outro); o casamento de CONTATO passa a exigir tambem o DDD quando os dois lados o tem.
+function mesmoClienteTelefone(a, b) {
+  const ca = chaveConversa(a);
+  const cb = chaveConversa(b);
+  if (!ca || !cb) return false;
+  if (ca.slice(-8) !== cb.slice(-8)) return false;
+
+  const na = semDdi(ca);
+  const nb = semDdi(cb);
+  // So exige DDD igual quando os DOIS lados tem DDD para comparar (>= 10 digitos). Numero curto
+  // (gravado sem DDD) continua casando pelo sufixo — nao da pra exigir o que nao foi informado.
+  if (na.length >= 10 && nb.length >= 10) return na.slice(0, 2) === nb.slice(0, 2);
+  return true;
+}
+
 // ------------------------------------------------------------
 // Numeros internos (equipe/socios) — nunca viram lead
 // ------------------------------------------------------------
@@ -60,6 +97,7 @@ function ehInterno(bruto) {
 module.exports = {
   chaveConversa,
   mesmoTelefone,
+  mesmoClienteTelefone,
   ehInterno,
   carregarInternos,
   TEAM_SUFIXOS,
