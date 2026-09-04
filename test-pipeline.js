@@ -147,6 +147,7 @@ const {
   handleAgendamentoCalendar, listarAtividadesMoskit, finalizarCiclo,
   aplicarGateCasoDescrito, deveEsperarCasoDescrito, deveEsperarCamposObrigatorios, aplicarPadroesDeterministicosDeOrigem, detectarRespostaPerguntaOrigem, registrarBriefing, mergeDados,
   mesclarParaCrm, derivarAdvogadoDaArea, detectarOpcoesInvalidas, registrarOpcoesInvalidas,
+  rejeitarAssuntoQueEhArea,
   reconciliarClassificacao, reconciliarPendenciasAgendamento, reconciliarVinculoAtividades, montarPayloadMoskit,
   refrescarBriefingsPertoDaConsulta,
   descreverAncora, somarMinutosNaive, formatarHorarioEscritorio,
@@ -2391,6 +2392,37 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     limpar();
     igual('mesmo conjunto → nao repete', await registrarOpcoesInvalidas(50, CHAT_OPC, invalidas), false);
     igual('   nenhum Telegram novo', telegrams().length, 0);
+  }
+
+  // A SONDAGEM nao pode escrever aviso de preenchimento. MEDIDO em producao em 04/09/2026: o assunto
+  // "Antecipacao de colacao de grau" (texto livre, correto, que foi para o NOME do negocio) fez o log
+  // dizer "⚠️ opcao nao reconhecida — campo fica vazio" tres vezes, porque rejeitarAssuntoQueEhArea
+  // pergunta "isto e nome de area?" pelo caminho que loga. O dono leu e pediu para cadastrar o assunto
+  // numa lista que nao existe. Aviso que descreve o contrario do que aconteceu manda arrumar o que
+  // esta certo — e por isso a sondagem tem funcao propria (ehOpcaoConhecida), silenciosa.
+  {
+    const logOriginal = console.log;
+    const linhas = [];
+    console.log = (...a) => { linhas.push(a.join(" ")); };
+    let dadosAssuntoBom;
+    let dadosAssuntoArea;
+    try {
+      dadosAssuntoBom = { assunto: "Antecipacao de colacao de grau" };
+      rejeitarAssuntoQueEhArea(dadosAssuntoBom);
+      dadosAssuntoArea = { assunto: "Direito Digital" };
+      rejeitarAssuntoQueEhArea(dadosAssuntoArea);
+      detectarOpcoesInvalidas({ area_direito: "Direito Civil" });
+    } finally {
+      console.log = logOriginal;
+    }
+    igual("assunto de texto livre SOBREVIVE", dadosAssuntoBom.assunto, "Antecipacao de colacao de grau");
+    checar("   e a sondagem nao escreve aviso de opcao nao reconhecida",
+      !linhas.some((l) => l.includes("opcao nao reconhecida")), linhas);
+    // O controle: a regra que a sondagem serve continua funcionando.
+    checar("assunto que E nome de area continua sendo trocado pelo neutro",
+      /consulta jur/i.test(dadosAssuntoArea.assunto), dadosAssuntoArea.assunto);
+    checar("   e o detector de opcao invalida tambem ficou silencioso (o caminho de escrita ja loga)",
+      !linhas.some((l) => l.includes("opcao nao reconhecida")), linhas);
   }
 
   // ============================================================

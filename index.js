@@ -1065,6 +1065,18 @@ function buscarIdOpcao(mapeamento, valor, opcoes = {}) {
   return id;
 }
 
+// A MESMA pergunta, sem o aviso: "este valor existe na lista do CRM?" feita como SONDAGEM, nao como
+// tentativa de preencher o campo. Sem isto, dois pontos que sondam de proposito escrevem no log um
+// aviso que descreve o contrario do que esta acontecendo — e foi medido em producao em 04/09/2026:
+// rejeitarAssuntoQueEhArea pergunta "o assunto e nome de area?" e a resposta BOA e "nao", mas o log
+// saia como "⚠️ opcao nao reconhecida para Antecipacao de colacao de grau — campo fica vazio". O dono
+// leu isso e pediu para cadastrar o assunto na lista; nao havia lista nenhuma onde cadastrar (assunto
+// e texto livre, vai para o NOME do negocio e nada mais), e o campo nao ficou vazio. Aviso que mente
+// sobre o que aconteceu custa mais que aviso nenhum: manda arrumar o que esta certo.
+function ehOpcaoConhecida(mapeamento, valor) {
+  return MOSKIT_IDS.buscarOpcao(mapeamento, valor) !== null;
+}
+
 // Bloco padrao de condicoes que a equipe manda quando a consulta e PAGA. Se a equipe NUNCA enviou
 // esse bloco, a consulta e cortesia — essa e a regra do escritorio, porque o atendente nunca declara
 // gratuidade explicitamente.
@@ -1610,7 +1622,7 @@ function derivarAdvogadoDaArea(dados) {
 function rejeitarAssuntoQueEhArea(dados) {
   if (!dados?.assunto) return;
   // Pelo indice de busca: pega tanto "LGPD" quanto os apelidos ("Direito Digital", "familia").
-  if (!buscarIdOpcao(MAPEAMENTO_AREA_DIREITO, dados.assunto)) return;
+  if (!ehOpcaoConhecida(MAPEAMENTO_AREA_DIREITO, dados.assunto)) return;
   console.log(`  🚫 assunto "${dados.assunto}" e nome de area, nao tema do caso — trocado por "${ASSUNTO_NEUTRO}"`);
   dados.assunto = ASSUNTO_NEUTRO;
 }
@@ -2188,7 +2200,7 @@ function detectarOpcoesInvalidas(dados) {
   return CAMPOS_CLASSIFICACAO
     .filter(({ campo, mapa }) => {
       const valor = dados[campo];
-      return valor && valor !== 'null' && buscarIdOpcao(mapa, valor) === null;
+      return valor && valor !== 'null' && !ehOpcaoConhecida(mapa, valor);
     })
     .map(({ campo, nome }) => ({ campo, nome, valor: dados[campo] }));
 }

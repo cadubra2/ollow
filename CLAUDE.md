@@ -359,6 +359,21 @@ docs/pop/                POP oficial do processo de negócio (HTML + PDF) — fo
 4. **Correspondência exata**: `MOSKIT_IDS.buscarOpcao` (usado por `buscarIdOpcao` e por todos os
    scripts) só aceita chave canônica ou apelido declarado. Valor fora da lista deixa o campo vazio e
    gera nota + Telegram (`detectarOpcoesInvalidas`/`registrarOpcoesInvalidas`), nunca um chute.
+   ⚠️ **Sondar se um valor está na lista NÃO é tentar preencher o campo — e o log tem de distinguir os
+   dois.** `buscarIdOpcao` escreve `⚠️ opcao nao reconhecida para "X" — campo fica vazio (cadastrar
+   apelido em src/moskit-ids.js)`, o que é correto no caminho de escrita e **mentira** em dois pontos
+   que perguntam de propósito: `rejeitarAssuntoQueEhArea` pergunta "este assunto é nome de área?" (a
+   resposta BOA é "não") e `detectarOpcoesInvalidas` reexamina valores que o caminho de escrita já
+   logou. MEDIDO em produção em 04/09/2026, no primeiro atendimento depois do deploy: o assunto
+   `"Antecipação de colação de grau"` — texto livre, correto, que foi para o nome do negócio como
+   devia — produziu esse aviso **três vezes**, e o dono pediu para "cadastrar o assunto na lista". Não
+   havia lista: **`assunto` não é campo de opção, não existe `CF.ASSUNTO`** — ele só compõe o `name`
+   do deal (`montarPayloadMoskit`), e nada tinha ficado vazio. Um aviso que descreve o contrário do
+   que aconteceu custa mais que aviso nenhum: manda arrumar o que está certo, e some no meio dos
+   avisos reais. Os dois pontos de sondagem usam `ehOpcaoConhecida` (mesma pergunta, silenciosa);
+   `buscarIdOpcao` continua intocado onde há campo de verdade para preencher. Regressão em
+   `test-pipeline.js`, com o controle de que a troca por `ASSUNTO_NEUTRO` continua acontecendo quando
+   o assunto é mesmo nome de área.
 5. **Reconciliação**: `reconciliarClassificacao` compara CRM x decisão do bot e corrige o que o
    próprio bot escreveu; roda a cada `RECONCILIACAO_INTERVAL_MS` (padrão 30 min) e sob demanda em
    `GET /auditoria-classificacao` (dry-run; `?aplicar=1`, `?incluir-legado=1`).
