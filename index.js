@@ -3355,7 +3355,7 @@ Analise a conversa completa e extraia dados para criar/atualizar um negocio no C
 Raciocine passo a passo antes de responder:
 1. Esta conversa ja tem um deal no CRM? Se sim, quais campos estao pendentes?
 2. Quais campos obrigatorios consigo identificar com confianca?
-3. O cliente contou algum fato do caso dele? Se NAO (so saudacao, so pedido de consulta, so o nome de um advogado), area_direito e advogado_responsavel ficam null e o assunto e "Consulta juridica".
+3. O cliente contou algum fato do caso dele? Se NAO (so saudacao, so pedido de consulta, so o nome de um advogado), area_direito e advogado_responsavel ficam null e o assunto e "Consulta juridica". Se SIM, o assunto TEM que ser o tema real do caso — o placeholder "Consulta juridica" fica proibido nessa hipotese (ver a regra de coerencia do campo assunto abaixo).
 4. ATENCAO: advogado_responsavel eh DEFINIDO pela area_direito, NAO por qual socio o lead mencionou.
 5. O lead fez pagamento ou enviou comprovante?
 6. Qual acao e mais adequada?
@@ -3376,7 +3376,12 @@ REGRAS DE DECISAO:
 - "ignorar": passou pela classificacao mas nao foi possivel extrair informacoes uteis. Ignorar permanentemente.
 
 CAMPOS OBRIGATORIOS (nunca podem ser null em criar):
-1. assunto — tema curto do caso, 2 a 5 palavras (ex: "Inventario", "Usucapiao de imovel", "Abatimento do FIES", "Rescisao de contrato"). E o que aparece no titulo do negocio no CRM, entao seja especifico e direto, sem frase completa. NUNCA deixe null: se o cliente ainda NAO contou o caso, use exatamente "Consulta juridica" — NUNCA use o nome de uma area do direito como assunto (isso transforma um palpite de area no titulo do negocio).
+1. assunto — tema curto do caso, 2 a 5 palavras (ex: "Inventario", "Usucapiao de imovel", "Abatimento do FIES", "Rescisao de contrato"). E o que aparece no titulo do negocio no CRM, entao seja especifico e direto, sem frase completa. NUNCA deixe null. NUNCA use o nome de uma area do direito como assunto (isso transforma um palpite de area no titulo do negocio).
+   REGRA DE COERENCIA, a mais importante deste campo: "Consulta juridica" so e resposta valida quando voce NAO emitir a observacao "cliente_descreveu_caso" nem "equipe_descreveu_caso". Se voce emitiu qualquer uma das duas, entao alguem CONTOU o caso — e o assunto TEM que ser o tema real desse caso, nunca o placeholder. As duas decisoes descrevem o mesmo fato e nao podem discordar: emitir "cliente_descreveu_caso" e responder assunto "Consulta juridica" e uma contradicao.
+   Exemplos dessa coerencia (todos com "cliente_descreveu_caso" emitido):
+   - "Sou servidora publica e meu pedido de remocao por motivo de saude foi negado, quero entrar na justica" -> assunto: "Remocao por motivo de saude" (NAO "Consulta juridica", NAO "Direito Administrativo")
+   - "Fui demitido sem justa causa e nao recebi as verbas rescisorias" -> assunto: "Verbas rescisorias" (NAO "Consulta juridica", NAO "Direito do Trabalho")
+   - "Meu FIES foi calculado errado, quero revisar o abatimento por tempo de servico no SUS" -> assunto: "Abatimento do FIES" (NAO "Consulta juridica", NAO "Direito Educacional")
 2. origem — SEMPRE preencher, e tente ao MAXIMO identificar antes de desistir. Procure ATIVAMENTE por
    canal de entrada em QUALQUER ponto da conversa, nao so na primeira mensagem: "vi/acessei/segui a
    pagina, o Instagram ou o link da bio do Dr. X" -> Instagram; "vi seu video/reels" -> Youtube;
