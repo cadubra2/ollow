@@ -995,6 +995,24 @@ A nota traz o resumo; o Doc que o Gemini gera vira **anexo** no mesmo negócio (
   POST responde 2xx, o anexo aparece na aba com o nome certo, e só quem **abrir** descobre que é um
   HTML. Por isso `conferirAnexoNoMoskit` compara `size` e `mimeType` do que o CRM guardou com o PDF
   enviado e manda Telegram na divergência. Medir antes de ligar: `test-moskit-anexo-real.js`.
+  ✅ **MEDIDO em 04/09/2026, e o interstício NÃO acontece com o baixador do Moskit — o risco era real
+  mas não se materializa.** Duas medições, na instância de produção, com o deal de teste 49449945:
+  (1) **quem baixa não é navegador.** A inspeção do túnel (`http://127.0.0.1:4040/api/requests/http`)
+  mostrou `User-Agent: Java-http-client/17.0.2` na primeira requisição e `Uploadcare/1.0 upload-api/1.0`
+  nas seguintes (o Moskit delega o armazenamento ao Uploadcare) — o ngrok só interpõe a página de aviso
+  para UA de navegador, então **quem respondeu foi o bot**, não o interstício. Controle do outro lado:
+  um `curl -A "Mozilla/5.0 ... Chrome/128"` na MESMA URL recebe `200` com 2808 bytes de HTML do ngrok —
+  ou seja, o interstício existe e está armado, só não é disparado por este cliente. Testar com `curl`
+  sem `-A` não prova nada (curl também não parece navegador): a única medição que vale é a do UA real,
+  lida na inspeção do túnel.
+  (2) **o Moskit valida o download, e isso é uma garantia a mais do que o desenho supunha.** Apontando
+  o POST para uma URL que responde 404 (token inválido de propósito), a resposta foi
+  `422 {"field":"attachment.file.upload.error","value":"404"}` — ele **recusa** em vez de guardar o
+  corpo do erro com nome de PDF. O anexo real que subiu em seguida: `application/pdf`, **275.417
+  bytes**, e o download do storage do CRM (`files.moskitcrm.com`) começa em `%PDF-1.4`, sem HTML, com
+  o `size` batendo com o registrado. Conclusão prática: `NOTAS_ANEXO_ATIVO=true` é seguro **com este
+  túnel e este baixador**; `conferirAnexoNoMoskit` continua sendo a rede de segurança para o dia em
+  que o Moskit trocar de cliente HTTP, ou o plano do ngrok mudar de comportamento.
 - **O nome do arquivo É a chave de deduplicação.** O POST não aceita marcador dentro do arquivo (o
   corpo é só uma url), então, depois de um crash entre "vou anexar" e "anexei", a única pergunta
   possível ao CRM é *"existe anexo com este nome?"*. `nomeAnexoNota` (`src/notas-reuniao.js`) deriva
