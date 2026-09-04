@@ -282,6 +282,10 @@ const LOST_REASON = {
   'desistiu de entrar com a acao': 127372,
   'escritorio nao possui interesse em prosseguir': 182706,
   'nao quis marcar consulta gratis': 244375,
+  // Cadastrado no CRM depois da medicao de 04/08/2026 e achado em 04/09/2026 (GET /lostReasons
+  // paginado por start= devolve 11, nao 10). Sem esta linha, `buscarOpcao` nunca elegeria a opcao
+  // que o escritorio ja usa, e o fechamento cairia no fallback "nao informou o motivo".
+  'apenas consultoria': 378429,
 };
 
 // ------------------------------------------------------------

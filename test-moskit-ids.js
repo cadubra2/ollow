@@ -222,6 +222,12 @@ console.log('\n=== Fechamento de negocio (status WON/LOST) ===');
   checar('LOST_REASON: nenhum ID repetido (sao motivos distintos, nao aliases)',
     new Set(Object.values(LOST_REASON)).size === Object.keys(LOST_REASON).length);
 
+  // Achado em 04/09/2026: GET /lostReasons paginado por start= devolve 11 motivos, nao 10 — o
+  // "Apenas consultoria" foi cadastrado no CRM depois da medicao original e faltava aqui.
+  igual('motivo "apenas consultoria" cadastrado (existe no CRM desde 2026)', LOST_REASON['apenas consultoria'], 378429);
+  checar('e buscarOpcao o encontra pelo texto que a IA escreveria',
+    IDS.buscarOpcao(IDS.LOST_REASON, 'Apenas consultoria') === 378429);
+
   checar('LOST_REASON_PADRAO_ID aponta pra um motivo existente na tabela',
     Object.values(LOST_REASON).includes(LOST_REASON_PADRAO_ID), LOST_REASON_PADRAO_ID);
 }

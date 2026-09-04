@@ -69,6 +69,15 @@ console.log('\n2) nomeUtilizavel — o "*" e os genericos');
   igual('*Cliente sem nome NUNCA e escrito', nomeUtilizavel('*Cliente sem nome'), null);
   igual('Cliente sem nome tambem nao', nomeUtilizavel('Cliente sem nome'), null);
   igual('generico simples', nomeUtilizavel('Cliente'), null);
+  // MEDIDO em producao em 04/09/2026: uma ficha do Chatwoot recebeu o nome "empresa". Substantivo
+  // comum sozinho nao identifica ninguem — buscar por ele acha qualquer um, e o cliente continua
+  // invisivel, que e exatamente o problema que esta rotina existe pra resolver.
+  igual('substantivo comum sozinho nao e nome (empresa)', nomeUtilizavel('empresa'), null);
+  igual('   idem com maiuscula/acento normalizados', nomeUtilizavel('Empresa'), null);
+  igual('   contato', nomeUtilizavel('Contato'), null);
+  igual('   whatsapp', nomeUtilizavel('WhatsApp'), null);
+  // O controle que impede a regra de virar excesso: nome REAL que contem a palavra continua passando.
+  igual('mas nome real que CONTEM a palavra e escrito', nomeUtilizavel('Empresa Silva Ltda'), 'Empresa Silva Ltda');
   igual('generico com caixa diferente', nomeUtilizavel('LEAD'), null);
   igual('generico com acento (a regex antiga nao pegava)', nomeUtilizavel('Não informado'), null);
   igual('teste', nomeUtilizavel('teste'), null);

@@ -145,6 +145,7 @@ google.calendar = () => ({
 const {
   moverParaEstagio, criarNotaMoskit, aplicarViradaCobranca, atualizarNegocioMoskit,
   handleAgendamentoCalendar, listarAtividadesMoskit, finalizarCiclo,
+  listarStagesMoskit,
   aplicarGateCasoDescrito, deveEsperarCasoDescrito, deveEsperarCamposObrigatorios, aplicarPadroesDeterministicosDeOrigem, detectarRespostaPerguntaOrigem, registrarBriefing, mergeDados,
   mesclarParaCrm, derivarAdvogadoDaArea, detectarOpcoesInvalidas, registrarOpcoesInvalidas,
   rejeitarAssuntoQueEhArea,
@@ -863,6 +864,37 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
     rede.get = () => ({ status: 500, data: null, headers: {} });
     const r = await listarAtividadesMoskit();
     igual('erro na primeira pagina → devolve lista vazia, nao lanca', r.atividades.length, 0);
+  }
+
+  // ============================================================
+  console.log('\n=== listarStagesMoskit: /stages tambem pagina por ?start= ===');
+  // MEDIDO em 04/09/2026: /stages devolve 10 por pagina e ignora `limit`. A conta tem 16 estagios, e
+  // ler so a primeira pagina fez a rota de auditoria (e eu, ao vivo, para o dono) afirmar que
+  // estagios EXISTENTES nao existiam — os invisiveis eram justamente os do funil novo.
+  {
+    limpar();
+    const p1 = Array.from({ length: 10 }, (_, k) => ({ id: 100 + k, name: 'E' + k, priority: k, pipeline: { id: 40631 } }));
+    const p2 = Array.from({ length: 6 }, (_, k) => ({ id: 200 + k, name: 'N' + k, priority: k, pipeline: { id: 107282 } }));
+    const lotes = [p1, p2];
+    let i = 0;
+    rede.get = () => ({ status: 200, data: lotes[i++] || [], headers: {} });
+    const stages = await listarStagesMoskit();
+    const gets = de('GET', '/stages');
+    igual('junta as duas paginas (16, nao 10)', stages.length, 16);
+    igual('   duas requisicoes, parando na incompleta', gets.length, 2);
+    igual('   a primeira pede start=0', gets[0].cfg.params.start, 0);
+    igual('   a segunda avanca o offset', gets[1].cfg.params.start, 10);
+    checar('   e traz estagios dos DOIS funis (e o chamador que filtra)',
+      new Set(stages.map((s) => s.pipeline.id)).size === 2, stages.map((s) => s.pipeline.id));
+  }
+  {
+    // Paginacao ignorada em silencio e ERRO ALTO: releria a mesma pagina para sempre, e o chamador
+    // acharia que varreu a conta inteira. Mesma decisao de varrerContatosChatwoot.
+    limpar();
+    const mesma = Array.from({ length: 10 }, (_, k) => ({ id: 300 + k, name: 'X', priority: k, pipeline: { id: 1 } }));
+    rede.get = () => ({ status: 200, data: mesma, headers: {} });
+    const erro = await esperarErro(() => listarStagesMoskit());
+    checar('pagina repetida LANCA em vez de fingir que varreu', /paginacao ignorada/.test(erro || ''), erro);
   }
 
   // ============================================================

@@ -5104,39 +5104,58 @@ app.get('/auditoria-agenda', exigeAdmin, rota(async (req, res) => {
   });
 }));
 
-// Auditoria SO-LEITURA: lista estagios do funil (pipeline "Funil de Vendas", id 40631) com priority
-// maior que a do ultimo estagio mapeado hoje em MOSKIT_STAGE_MAP (contrato_enviado), e amostra os
-// valores reais de deal.status ja em uso no Moskit. Nao escreve nada — serve pra descobrir os
-// nomes/IDs dos estagios finais do funil (ex.: Contrato Assinado, Ganho, Perdido) antes de mapea-los.
+// Lista TODOS os estagios da conta, paginando por `?start=`.
+//
+// MEDIDO em 04/09/2026: `GET /stages` devolve 10 por pagina, como /deals e /activities, e ignora
+// `limit` em silencio. Ler so a primeira pagina fez esta rota (e eu, nesta sessao) afirmar que
+// estagios EXISTENTES nao existiam — a conta tem 16, e os 6 invisiveis eram justamente os do funil
+// novo. Mesmo padrao de listarAtividadesMoskit: pagina incompleta encerra o loop.
+async function listarStagesMoskit() {
+  const todos = [];
+  const vistos = new Set();
+  for (let start = 0; start < 500; start += 10) {
+    const r = await axios.get(`${MOSKIT_BASE}/stages`, { params: { start }, headers: apiHeaders, validateStatus: (s) => s < 500 });
+    if (r.status < 200 || r.status >= 300 || !Array.isArray(r.data) || !r.data.length) break;
+    // Paginacao ignorada em silencio releria a mesma pagina para sempre — erro ALTO, como no Chatwoot.
+    const novos = r.data.filter((s) => s?.id != null && !vistos.has(s.id));
+    if (!novos.length) throw new Error(`GET /stages?start=${start} nao trouxe nenhum estagio novo — paginacao ignorada`);
+    for (const s of novos) { vistos.add(s.id); todos.push(s); }
+    if (r.data.length < 10) break;
+  }
+  return todos;
+}
+
+// Auditoria SO-LEITURA: lista estagios do funil EM USO com priority maior que a do ultimo estagio
+// mapeado hoje em MOSKIT_STAGE_MAP (contrato_enviado), e amostra os valores reais de deal.status ja
+// em uso no Moskit. Nao escreve nada — serve pra descobrir os nomes/IDs dos estagios finais do funil
+// (ex.: Contrato Assinado, Ganho, Perdido) antes de mapea-los.
+//
+// O funil e DERIVADO do estagio configurado (`MOSKIT_STAGE_MAP.agendamento.id` -> `stage.pipeline.id`),
+// nunca escrito a mao. Antes havia um `/pipelines/40631` fixo aqui: no dia em que o .env passou a
+// apontar para outro funil (04/09/2026), esta rota continuou auditando o funil que o bot nao usa mais
+// — e a resposta parecia perfeitamente normal. Derivar do estagio faz a auditoria seguir o bot sozinha.
 app.get('/auditoria-funil-completo', exigeAdmin, rota(async (req, res) => {
   console.log('\n🔍 Auditoria do funil completo (so leitura)...');
   const maxPriorityMapeada = Math.max(...Object.values(MOSKIT_STAGE_MAP).map((s) => s.priority));
 
   let stages = [];
   let stagesFonte = null;
-  for (const tentativa of [
-    { fonte: '/stages', req: () => axios.get(`${MOSKIT_BASE}/stages`, { headers: apiHeaders, validateStatus: (s) => s < 500 }) },
-    { fonte: '/pipelines/40631', req: () => axios.get(`${MOSKIT_BASE}/pipelines/40631`, { headers: apiHeaders, validateStatus: (s) => s < 500 }) },
-    { fonte: '/pipelines', req: () => axios.get(`${MOSKIT_BASE}/pipelines`, { headers: apiHeaders, validateStatus: (s) => s < 500 }) },
-  ]) {
-    try {
-      const respTentativa = await tentativa.req();
-      if (respTentativa.status >= 200 && respTentativa.status < 300 && respTentativa.data) {
-        const candidato = Array.isArray(respTentativa.data)
-          ? respTentativa.data
-          : (respTentativa.data.stages || [respTentativa.data]);
-        if (candidato.length) {
-          stages = candidato;
-          stagesFonte = tentativa.fonte;
-          break;
-        }
-      }
-    } catch (e) {
-      console.log(`  ⚠️ ${tentativa.fonte} falhou: ${e.message}`);
-    }
+  try {
+    stages = await listarStagesMoskit();
+    stagesFonte = '/stages (paginado por start)';
+  } catch (e) {
+    console.log(`  ⚠️ /stages falhou: ${e.message}`);
   }
 
-  const estagiosAlemDoMapeado = stages
+  // Qual funil o bot usa de verdade, segundo o estagio de entrada configurado.
+  const idEstagioEntrada = MOSKIT_STAGE_MAP.agendamento.id;
+  const estagioEntrada = stages.find((s) => String(s.id) === String(idEstagioEntrada));
+  const pipelineEmUso = estagioEntrada?.pipeline?.id ?? null;
+  const doFunilEmUso = pipelineEmUso == null
+    ? stages
+    : stages.filter((s) => String(s?.pipeline?.id) === String(pipelineEmUso));
+
+  const estagiosAlemDoMapeado = doFunilEmUso
     .filter((s) => Number.isFinite(s?.priority) && s.priority > maxPriorityMapeada)
     .sort((a, b) => a.priority - b.priority)
     .map((s) => ({ id: s.id, name: s.name, priority: s.priority }));
@@ -5163,6 +5182,10 @@ app.get('/auditoria-funil-completo', exigeAdmin, rota(async (req, res) => {
   res.json({
     ok: true,
     fonte_estagios: stagesFonte,
+    estagios_na_conta: stages.length,
+    pipeline_em_uso: pipelineEmUso,
+    pipeline_derivado_de: `MOSKIT_STAGE_MAP.agendamento.id = ${idEstagioEntrada}`,
+    estagios_do_funil_em_uso: doFunilEmUso.length,
     max_priority_mapeada_hoje: maxPriorityMapeada,
     estagios_alem_do_mapeado: estagiosAlemDoMapeado,
     amostra_deals: deals.length,
@@ -9180,6 +9203,7 @@ module.exports = {
   // Exportada para teste: a paginacao por pageToken (e NAO por ?page=) e o tipo de detalhe que passa
   // despercebido — o codigo antigo "paginava" e lia sempre os mesmos 10 registros sem erro nenhum.
   listarAtividadesMoskit,
+  listarStagesMoskit,
   // Exportada para teste: e a rotina que decide se uma atividade criada direto no Moskit ganha o
   // sufixo #dealId/marcador [deal:...] no evento do Google (ver comSufixoDealId/comMarcadorDeal).
   sincronizarAtividadesMoskit,

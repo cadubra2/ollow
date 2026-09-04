@@ -40,6 +40,15 @@ const NOMES_GENERICOS = new Set([
   'null',
   'undefined',
   'teste',
+  // MEDIDO em producao em 04/09/2026: uma ficha recebeu o nome "empresa" — passou o filtro (tem
+  // letra, tem 7 caracteres, nao estava na lista) e nao serve pra NADA do que esta funcionalidade
+  // existe pra fazer: o atendente que busca "empresa" acha qualquer um, e quem busca o cliente por
+  // nome continua nao achando. Substantivo comum sozinho e placeholder, nao nome de pessoa. So o
+  // termo EXATO e recusado (a comparacao e do nome inteiro normalizado): "Empresa Silva Ltda"
+  // continua sendo escrito normalmente.
+  'empresa',
+  'contato',
+  'whatsapp',
 ]);
 
 const MIN_CARACTERES_NOME = 3;
