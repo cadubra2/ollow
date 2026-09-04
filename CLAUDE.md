@@ -33,6 +33,22 @@ node test-telefone.js    # roda um arquivo de teste isolado (mesmo padrão para 
 Todos usam `DB_PATH` apontando para um arquivo inexistente (banco descartável) —
 **nunca** deixe um teste abrir `conversations.db` de produção.
 
+⚠️ **Nenhuma asserção pode depender do `.env` de quem roda — e o `npm test` é o portão do deploy.**
+MEDIDO em 04/09/2026: as asserções de estágio de `test-pipeline.js` têm o ID escrito à mão
+(`stage: { id: 179388 }` = "ainda em agendamento", `285584` = "já avançou além de consulta agendada"),
+e `MOSKIT_STAGE_MAP` aceita override por env var. No dia em que o `.env` de produção passou a apontar
+para **outro funil**, a mesma suíte ficou **verde na máquina de dev e vermelha na VPS** — `285584`
+deixou de existir no mapa, a guarda de "deal já avançado" nunca acionava, e o teste falhava sem que
+uma linha de código de produção estivesse errada. Como `deploy.js` roda `npm test` **antes** do
+`pm2 restart`, isso não é só um falso negativo: **travaria todo deploy futuro do bot.**
+`fixarEstagiosDeTeste()` ([test-utils.js](test-utils.js)) fixa os 7 `MOSKIT_STAGE_*` do processo nos
+IDs canônicos de `src/moskit-ids.js` — chamada em `test-pipeline.js`,
+`test-bloqueio-campos-obrigatorios-dry-run.js`, `test-cliente-retorno-flags.js` e
+`test-reuniao-retorno-flags.js`, os 4 arquivos da suíte que escrevem ID de estágio à mão.
+`delete process.env.X` **não** serviria em nenhum caso desses: o `require('dotenv').config()` do
+`index.js` preenche de volta a chave apagada a partir do `.env` — tem de ser atribuição explícita
+(mesma armadilha do `CHATWOOT_BASE=''` no modo `sem_chatwoot` de `test-evolution-flags.js`).
+
 **A suíte roda com `TZ=UTC`, o fuso da VPS** — é isso que o `rodar-testes.js` existe para garantir.
 Antes ela rodava no fuso de quem executava, que na máquina de dev é `America/Fortaleza`, o *mesmo* do
 escritório: todo bug de fuso passava batido porque o relógio do teste e o relógio esperado eram o

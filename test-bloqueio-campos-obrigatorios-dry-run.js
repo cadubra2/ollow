@@ -11,6 +11,9 @@
 
 const path = require('path');
 const { dirTemporario } = require('./test-utils');
+// Os IDs de estagio das assercoes deste arquivo sao os canonicos de src/moskit-ids.js — fixar aqui
+// impede que o .env de quem roda (dev ou VPS, que pode apontar para outro funil) mude o veredito.
+require('./test-utils').fixarEstagiosDeTeste();
 const Database = require('better-sqlite3');
 
 const DIR = dirTemporario('bloqueio-campos-dryrun');
