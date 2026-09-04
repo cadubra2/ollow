@@ -9066,7 +9066,22 @@ app.listen(PORT, () => {
   }
 
 
-  // Expor via ngrok para receber webhooks do Zernio
+  // Expor via ngrok para receber webhooks do Zernio.
+  //
+  // TUNEL_NGROK_ATIVO=false desliga o tunel — para quando o webhook passa a entrar por um DOMINIO
+  // proprio (nginx na frente, na mesma VPS). Nasce LIGADO: sem a variavel, o comportamento e o de
+  // sempre. Poder desligar importa por um motivo concreto e nao obvio: no plano gratis o ngrok aceita
+  // UMA sessao por conta, entao um tunel orfao rodando aqui pode derrubar (ou ser derrubado por) o de
+  // outro projeto — e o sintoma e "cliente mandou e ninguem respondeu", sem erro nenhum no log.
+  const TUNEL_NGROK_ATIVO = process.env.TUNEL_NGROK_ATIVO !== 'false';
+  if (!TUNEL_NGROK_ATIVO) {
+    console.log('\n🌐 Tunel ngrok DESLIGADO (TUNEL_NGROK_ATIVO=false)');
+    console.log(`   O webhook precisa chegar por outro caminho — PUBLIC_BASE_URL=${process.env.PUBLIC_BASE_URL || '(vazio!)'}`);
+    if (!process.env.PUBLIC_BASE_URL) {
+      console.warn('   ⚠️ sem PUBLIC_BASE_URL e sem tunel, o anexo de nota no CRM nao tem URL publica para servir');
+    }
+    return;
+  }
   const { spawn } = require('child_process');
   const ngrokPath = process.platform === 'win32'
     ? require('path').join(__dirname, 'ngrok', 'ngrok.exe')
