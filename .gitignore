@@ -97,3 +97,7 @@ Apresentacao_Comite_IA.docx
 # Registro do que a simulacao de leads criou no funil de teste (ids de negocio/contato reais, ainda
 # que ficticios). E estado de execucao, nao codigo: quem rodou apaga com `--limpar`.
 .simulacao-10-criados.json
+
+# Registro do que o clone dos deals com reuniao gravada criou no funil de teste (ids reais).
+# Mesmo motivo do .simulacao-10-criados.json: e estado de execucao, nao codigo.
+.clone-reuniao-criados.json
