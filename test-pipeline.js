@@ -267,22 +267,67 @@ const CF_DADOS = [cf(CF.TIPO_CONSULTA, OPCAO.paga), cf(CF.AREA_DIREITO, OPCAO.fa
   }
   {
     limpar();
-    let seq = [{ stage: { id: 179388 } }, { stage: { id: 179388 } }];
+    let seq = [{ id: 7, name: 'Deal', stage: { id: 179388 } }, { stage: { id: 179388 } }];
     rede.get = () => ({ status: 200, data: seq.shift() });
     const erro = await esperarErro(() => moverParaEstagio(7, 184382));
     checar('Moskit aceitou o PUT mas nao moveu → LANCA', !!erro && erro.includes('nao se confirmou'), erro);
   }
   {
     limpar();
-    let seq = [{ stage: { id: 179388 } }, {}];
+    let seq = [{ id: 7, name: 'Deal', stage: { id: 179388 } }, {}];
     rede.get = () => ({ status: 200, data: seq.shift() });
     checar('conferencia sem stage → LANCA', !!(await esperarErro(() => moverParaEstagio(7, 184382))));
   }
   {
     limpar();
-    let seq = [{ stage: { id: 179388 } }, { stage: { id: '184382' } }];
+    let seq = [{ id: 7, name: 'Deal', stage: { id: 179388 } }, { stage: { id: '184382' } }];
     rede.get = () => ({ status: 200, data: seq.shift() });
     igual('id como string nao gera falso alarme (compara com Number)', await esperarErro(() => moverParaEstagio(7, 184382)), null);
+  }
+
+  // ============================================================
+  // Regressao do 404/422 medido em 04/09/2026: quando o MESMO ciclo cria o negocio e ja precisa
+  // move-lo, o GET que alimenta o PUT pega o Moskit antes de ele enxergar o deal que acabou de
+  // criar. Sem retentativa, o 404 subia como excecao e o corpo vazio virava um PUT com
+  // name/createdBy/responsible nulos (422) — e a excecao derrubava o resto de finalizarCiclo,
+  // levando junto o agendamento, a persistencia de last_data e o Briefing.
+  {
+    limpar();
+    // 404, 404 e entao o deal aparece: tem de resolver, e o PUT tem de levar o corpo COMPLETO.
+    let seq = [
+      { status: 404, data: { message: 'Resource not found' } },
+      { status: 404, data: { message: 'Resource not found' } },
+      { status: 200, data: { id: 7, name: 'Cliente - Caso', stage: { id: 179388 }, createdBy: { id: 90607 } } },
+      { status: 200, data: { id: 7, name: 'Cliente - Caso', stage: { id: 184382 } } },
+    ];
+    rede.get = () => seq.shift();
+    igual('deal recem-criado: 404 no GET e reconsultado ate propagar', await esperarErro(() => moverParaEstagio(7, 184382)), null);
+    igual('   insistiu no GET ate o deal aparecer', de('GET', '/deals/7').length, 4);
+    igual('   o PUT saiu com o nome preservado (nao nulo, que era o 422)', de('PUT', '/deals/7')[0].corpo.name, 'Cliente - Caso');
+    igual('   ...e com o createdBy que o Moskit exige', de('PUT', '/deals/7')[0].corpo.createdBy.id, 90607);
+  }
+  {
+    limpar();
+    // 200 com corpo VAZIO e o outro sintoma do mesmo atraso — e o mais perigoso, porque parecia
+    // sucesso. Sem a checagem de id/name, isto virava o PUT que o Moskit recusa com 422.
+    let seq = [
+      { status: 200, data: {} },
+      { status: 200, data: { id: 7, name: 'Cliente - Caso', stage: { id: 179388 } } },
+      { status: 200, data: { id: 7, name: 'Cliente - Caso', stage: { id: 184382 } } },
+    ];
+    rede.get = () => seq.shift();
+    igual('corpo vazio nao vira PUT com campos nulos', await esperarErro(() => moverParaEstagio(7, 184382)), null);
+    igual('   nenhum PUT saiu antes do corpo bom chegar', de('PUT', '/deals/7').length, 1);
+    igual('   o unico PUT leva o corpo completo', de('PUT', '/deals/7')[0].corpo.name, 'Cliente - Caso');
+  }
+  {
+    limpar();
+    // Deal que nao existe mesmo (apagado, id errado): esgota a espera e LANCA com motivo nomeado —
+    // nunca segue para o PUT, e nunca deixa o 422 de campo nulo falar pela causa real.
+    rede.get = () => ({ status: 404, data: { message: 'Resource not found' } });
+    const erro = await esperarErro(() => moverParaEstagio(7, 184382));
+    checar('deal inexistente -> LANCA dizendo que nao conseguiu LER o negocio', !!erro && erro.includes('para montar o PUT'), erro);
+    igual('   e nenhum PUT foi tentado', de('PUT', '/deals/7').length, 0);
   }
 
   // ============================================================

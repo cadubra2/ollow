@@ -36,6 +36,7 @@ const TESTES = [
   'test-transcricao.js',
   'test-zapsign.js',
   'test-notas-reuniao.js',
+  'test-notas-anexo-flags.js',
   'test-cliente-retorno.js',
   'test-cliente-retorno-flags.js',
   'test-reuniao-retorno.js',

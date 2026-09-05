@@ -840,7 +840,10 @@ for (const tabela of ['notas_reuniao', 'notas_reuniao_dryrun']) {
     'anexo_token TEXT',       // segredo da URL publica; NULL = sem URL viva
     'anexo_caminho TEXT',     // PDF em disco, apagado assim que o Moskit confirma a copia
     'anexo_nome TEXT',        // nome deterministico: e por ele que a deduplicacao encontra o anexo
-    'anexo_estado TEXT',      // NULL | ANEXANDO | ANEXADO | SEM_DOC | DESISTIU
+    // NULL só sobrevive em linha anterior a 04/09/2026: desde entao todo caminho que sai sem tentar
+    // grava o motivo (DESLIGADO / SEM_URL / SEM_DEAL). NULL era um buraco mudo — `anexosPendentes` so
+    // retoma ANEXANDO, entao ninguem olhava aquela linha de novo nem sabia que a transcricao ficou de fora.
+    'anexo_estado TEXT',      // NULL | ANEXANDO | ANEXADO | SEM_DOC | DESISTIU | DESLIGADO | SEM_URL | SEM_DEAL
     'anexo_id INTEGER',       // id do attachment no Moskit
     'anexo_expira_em TEXT',
     'anexo_tentativas INTEGER DEFAULT 0',
@@ -2499,11 +2502,45 @@ async function confirmarAposRetentativas(dealId, verificar, origem = 'BOT_WHATSA
   return { confirmado: false, deal: ultimoLido };
 }
 
+// O GET que ALIMENTA o PUT precisa de retentativa propria, e por um motivo diferente do de
+// `confirmarAposRetentativas` (que confere se a mudanca pegou, DEPOIS do PUT).
+//
+// MEDIDO em 04/09/2026 reproduzindo conversas reais: quando o mesmo ciclo cria o negocio e ja precisa
+// move-lo (lead que descreve o caso E fecha o horario dentro da mesma janela de inatividade), o
+// `GET /deals/{id}` feito segundos depois do `POST` responde **404 "Resource not found"**, ou 200 com
+// corpo vazio. E o mesmo atraso de propagacao ja documentado como "GET logo apos um PUT pode retornar
+// cache por ~4s", so que no GET depois do POST — e aqui ninguem tratava.
+//
+// Os dois sintomas vinham do mesmo lugar: o 404 subia como excecao, e o corpo vazio virava um PUT com
+// `name`/`createdBy.id`/`responsible.id` nulos que o Moskit recusa com 422. Em qualquer um dos dois a
+// excecao derruba o RESTO do ciclo em `finalizarCiclo` — agendamento, avanco de estagio, persistencia
+// de `last_data` e o Briefing, que e a nota que o advogado le minutos antes da consulta. Medido: 5 de
+// 6 conversas reproduzidas bateram nisso, todas sem briefing; e 3 ocorrencias com esta mesma pilha no
+// log de erro de producao, em chats de cliente real.
+//
+// Um corpo com `id` e `name` e a prova de que o deal propagou: era exatamente `name` que vinha nulo.
+async function lerDealParaPut(dealId, origem = 'BOT_WHATSAPP') {
+  const esperasMs = [0, 1200, 2000, 3500]; // cobre ate ~6.7s, folga sobre os ~4s observados
+  let ultimoStatus = null;
+  for (const ms of esperasMs) {
+    if (ms) await new Promise((r) => setTimeout(r, ms));
+    const res = await axios.get(`${MOSKIT_BASE}/deals/${dealId}`, {
+      headers: { ...apiHeaders, 'X-Ollow-Origin': origem },
+      // Sem isto o 404 lanca antes da segunda tentativa — que e justamente a que costuma funcionar.
+      validateStatus: (s) => s < 500,
+    });
+    ultimoStatus = res.status;
+    if (res.status >= 200 && res.status < 300 && res.data?.id && res.data?.name) return res.data;
+  }
+  // Esgotou a espera: o deal nao existe mesmo (apagado, id errado) ou o Moskit esta fora. Lancar com
+  // o motivo NOMEADO, e nao deixar o 422 de campo nulo falar por nos — quem le o log precisa saber
+  // que o problema foi ler o negocio, nao o conteudo do que se queria gravar.
+  throw new Error(`Moskit nao devolveu o deal ${dealId} completo para montar o PUT (ultimo status ${ultimoStatus}) — negocio recem-criado que ainda nao propagou, ou inexistente`);
+}
+
 async function putDealComVerificacao(dealId, mudancas, verificar, origem = 'BOT_WHATSAPP') {
-  const getRes = await axios.get(`${MOSKIT_BASE}/deals/${dealId}`, {
-    headers: { ...apiHeaders, 'X-Ollow-Origin': origem },
-  });
-  const dealAtual = { ...getRes.data, ...mudancas };
+  const dealLido = await lerDealParaPut(dealId, origem);
+  const dealAtual = { ...dealLido, ...mudancas };
   // O Moskit rejeita PUT cujo corpo traga status null ("Enum cannot be null"). Quando o GET vem sem
   // status, assume OPEN (o PUT aqui so acontece em operacoes de avancar/fechar — nunca reabre um
   // WON/LOST, e o status real de um deal em movimento no funil e OPEN).
@@ -7953,9 +7990,30 @@ function anexoComNomeExiste(dealId, nome) {
 async function anexarDocNoDeal({ dealId, docId, gmailMessageId, dataIso, marcador, drive, stmts, dryRun, nomeForcado = null }) {
   const semAnexo = (motivo) => ({ anexado: false, motivo });
 
+  // Sair daqui sem gravar NADA deixava `anexo_estado` em NULL — e NULL nao e "nao tentei ainda", e
+  // um BURACO MUDO: `anexosPendentes` so retoma 'ANEXANDO', entao a linha nunca mais e olhada, e nem
+  // a tabela nem o Telegram registram que aquela transcricao ficou de fora.
+  //
+  // MEDIDO em 04/09/2026: das 12 reunioes gravadas ate entao, 10 estavam com `anexo_estado = NULL` e
+  // `anexo_tentativas = 0`. As notas concluiram enquanto NOTAS_ANEXO_ATIVO ainda estava desligada
+  // (a flag foi ligada 11 minutos depois); como estado de nota concluida e terminal, elas nunca
+  // voltaram a ser processadas e os 10 PDFs ficaram parados para sempre, sem uma linha de aviso.
+  //
+  // O estado explicito nao recupera nada do passado — de proposito, e decisao do escritorio — mas faz
+  // a proxima vez ser VISIVEL: da para perguntar a tabela por que a transcricao nao subiu.
+  const registrarSemTentativa = (estadoAnexo, motivo) => {
+    try {
+      stmts.avancarAnexo.run({
+        gmail_message_id: gmailMessageId, anexo_estado: estadoAnexo,
+        anexo_token: null, anexo_caminho: null, anexo_nome: null, anexo_id: null, anexo_expira_em: null,
+      });
+    } catch { /* linha ainda nao existe: o motivo ja vai no retorno, nao vale derrubar a nota por isso */ }
+    return semAnexo(motivo);
+  };
+
   try {
-    if (!NOTAS_ANEXO_ATIVO) return semAnexo('desligado');
-    if (!dealId) return semAnexo('sem_deal');
+    if (!NOTAS_ANEXO_ATIVO) return registrarSemTentativa('DESLIGADO', 'desligado');
+    if (!dealId) return registrarSemTentativa('SEM_DEAL', 'sem_deal');
 
     // Sem Doc nao ha o que anexar — decisao de produto: nao geramos PDF a partir do resumo do
     // e-mail, que ja esta inteiro dentro da propria nota.
@@ -7969,7 +8027,18 @@ async function anexarDocNoDeal({ dealId, docId, gmailMessageId, dataIso, marcado
 
     if (!PUBLIC_BASE_URL) {
       console.log('  ⏭️ PUBLIC_BASE_URL nao configurada — o Moskit nao teria de onde baixar o PDF; nota segue sem anexo');
-      return semAnexo('sem_url_base');
+      // AVISA, diferente do 'DESLIGADO' logo acima. A distincao e entre configuracao deliberada e
+      // defeito: com a funcionalidade LIGADA e sem URL publica, o tunel caiu ou mudou de endereco, e
+      // cada reuniao que passar por aqui perde a transcricao. Um aviso por nota e o volume certo —
+      // cada um representa uma transcricao que nao subiu, e sao ~1 por dia, nao um polling repetindo.
+      if (!dryRun) {
+        await enviarTelegram(
+          `⚠️ *Transcrição não anexada* (deal ${dealId})\n`
+          + 'PUBLIC_BASE_URL está vazia — sem URL pública o Moskit não tem de onde baixar o PDF.\n'
+          + 'Provável túnel caído ou trocado de endereço. A nota da reunião foi postada; só o arquivo ficou de fora.'
+        ).catch(() => {});
+      }
+      return registrarSemTentativa('SEM_URL', 'sem_url_base');
     }
 
     const nome = nomeForcado || notasReuniao.nomeAnexoNota(marcador, dataIso);

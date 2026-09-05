@@ -27,7 +27,7 @@ node test-telefone.js    # roda um arquivo de teste isolado (mesmo padrão para 
 `test-telefone.js`, `test-chatwoot.js`, `test-moskit-ids.js`, `test-atividade-moskit.js`, `test-evidencia.js`,
 `test-briefing.js`, `test-fila.js`, `test-payload.js`, `test-rotas.js`, `test-pipeline.js`,
 `test-agenda-dry-run.js`, `test-bloqueio-campos-obrigatorios-dry-run.js`, `test-guards-internos.js`, `test-agendamento-bloco-mensagens.js`,
-`test-transcricao.js`, `test-zapsign.js`, `test-notas-reuniao.js`,
+`test-transcricao.js`, `test-zapsign.js`, `test-notas-reuniao.js`, `test-notas-anexo-flags.js`,
 `test-cliente-retorno.js`, `test-cliente-retorno-flags.js`, `test-reuniao-retorno.js`,
 `test-reuniao-retorno-flags.js`, `test-chatwoot-flags.js`.
 Todos usam `DB_PATH` apontando para um arquivo inexistente (banco descartável) —
@@ -277,6 +277,23 @@ Escrevem em dados reais de produção (Moskit e/ou banco real):
   `conversations.db` estava atrasado — a proteção "confere de novo antes do PUT" pulou todas sem
   sobrescrever), e as 5 que precisavam de escrita batiam nesses dois 422 até os campos serem
   adicionados; as 5 fecharam com 200 depois da correção.
+- `clonar-deals-reuniao-funil-teste.js --snapshot=<db> [--aplicar] [--limpar] [--deal=N]` — reproduz
+  pelo pipeline REAL (`processarConversaDirect`) as conversas dos deals que tiveram **reunião gravada
+  no Meet**, escrevendo num FUNIL DE TESTE. Irmão de `simular-10-leads-funil-teste.js`, com uma trava
+  a mais e ela é a razão de existir: **telefone fictício** (faixa `5586992000xxx`). Reproduzir com o
+  telefone REAL faria `buscarOuCriarContato` achar o contato de produção e `buscarDealPorContato` achar
+  o NEGÓCIO de produção — a rodada terminaria dando PUT no deal do cliente de verdade. A lista sai de
+  `notas_reuniao` com estado `CONCLUIDO` (nota de reunião só nasce quando o Gemini gravou e
+  transcreveu, então é a definição operacional de "reunião gravada"). Copia para o clone a nota da
+  reunião e os anexos do deal real; `--limpar` apaga negócios, contatos e atividades criados.
+- `anexar-transcricao-nos-clones.js [--aplicar] [--clone=N]` — anexa o PDF da transcrição nos clones.
+  **Só roda na VPS**, e não por conveniência: o Moskit não aceita upload (o corpo do POST é só uma
+  url e quem baixa é o servidor dele), e a única URL pública que serve esses PDFs é a rota
+  `/arquivo-nota/:token/:nome` do bot em produção, atrás do túnel. Ela lê o token da tabela
+  `notas_reuniao` do banco de PRODUÇÃO — então o token tem de estar lá. A linha inserida usa
+  `gmail_message_id` sintético, `doc_id NULL` (o índice único de `doc_id` é PARCIAL,
+  `WHERE doc_id IS NOT NULL`) e `estado = 'CLONE_TESTE'`, que nenhuma query da rotina casa; e é
+  apagada no fim, junto com o PDF do disco e o token invalidado.
 - `reprocessar-nota-reuniao.js <gmailMessageId> <dealId> [--aplicar]` — religa à mão uma nota de
   reunião que ficou órfã (o id vem no aviso do Telegram). Sem `--aplicar` só imprime a nota que
   iria; com `--aplicar` **escreve no CRM**.
@@ -1047,6 +1064,34 @@ A nota traz o resumo; o Doc que o Gemini gera vira **anexo** no mesmo negócio (
   o `size` batendo com o registrado. Conclusão prática: `NOTAS_ANEXO_ATIVO=true` é seguro **com este
   túnel e este baixador**; `conferirAnexoNoMoskit` continua sendo a rede de segurança para o dia em
   que o Moskit trocar de cliente HTTP, ou o plano do ngrok mudar de comportamento.
+- ⚠️ **`POST` com `200` NÃO significa arquivo guardado — o Moskit baixa MAIS DE UMA VEZ.** MEDIDO em
+  04/09/2026 pelo log da própria rota: primeiro vem um `User-Agent: Java-http-client/17.0.2` (a
+  validação, que é quem devolve `422 attachment.file.upload.error` quando a URL não responde) e
+  **depois** o `Uploadcare/1.0 upload-api/1.0` busca de novo, às vezes duas vezes, para fazer a cópia
+  de verdade. Num dos anexos só o primeiro fetch chegou antes de o token ser invalidado: `POST` 200
+  com id, log de "anexo servido", e a aba Arquivos **vazia**, sem erro nenhum. É por isso que
+  `conferirAnexoNoMoskit` só chama `encerrar()` depois de conferir `size` e `mimeType`, e por que ela
+  **não** apaga nada quando a conferência falha ("se o Moskit ainda estiver para buscar, apagar
+  garantiria a falha") — esse desenho está certo e não pode ser "simplificado" para encerrar logo
+  após o POST. Quem errou isso foi um script avulso, e o sintoma foi exatamente este.
+- **`anexo_estado` NULL era um buraco mudo — hoje todo caminho que sai sem tentar grava o motivo.**
+  MEDIDO em 04/09/2026: das 12 reuniões gravadas até então, **10** estavam com `anexo_estado = NULL` e
+  `anexo_tentativas = 0`. As notas concluíram enquanto `NOTAS_ANEXO_ATIVO` ainda estava desligada (a
+  flag foi ligada 11 minutos depois); como estado de nota concluída é **terminal**, elas nunca
+  voltaram a ser processadas, e `anexosPendentes` só retoma `'ANEXANDO'` — ou seja, NULL não era
+  "ainda vou tentar", era uma linha que ninguém ia olhar de novo. Dez transcrições de consulta
+  jurídica ficaram fora do CRM sem uma linha de log. Agora os três caminhos que saem antes do bracket
+  gravam estado explícito: `DESLIGADO` (flag off), `SEM_URL` (sem `PUBLIC_BASE_URL`) e `SEM_DEAL`.
+  **Só `SEM_URL` avisa no Telegram**, e a distinção é entre configuração deliberada e defeito: com a
+  funcionalidade LIGADA e sem URL pública o túnel caiu ou mudou de endereço, e cada reunião que passar
+  por ali perde a transcrição; já um aviso por nota com a funcionalidade desligada dispararia em TODA
+  nota, e aviso que chega todo dia deixa de ser lido (a lição dos 6 negócios que inundaram o Telegram
+  em agosto). Nenhum dos três estados entra em `anexosPendentes` nem gasta tentativa — o bracket não
+  chegou a abrir, então o orçamento de 3 continua inteiro para quando a configuração voltar ao normal.
+  **Isto não recupera nada do passado** (decisão do escritório: sem correção retroativa); faz a
+  próxima vez ser perguntável à tabela. Regressão em `test-notas-anexo-flags.js`, arquivo próprio
+  porque `NOTAS_ANEXO_ATIVO` e `PUBLIC_BASE_URL` são `const` lidas no require — mesmo motivo de
+  `test-agenda-dry-run.js`.
 - **O nome do arquivo É a chave de deduplicação.** O POST não aceita marcador dentro do arquivo (o
   corpo é só uma url), então, depois de um crash entre "vou anexar" e "anexei", a única pergunta
   possível ao CRM é *"existe anexo com este nome?"*. `nomeAnexoNota` (`src/notas-reuniao.js`) deriva
@@ -1586,7 +1631,25 @@ perdidas na janela **não foram recuperadas** (ver seção acima) — decisão f
   em toda chamada à OpenAI do sistema, não só notas de reunião.
 - **Moskit CRM** (`MOSKIT_BASE`): `PUT` de deal precisa reenviar o corpo do `GET` (peculiaridade da
   API); `GET` logo após um `PUT` pode retornar dados em cache por até ~4s; `limit` de paginação
-  sempre retorna 10 independente do valor pedido. Em `/activities` (medido em 12/08/2026, um
+  sempre retorna 10 independente do valor pedido.
+  **O mesmo atraso existe no `GET` logo depois do `POST` que CRIA o deal, e ninguém tratava.** MEDIDO
+  em 04/09/2026 reproduzindo conversas reais: quando o mesmo ciclo cria o negócio e já precisa movê-lo
+  (lead que descreve o caso E fecha o horário dentro da mesma janela de inatividade), o
+  `GET /deals/{id}` feito segundos depois do `POST` responde **404 "Resource not found"**, ou 200 com
+  **corpo vazio**. Os dois sintomas vinham do mesmo lugar: o 404 subia como exceção, e o corpo vazio
+  virava um `PUT` com `name`/`createdBy.id`/`responsible.id` nulos que o Moskit recusa com **422** —
+  e em qualquer um dos dois a exceção derruba o RESTO de `finalizarCiclo`: agendamento, avanço de
+  estágio, persistência de `last_data` e o **Briefing**, que é a nota que o advogado lê minutos antes
+  da consulta. Medido: 5 de 6 conversas reproduzidas bateram nisso, todas sem briefing; e 3
+  ocorrências com esta mesma pilha (`putDealComVerificacao → moverParaEstagio →
+  handlePagamentoConfirmado`) no log de erro de produção, em chats de cliente real. A conversa cai na
+  fila e costuma se curar na tentativa seguinte (o deal já propagou), mas são 3 tentativas e depois
+  ela é **descartada** — o mesmo caminho que já queimou o chat 553799437737 pelo 422 de `activities`.
+  `lerDealParaPut` insiste no `GET` (`0 → 1,2s → 2s → 3,5s`) e só aceita o corpo quando ele traz `id`
+  **e** `name` — era exatamente `name` que vinha nulo. Esgotada a espera, **lança com o motivo
+  nomeado** em vez de deixar o 422 de campo nulo falar pela causa: quem lê o log precisa saber que o
+  problema foi LER o negócio, não o conteúdo do que se queria gravar. Regressão em `test-pipeline.js`
+  (404 até propagar, corpo vazio, e deal inexistente sem nenhum `PUT` tentado). Em `/activities` (medido em 12/08/2026, um
   parâmetro por vez) **o único que pagina é `?start=`** — offset real; `page`, `pageToken`, `offset`,
   `skip`, `from`, `maxId` e `beforeId` são todos **ignorados em silêncio**, respondendo 200 com a
   primeira página de novo. Um loop errado aqui não quebra: relê os mesmos 10 registros e parece ter
